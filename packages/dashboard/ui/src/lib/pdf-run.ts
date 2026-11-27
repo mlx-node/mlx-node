@@ -459,21 +459,23 @@ export interface UnreadPdf {
 
 /**
  * The PDFs of the message at `at` that went to the PDF tool and that no run of the tool read: shown once its turn
- * ended, so never while an answer of the conversation runs (a Read it now that starts runs as one), and never in a
- * fork, whose page folders are the original's. `started`: the ids of the conversation's PDF runs.
+ * ended, so never while an answer of the conversation runs (a Read it now that starts runs as one), and never for a
+ * note another conversation sent (a fork's copy of the original's message: its page folder is the original's).
+ * `started`: the ids of the conversation's PDF runs; `session`: the conversation's id.
  */
 export function pdfUnread(
   entries: readonly TranscriptEntry[],
   at: number,
   running: boolean,
   started: ReadonlySet<string>,
-  fork: boolean,
+  session: string | null,
 ): UnreadPdf[] {
   const entry = entries[at];
-  if (fork || running || entry?.kind !== 'user' || entry.attachments === undefined) return [];
+  if (running || entry?.kind !== 'user' || entry.attachments === undefined) return [];
   const out: UnreadPdf[] = [];
   for (const item of entry.attachments) {
     if (item.kind !== 'pdf' || item.way !== 'tool' || item.id === undefined || started.has(item.id)) continue;
+    if (item.session !== undefined && item.session !== session) continue;
     out.push({ id: item.id, name: item.name });
   }
   return out;

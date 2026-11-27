@@ -341,7 +341,7 @@ function userAttachment(block: unknown): { view: UserAttachment; pages?: { from:
     const note = readPdfNote(text);
     if (note === null) return { view: { kind: 'file', name, bytes: utf8Bytes(text) } };
     const pdf = { kind: 'pdf', name: note.name, pages: note.pages, way: note.way, bytes: 0, chars: 0 } as const;
-    if (note.way === 'tool') return { view: { ...pdf, id: note.id } };
+    if (note.way === 'tool') return { view: { ...pdf, id: note.id, session: note.session } };
     return { view: pdf, pages: { from: note.from, to: note.from + note.pages - 1 } };
   }
   const blob = str(block.resource.blob);

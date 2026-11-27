@@ -1304,9 +1304,9 @@ export class ChatService {
 
   /**
    * Work in Auto or Bypass, a model of {@link HOST_START_FAMILIES}: the turn that sent the PDF `pdf` to the tool ended
-   * and no `read-pdf` call of the model named it, whatever its answer, so the host starts it as Read it now does. Not
-   * in Ask, not in a fork (its page folders are the original's), not after a Stop, a deny or a failed turn, and not
-   * while another turn or a run of the tool goes on (Read it now stays offered).
+   * and no `read-pdf` call of the model named it, whatever its answer, so the host starts it as Read it now does, in a
+   * fork too (the PDF was sent there). Not in Ask, not after a Stop, a deny or a failed turn, and not while another turn
+   * or a run of the tool goes on (Read it now stays offered).
    */
   private async hostStartPdf(
     conversation: Conversation,
@@ -1315,7 +1315,7 @@ export class ChatService {
   ): Promise<{ turnId: string } | null> {
     if (outcome === undefined || !HOST_START_OUTCOMES.has(outcome)) return null;
     const id = conversation.info.id;
-    if (this.conversations.get(id) !== conversation || conversation.info.forkOf !== undefined) return null;
+    if (this.conversations.get(id) !== conversation) return null;
     if (this.modeOf(id) === 'ask') return null;
     const family = (await this.state()).models.find((m) => m.id === conversation.info.modelId)?.family;
     if (family === null || family === undefined || !HOST_START_FAMILIES.has(family)) return null;

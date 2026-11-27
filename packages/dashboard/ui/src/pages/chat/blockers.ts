@@ -15,6 +15,7 @@ import {
   type PdfPlan,
   type PdfWay,
   planPdfs,
+  SESSION_ID_SIZED,
   storedPictureChars,
   type UserAttachment,
   utf8Bytes,
@@ -390,7 +391,7 @@ export function attachProblem(facts: AttachFacts): string | null {
   const ways = fileWays(facts.files, plan);
   let bytes = utf8Bytes(facts.text);
   for (const file of facts.files) if (file.kind === 'file') bytes += file.numbered;
-  for (const note of pdfNotes(messageInputs(facts.files, plan))) bytes += numberedBytes(note);
+  for (const note of pdfNotes(messageInputs(facts.files, plan), SESSION_ID_SIZED)) bytes += numberedBytes(note);
   if (bytes > MESSAGE_FILES_MAX_BYTES) return a.blockedLong;
   const window = facts.windowTokens;
   if (

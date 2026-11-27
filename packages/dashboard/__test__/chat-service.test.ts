@@ -28,7 +28,7 @@ import { ApiError } from '../src/api/errors.js';
 import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
 import { readPdfCommand, readPdfScript } from '../src/chat/agent/pdf-tool.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import { attachmentView, type AttachmentInput, pdfToolId } from '../src/chat/attachment-rule.js';
+import { attachmentView, type AttachmentInput, pdfToolId, readPdfNote } from '../src/chat/attachment-rule.js';
 import { readWorkIndexSync } from '../src/chat/index-file.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
@@ -1264,9 +1264,10 @@ describe('Chat service — attachments', () => {
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
     // Mutations: the host start left out; the family check dropped; a start in Ask; a start after a move down to Ask
-    // during its checks; a start in a fork; a start after the model's call of the PDF, after any call of the tool, or
-    // after a deny; the start sent as the person's; Read it now while a run of the tool goes on; Read it now during the
-    // host's start not answered with its turn → red.
+    // during its checks; no start for a PDF sent inside a fork; Read it now in a fork on a PDF copied from the original
+    // (the session check dropped); a tool note that does not name the conversation it is sent in; a start after the
+    // model's call of the PDF, after any call of the tool, or after a deny; the start sent as the person's; Read it now
+    // while a run of the tool goes on; Read it now during the host's start not answered with its turn → red.
     it('Work Auto and Bypass: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
       const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
       const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
@@ -1360,11 +1361,19 @@ describe('Chat service — attachments', () => {
           const forked = (await svc.fork(asked.id)).id;
           expect(await svc.setPermissionMode(forked, 'bypass', true)).toEqual({ mode: 'bypass' });
           const forkPage = new Page(svc, forked);
+          const copied = await apiError(svc.readPdf(forked, asked.pdf));
+          expect([copied.code, copied.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
           const stage = await staged(svc, 3);
           await svc.prompt(forked, 'pdfnot', [tool(stage, 3)]);
-          await until(ended(forkPage), 10_000);
-          await settle();
-          expect(texts(forked)).toEqual(['pdfnot']);
+          const noteOf = (session: string) =>
+            prompts(fake)
+              .filter((p) => p.sessionId === session)
+              .flatMap((p) => p.prompt as Array<{ type: string; resource?: { text?: string } }>)
+              .find((block) => block.type === 'resource')?.resource?.text ?? '';
+          await until(() => texts(forked).length === 2, 10_000);
+          expect(readPdfNote(noteOf(forked))).toMatchObject({ id: pdfToolId(stage, 3), session: forked });
+          expect(readPdfNote(noteOf(asked.id))).toMatchObject({ id: asked.pdf, session: asked.id });
+          expect(texts(forked)).toEqual(['pdfnot', readPdfCommand(pdfToolId(stage, 3), 'pdfnot', 'report.pdf', 'app')]);
           forkPage.detach();
 
           const other = await send('pdfnot', INKLING.name, 'bypass');

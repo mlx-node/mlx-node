@@ -318,7 +318,7 @@ export function promptParams(
 ): Record<string, unknown> {
   const prompt: Array<Record<string, unknown>> = [{ type: 'text', text }];
   for (const item of attachments) if (item.kind === 'file') prompt.push(resource(item.name, item.text));
-  const notes = pdfNotes(attachments);
+  const notes = pdfNotes(attachments, sessionId);
   let note = 0;
   for (const item of attachments) if (item.kind === 'pdf') prompt.push(resource(item.name, notes[note++]!));
   for (const item of attachments) {

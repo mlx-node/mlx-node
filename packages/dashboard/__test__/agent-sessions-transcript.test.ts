@@ -1322,8 +1322,10 @@ describe('parseUpdates: attachments of a user message', () => {
     ]);
   });
 
-  it('a tool note is a PDF view with its id and no pages; a later picture stays a picture', () => {
-    const toolNote = pdfNote({ name: 'report.pdf', pages: 212, way: 'tool', id: 'k3f9a2c1-212' });
+  // Mutation: the note's session left off the view → a fork's copy of the original's message reads as its own.
+  it('a tool note is a PDF view with its id, its session and no pages; a later picture stays a picture', () => {
+    const session = '01a20000-0000-7000-8000-000000000010';
+    const toolNote = pdfNote({ name: 'report.pdf', pages: 212, way: 'tool', id: 'k3f9a2c1-212', session });
     const lines = [
       user('summarize', 3),
       block({ type: 'resource', resource: { uri: 'file:///attached/report.pdf', text: toolNote } }, 3, 2),
@@ -1336,7 +1338,7 @@ describe('parseUpdates: attachments of a user message', () => {
         text: 'summarize',
         promptIndex: 3,
         attachments: [
-          { kind: 'pdf', name: 'report.pdf', pages: 212, way: 'tool', bytes: 0, chars: 0, id: 'k3f9a2c1-212' },
+          { kind: 'pdf', name: 'report.pdf', pages: 212, way: 'tool', bytes: 0, chars: 0, id: 'k3f9a2c1-212', session },
           { kind: 'image', mediaType: 'image/png', bytes: 16 },
         ],
       },

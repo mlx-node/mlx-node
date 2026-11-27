@@ -296,7 +296,13 @@ describe('pageTokens', () => {
 
 describe('pdfNote and readPdfNote', () => {
   const MESSAGE = { name: 'bitter_lesson.pdf', pages: 2, way: 'message', from: 1 } as const;
-  const TOOL = { name: 'report-2026.pdf', pages: 212, way: 'tool', id: 'k3f9a2c1-212' } as const;
+  const TOOL = {
+    name: 'report-2026.pdf',
+    pages: 212,
+    way: 'tool',
+    id: 'k3f9a2c1-212',
+    session: '01a20000-0000-7000-8000-000000000010',
+  } as const;
 
   it('writes key lines the model reads and one sentence', () => {
     expect(pdfNote(MESSAGE)).toBe(
@@ -319,6 +325,7 @@ describe('pdfNote and readPdfNote', () => {
       'pages: 212',
       'way: tool',
       'id: k3f9a2c1-212',
+      'session: 01a20000-0000-7000-8000-000000000010',
       'The pages are image files on disk, not in this message. To read them, call the workflow tool with name read-pdf and args {"pdf": "k3f9a2c1-212", "question": "<what to find out>"}. Add "pages": "40-60" to read only some pages.',
     ]);
   });
@@ -333,7 +340,8 @@ describe('pdfNote and readPdfNote', () => {
     expect(pdfNote({ ...MESSAGE, name: 'a\nb#c.pdf' }).split('\n')[1]).toBe('name: a_b_c.pdf');
   });
 
-  // Mutation: any text that names a PDF read as a note → red.
+  // Mutations: any text that names a PDF read as a note; a tool note with no session line, or an empty one, read as
+  // one → red.
   it('takes a note only when its first line is the marker and every key line is one the app writes', () => {
     const note = pdfNote(MESSAGE);
     const lines = note.split('\n');
@@ -363,6 +371,12 @@ describe('pdfNote and readPdfNote', () => {
       pdfNote({ ...TOOL, id: 'K3F9A2C1-212' }),
       pdfNote({ ...TOOL, id: 'k3f9a2c-212' }),
       pdfNote({ ...TOOL, pages: 321, id: 'k3f9a2c1-321' }),
+      pdfNote({ ...TOOL, session: '' }),
+      pdfNote(TOOL).replace('\nsession: ', '\nconversation: '),
+      pdfNote(TOOL)
+        .split('\n')
+        .filter((line) => !line.startsWith('session: '))
+        .join('\n'),
     ];
     for (const text of refused) expect([text, readPdfNote(text)]).toEqual([text, null]);
   });
@@ -545,6 +559,7 @@ describe('a PDF for the tool', () => {
     }
   });
 
+  // Mutation: the tool note sized with no session line → the estimate counts fewer bytes than the prompt carries.
   it('is viewed as a tool PDF with its id and no stored base64; its note names the id; it holds no image', () => {
     const view = attachmentView(tool);
     expect(view).toEqual({
@@ -560,10 +575,17 @@ describe('a PDF for the tool', () => {
     expect(heldImages([{ kind: 'user', attachments: [view] }])).toBe(0);
     const picture = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=' } as const;
     const pages: AttachmentInput = { kind: 'pdf', name: 'b.pdf', images: ['/9j/4AAQ', '/9j/4AAQ'] };
-    const notes = pdfNotes([tool, picture, pages]);
-    expect(notes[0]).toBe(pdfNote({ name: 'report_1.pdf', pages: 212, way: 'tool', id: 'k3f7a2c4-212' }));
+    const session = '01a20000-0000-7000-8000-000000000010';
+    const notes = pdfNotes([tool, picture, pages], session);
+    expect(notes[0]).toBe(pdfNote({ name: 'report_1.pdf', pages: 212, way: 'tool', id: 'k3f7a2c4-212', session }));
     expect(notes[1]).toBe(pdfNote({ name: 'b.pdf', pages: 2, way: 'message', from: 2 }));
-    expect(readPdfNote(notes[0]!)).toEqual({ name: 'report_1.pdf', pages: 212, way: 'tool', id: 'k3f7a2c4-212' });
+    expect(readPdfNote(notes[0]!)).toEqual({
+      name: 'report_1.pdf',
+      pages: 212,
+      way: 'tool',
+      id: 'k3f7a2c4-212',
+      session,
+    });
     expect(estimateTokens('q', [tool], 'qwen3_5')).toBe(Math.ceil((1 + numberedBytes(notes[0]!)) / 3));
   });
 });

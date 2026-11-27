@@ -64,8 +64,6 @@ export interface TranscriptProps {
   asOfMs?: number;
   /** The reader's error for this transcript; shown above it. */
   transcriptError?: string;
-  /** The session is a fork: the PDFs its copied messages sent are the original's, so no "not read" line shows. */
-  fork?: boolean;
 }
 
 type Entry<K extends TranscriptEntry['kind']> = Extract<TranscriptEntry, { kind: K }>;
@@ -246,7 +244,6 @@ interface BodyProps {
   places: RunsAt;
   /** The name of each PDF the session's messages sent to the PDF tool, by its id. */
   pdfNames: ReadonlyMap<string, string>;
-  fork: boolean;
   /** The session runs in an agent process now (its body says so), fresh or not. */
   sessionLive: boolean;
   sessionId: string | null;
@@ -558,7 +555,7 @@ function GroupBody(props: BodyProps): ReactElement {
     }
   }
 
-  for (const pdf of pdfUnread(group.entries, 0, open, startedPdfs(places), props.fork))
+  for (const pdf of pdfUnread(group.entries, 0, open, startedPdfs(places), props.sessionId))
     items.push(<PdfUnreadRow key={`pdf-${pdf.id}`} pdf={pdf} />);
 
   const end = group.end;
@@ -637,7 +634,6 @@ export function TranscriptStream(props: TranscriptStreamProps): ReactElement {
         subagents={subagents}
         places={places}
         pdfNames={names}
-        fork={false}
         sessionLive={props.live}
         sessionId={props.sessionId}
         onJump={() => undefined}
@@ -841,7 +837,6 @@ export function Transcript(props: TranscriptProps): ReactElement {
                   subagents={subagents}
                   places={places}
                   pdfNames={names}
-                  fork={props.fork === true}
                   sessionLive={props.sessionLive}
                   sessionId={props.sessionId ?? null}
                   onJump={jump}

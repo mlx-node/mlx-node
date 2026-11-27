@@ -907,21 +907,36 @@ describe('a run of the PDF tool', () => {
     expect([...shownRunNames(runsAt(other))]).toEqual([]);
   });
 
-  // Mutations: Read it now while the turn runs → a second run starts beside the model's own; the fork check dropped →
-  // a fork offers a PDF whose page folder is the original's.
+  // Mutation: Read it now while the turn runs → a second run starts beside the model's own.
   it('Read it now: a PDF sent to the tool that no run read, once its turn ended, never while an answer runs', () => {
     const entries = [note];
-    expect(pdfUnread(entries, 0, false, new Set(), false)).toEqual([{ id: ID, name: 'report.pdf' }]);
-    expect(pdfUnread(entries, 0, true, new Set(), false)).toEqual([]);
-    expect(pdfUnread(entries, 0, false, new Set(), true)).toEqual([]);
+    expect(pdfUnread(entries, 0, false, new Set(), 'conv')).toEqual([{ id: ID, name: 'report.pdf' }]);
+    expect(pdfUnread(entries, 0, true, new Set(), 'conv')).toEqual([]);
     const read = [note, launch({ pdf: ID, question: 'q' }), pdfRun()];
-    expect(pdfUnread(read, 0, false, startedPdfs(runsAt(read)), false)).toEqual([]);
+    expect(pdfUnread(read, 0, false, startedPdfs(runsAt(read)), 'conv')).toEqual([]);
     const other = [note, launch({ pdf: 'zzzzzzzz-40', question: 'q' }), pdfRun()];
-    expect(pdfUnread(other, 0, false, startedPdfs(runsAt(other)), false)).toEqual([{ id: ID, name: 'report.pdf' }]);
+    expect(pdfUnread(other, 0, false, startedPdfs(runsAt(other)), 'conv')).toEqual([{ id: ID, name: 'report.pdf' }]);
     const inMessage: TranscriptEntry = {
       ...note,
       attachments: [{ kind: 'pdf', name: 'short.pdf', pages: 2, way: 'message', bytes: 9, chars: 12 }],
     };
-    expect(pdfUnread([inMessage], 0, false, new Set(), false)).toEqual([]);
+    expect(pdfUnread([inMessage], 0, false, new Set(), 'conv')).toEqual([]);
+  });
+
+  // Mutations: the session check dropped → a fork offers a PDF copied from the original, whose page folder is the
+  // original's; the check run on live notes too, which name no session → a PDF sent inside the fork loses its line.
+  it('Read it now in a fork: none for a PDF copied from the original, as in any conversation for one sent there', () => {
+    const stored = (session: string): TranscriptEntry[] => [
+      {
+        ...note,
+        attachments: [{ kind: 'pdf', name: 'report.pdf', pages: 40, way: 'tool', bytes: 0, chars: 0, id: ID, session }],
+      },
+    ];
+    const shown = [{ id: ID, name: 'report.pdf' }];
+    expect(pdfUnread(stored('orig'), 0, false, new Set(), 'fork')).toEqual([]);
+    expect(pdfUnread(stored('orig'), 0, false, new Set(), 'orig')).toEqual(shown);
+    expect(pdfUnread(stored('fork'), 0, false, new Set(), 'fork')).toEqual(shown);
+    expect(pdfUnread([note], 0, false, new Set(), 'fork')).toEqual(shown);
+    expect(pdfUnread(stored('fork'), 0, true, new Set(), 'fork')).toEqual([]);
   });
 });

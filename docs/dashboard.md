@@ -1108,6 +1108,8 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   `attachments` on the user entry (name from the `uri`, sizes from the stored text or base64); a `resource` whose
   first line is `Portato PDF note 1` is a PDF note (its `key: value` lines read by a small parser), and the images it
   names (`images: a-b`, positions among the message's image blocks) become that one `pdf` entry, not picture chips;
+  a tool note names `id:` and `session:` (the conversation it was sent in, which a fork's copy keeps; the entry's
+  `session`, the size checks count it at a session id's 36 characters);
   no file text and no pixels cross to the page. Titles and the conversation list use the message text only. The Chat address list for
   `web_fetch` is built from the typed text only, so an address inside a file is not opened.
 
@@ -1747,9 +1749,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   the conversation is active or paused, so two runs never share the image lane. For a model of `HOST_START_FAMILIES`
   (`gemma4`, `qwen3_5`: they started the tool from the note in 2 of 10 tries each, against 10 of 10 for
   Inkling-2-Mini) the service sends that command itself in Auto and Bypass when the turn that sent the PDF ends
-  (completed, output limit or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it;
-  not in Ask, not in a fork (its page folders are the original's), not after a Stop, a deny or a failed turn, and not
-  while another turn or a run of the tool goes on, which leaves Read it now. A Read it now sent while that start is in
+  (completed, output limit or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it,
+  in a fork too (a PDF sent there is placed for the fork); not in Ask, not after a Stop, a deny or a failed turn, and
+  not while another turn or a run of the tool goes on, which leaves Read it now. A PDF a fork copied from the original
+  has its page folder's `meta.json` naming the original, so Read it now of it is refused (`E_NOT_FOUND`). A Read it now sent while that start is in
   flight gets its turn. The command's args carry `by`: `"you"` for Read it now, `"app"` for the service's own start
   (the script does not read it).
   - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
@@ -1779,10 +1782,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   - Read it now. Under a finished Work turn that sent a PDF to the tool and that no run read: "The pages of {name} were
     not read." with Read it now while the conversation's model sees images and nothing runs ("The PDF tool could not
     start. Try again." on a failure). Its command turn is drawn as one row, "You started reading {name}", or "Started
-    reading {name}" for the service's own start. A fork shows neither the line nor the button.
+    reading {name}" for the service's own start. A message whose stored note names another conversation (a fork's
+    copy of the original's message) shows neither the line nor the button; a PDF sent inside the fork shows both as
+    in any conversation (`pdfUnread` with the conversation id).
   - Ask. The launch card reads "Read {name} with the PDF tool · {n} pages · {r} reader agents".
   - Sessions. The transcript draws the same chip, block, line, rows and end row from stored lines, the unread line with
-    no button (none in a fork), and the command turn as its row.
+    no button (none for a note that names another session), and the command turn as its row.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip

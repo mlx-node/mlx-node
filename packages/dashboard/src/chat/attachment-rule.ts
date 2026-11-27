@@ -88,8 +88,20 @@ export type PdfWay = 'message' | 'tool';
 export type UserAttachment =
   | { kind: 'file'; name: string; bytes: number }
   | { kind: 'image'; mediaType: string; bytes: number }
-  /** `bytes`, `chars`: decoded size and stored base64 of the pages the message carries (none by the tool). */
-  | { kind: 'pdf'; name: string; pages: number; way: PdfWay; bytes: number; chars: number; id?: string };
+  /**
+   * `bytes`, `chars`: decoded size and stored base64 of the pages the message carries (none by the tool). `session`:
+   * the conversation a stored tool note was sent in, which a fork's copy of the message keeps.
+   */
+  | {
+      kind: 'pdf';
+      name: string;
+      pages: number;
+      way: PdfWay;
+      bytes: number;
+      chars: number;
+      id?: string;
+      session?: string;
+    };
 
 const URI_PREFIX = 'file:///attached/';
 /** UTF-8 length of '→', the agent's separator between a line number and its line. */
@@ -475,11 +487,14 @@ function pagesTokens(family: string | null, sizes: readonly PageSize[]): number 
 
 /**
  * What the note of a PDF says: `message`, its pages are the message's images `from` (from 1, among its image blocks)
- * on; `tool`, they are files the PDF tool reads by `id`.
+ * on; `tool`, they are files the PDF tool reads by `id`, placed for the conversation `session`.
  */
 export type PdfNote =
   | { name: string; pages: number; way: 'message'; from: number }
-  | { name: string; pages: number; way: 'tool'; id: string };
+  | { name: string; pages: number; way: 'tool'; id: string; session: string };
+
+/** As long as an agent's session id: it sizes a tool note before its conversation is known. */
+export const SESSION_ID_SIZED = '00000000-0000-0000-0000-000000000000';
 
 /** The note a PDF carries in the prompt: `key: value` lines the model reads, then one sentence. */
 export function pdfNote(note: PdfNote): string {
@@ -489,6 +504,7 @@ export function pdfNote(note: PdfNote): string {
     return [
       ...head,
       `id: ${note.id}`,
+      `session: ${note.session}`,
       `The pages are image files on disk, not in this message. To read them, call the workflow tool with name read-pdf and args ${args}. Add "pages": "40-60" to read only some pages.`,
     ].join('\n');
   }
@@ -557,8 +573,9 @@ export function readPdfNote(text: string): PdfNote | null {
   if (name === null || name === '' || safeName(name) !== name || pages === null) return null;
   if (way === 'tool') {
     const id = fieldOf(lineAt(lines, 4), 'id');
-    if (id === null || pdfIdPages(id) !== pages) return null;
-    return { name, pages, way, id };
+    const session = fieldOf(lineAt(lines, 5), 'session');
+    if (id === null || pdfIdPages(id) !== pages || session === null || session === '') return null;
+    return { name, pages, way, id, session };
   }
   if (way !== 'message' || pages > PDF_MESSAGE_PAGES) return null;
   const range = fieldOf(lineAt(lines, 4), 'images');
@@ -572,16 +589,17 @@ export function readPdfNote(text: string): PdfNote | null {
 
 /**
  * The note of each PDF among `attachments`, in order: the pictures come first among the image blocks, then the pages
- * of the PDFs the message carries. A PDF for the tool names its id.
+ * of the PDFs the message carries. A PDF for the tool names its id and the conversation `session` it is sent in.
  */
-export function pdfNotes(attachments: readonly AttachmentInput[]): string[] {
+export function pdfNotes(attachments: readonly AttachmentInput[], session: string): string[] {
   let from = 1;
   for (const item of attachments) if (item.kind === 'image') from += 1;
   const notes: string[] = [];
   for (const item of attachments) {
     if (item.kind !== 'pdf') continue;
     if (isToolPdf(item)) {
-      notes.push(pdfNote({ name: item.name, pages: item.pages, way: 'tool', id: pdfToolId(item.stage, item.pages) }));
+      const id = pdfToolId(item.stage, item.pages);
+      notes.push(pdfNote({ name: item.name, pages: item.pages, way: 'tool', id, session }));
       continue;
     }
     notes.push(pdfNote({ name: item.name, pages: item.images.length, way: 'message', from }));
@@ -651,7 +669,9 @@ export function estimateTokens(text: string, attachments: readonly TokenItem[], 
     if (item.kind !== 'pdf') continue;
     if ('stage' in item) {
       const id = pdfToolId(item.stage, item.pages);
-      bytes += numberedBytes(pdfNote({ name: item.name, pages: item.pages, way: 'tool', id }));
+      bytes += numberedBytes(
+        pdfNote({ name: item.name, pages: item.pages, way: 'tool', id, session: SESSION_ID_SIZED }),
+      );
       continue;
     }
     const count = item.images.length;
@@ -749,7 +769,8 @@ export function planPdfs(input: PdfPlanInput): PdfPlan {
       ways.push('tool');
       tools += 1;
       readTokens += tokens;
-      bytes += numberedBytes(pdfNote({ name: pdf.name, pages: count, way: 'tool', id: `xxxxxxxx-${count}` }));
+      const id = `xxxxxxxx-${count}`;
+      bytes += numberedBytes(pdfNote({ name: pdf.name, pages: count, way: 'tool', id, session: SESSION_ID_SIZED }));
     }
   }
   const problem = misses > 0 ? 'room' : tools > 1 ? 'one' : null;

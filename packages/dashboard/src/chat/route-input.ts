@@ -38,6 +38,7 @@ import {
   pdfIdPages,
   pdfNotes,
   safeName,
+  SESSION_ID_SIZED,
   storedPictureChars,
   wellFormed,
   utf8Bytes,
@@ -213,7 +214,7 @@ export function checkAttachments(value: unknown[], text: string): AttachmentInpu
     else if (attachment.kind === 'pdf') pages += attachment.images.length;
     out.push(attachment);
   }
-  for (const note of pdfNotes(out)) bytes += numberedBytes(note);
+  for (const note of pdfNotes(out, SESSION_ID_SIZED)) bytes += numberedBytes(note);
   if (bytes > MESSAGE_FILES_MAX_BYTES || pages > PDF_MESSAGE_PAGES || tool > 1) throw refused;
   if (storedPictureChars(out.map(attachmentView)) > MESSAGE_IMAGES_MAX_BASE64) throw refused;
   return out;
