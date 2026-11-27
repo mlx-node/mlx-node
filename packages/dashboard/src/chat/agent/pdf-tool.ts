@@ -16,6 +16,11 @@ export const READ_PDF_WORKFLOW = 'read-pdf';
 export const PDF_READER_AGENT = 'pdf-reader';
 export const READ_PDF_MARKER = '// Portato read-pdf 1';
 export const PDF_READER_MARKER = '# Portato pdf-reader 1';
+/**
+ * Model families that started the tool from the note in fewer than 5 of 10 tries: when the turn that sent a PDF to
+ * the tool ends with no `read-pdf` run, the host starts it itself, as Read it now does.
+ */
+export const HOST_START_FAMILIES: ReadonlySet<string> = new Set(['gemma4', 'qwen3_5']);
 /** The question a host start carries, in UTF-16 units: the command must stay a message the route takes. */
 export const READ_PDF_QUESTION_MAX = 4_000;
 const FILE_READ_MAX = 1024 * 1024;

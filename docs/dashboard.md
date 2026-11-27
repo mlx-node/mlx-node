@@ -1739,7 +1739,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   for a model that sees images and with at least one page picked; it counts in the answer's cap and touches no folder.
   Any other workflow still asks (`helper-start`). The card of a launch carries `pdfRead: {name, pages, readers}`. Read
   it now (`POST …/pdf-read`) sends the agent's own `/workflow read-pdf {json}` with the message's text as the
-  question: no model call and no permission request.
+  question: no model call and no permission request. For a model of `HOST_START_FAMILIES` (`gemma4`, `qwen3_5`: they
+  started the tool from the note in 2 of 10 tries each, against 10 of 10 for Inkling-2-Mini) the service sends that
+  command itself when the turn that sent the PDF ends (completed, denied, output limit or tool loop) with no new
+  `read-pdf` run; not after a Stop or a failed turn, and not while another turn runs, which leaves Read it now.
   - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
     320 pages: "{name} has {n} pages. Up to 320 pages can be read."); only a PDF of 20 pages or fewer keeps its pages
     in the window too, so a model change moves it between the two ways with no second draw. The page plans the ways
@@ -3049,9 +3052,10 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   a PDF past the message's room and "pdftool" launches `read-pdf` on it (`readPdf` step; `$PDF` and `$RUN` in a
   script's steps stand for the PDF id its note names and the turn's run id): readers one after another, 4 pages
   each, each opening its pages with `read_file` and a live tick, pages 9-12 failing twice, then "combine", the report
-  and the wake. "pdfnot" answers without reading, which leaves the Read it now line; its `/workflow read-pdf` turn
-  starts the same run from the Work scenario's `readPdf` (pages 5-8 fail once). The fake agent stores a tool PDF's
-  note as its own chunk, so the Sessions transcript shows its chip. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
+  and the wake. "pdfnot" answers without reading; on the `qwen3_5` family the host then sends the `/workflow
+  read-pdf` turn itself, and with `MLX_DEV_IMAGE_FAMILY=inkling2` the turn leaves the Read it now line, whose
+  `/workflow read-pdf` turn starts the same run from the Work scenario's `readPdf` (pages 5-8 fail once). The fake
+  agent stores a tool PDF's note as its own chunk, so the Sessions transcript shows its chip. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
   `model_auto_switched` line and `end_turn`, nothing stored): "No model answered." with the agent's words under it;
   the scenario's `session.modelGoneOnLoad` plays the load cases. The fixture's live session stores both picture
   one-shots after its 2nd prompt's chunk, which the Sessions transcript draws before that answer's first call.

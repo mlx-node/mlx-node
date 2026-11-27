@@ -175,9 +175,19 @@ interface GroupView {
   index: number;
 }
 
-function GroupTitle({ group, trailing, live }: { group: TurnGroup; trailing: boolean; live: boolean }): ReactElement {
+function GroupTitle({
+  group,
+  trailing,
+  live,
+  names,
+}: {
+  group: TurnGroup;
+  trailing: boolean;
+  live: boolean;
+  names: ReadonlyMap<string, string>;
+}): ReactElement {
   if (group.number === 0) return <span>Earlier messages</span>;
-  const summary = turnTitle(group.entries);
+  const summary = turnTitle(group.entries, names);
   return (
     <span className="flex min-w-0 items-baseline gap-2">
       <span className="inline-block min-w-[7ch] shrink-0 tabular-nums">
@@ -800,7 +810,7 @@ export function Transcript(props: TranscriptProps): ReactElement {
               data-turn={group.number}
             >
               <Disclosure
-                title={<GroupTitle group={group} trailing={trailing} live={live} />}
+                title={<GroupTitle group={group} trailing={trailing} live={live} names={names} />}
                 meta={<GroupMeta group={group} />}
                 open={openSet.has(index)}
                 onOpenChange={(next) => {

@@ -41,7 +41,7 @@ import { findUserHooks } from './agent/auto.js';
 import type { EndpointReader, InferenceEndpoint } from './agent/endpoint.js';
 import { safeReader } from './agent/endpoint.js';
 import { folderKey, NeverRules, neverNote } from './agent/never-rules.js';
-import { pdfToolBlocked, readPdfCommand } from './agent/pdf-tool.js';
+import { HOST_START_FAMILIES, pdfToolBlocked, READ_PDF_WORKFLOW, readPdfCommand } from './agent/pdf-tool.js';
 import type { PdfFacts } from './agent/permissions.js';
 import { ALLOW_ONCE_OPTION_ID, chatPrompt, REJECT_ONCE_OPTION_ID } from './agent/profiles.js';
 import { tempRoots, type AllowedRoot } from './agent/roots.js';
@@ -54,6 +54,7 @@ import {
   CHAT_PICTURES_MAX_BASE64,
   imageCount,
   isToolPdf,
+  pdfToolId,
   storedPictureChars,
 } from './attachment-rule.js';
 import { checkCommand } from './commands.js';
@@ -191,6 +192,8 @@ const STEER_WORK_ONLY = 'Send now is for Work conversations only.';
 const GOAL_WORK_ONLY = 'A goal is for Work conversations only.';
 const PDF_READ_WORK_ONLY = 'The PDF tool is for Work conversations only.';
 const PDF_GONE = 'No such PDF.';
+/** Ends of a turn after which the host starts a PDF read the model did not start. */
+const HOST_START_OUTCOMES: ReadonlySet<TurnOutcome> = new Set(['completed', 'denied', 'output-limit', 'tool-loop']);
 const STEER_NOT_NOW = 'No answer takes it now. The message stays queued.';
 const STEER_BUSY = 'The answer takes no message at this step.';
 const STEER_LATE = 'The agent did not answer in time. The message stays queued.';
@@ -1248,6 +1251,26 @@ export class ChatService {
     if (sent === null || facts === null || facts.session !== id) throw ApiError.notFound(PDF_GONE);
     if (!facts.images || !(await this.pdfToolWork())) throw chatRouteError('attachment-refused');
     return this.prompt(id, readPdfCommand(pdf, sent.text, sent.name));
+  }
+
+  /**
+   * Work, a model of {@link HOST_START_FAMILIES}: the turn that sent the PDF `pdf` to the tool ended with no new
+   * `read-pdf` run, so the host starts it as Read it now does. Not after a Stop or a failed turn, and not while
+   * another turn runs (Read it now stays offered).
+   */
+  private async hostStartPdf(
+    conversation: Conversation,
+    outcome: TurnOutcome | undefined,
+    before: ReadonlySet<string>,
+    pdf: string,
+  ): Promise<void> {
+    if (outcome === undefined || !HOST_START_OUTCOMES.has(outcome)) return;
+    const id = conversation.info.id;
+    if (this.conversations.get(id) !== conversation) return;
+    const family = (await this.state()).models.find((m) => m.id === conversation.info.modelId)?.family;
+    if (family === null || family === undefined || !HOST_START_FAMILIES.has(family)) return;
+    if (this.hosts.work.runs(id).some((r) => r.name === READ_PDF_WORKFLOW && !before.has(r.runId))) return;
+    await this.readPdf(id, pdf);
   }
 
   /** Work: the PDF tool is there, by the last agent start, else by the files in the agent home. */
@@ -3174,6 +3197,12 @@ export class ChatService {
     }
     conversation.userPrompt(text, attachments.map(attachmentView));
     void started.done.catch(() => {});
+    const toolPdf = conversation.info.mode === 'work' ? attachments.find(isToolPdf) : undefined;
+    if (toolPdf !== undefined) {
+      const before = new Set(host.runs(id).map((r) => r.runId));
+      const pdf = pdfToolId(toolPdf.stage, toolPdf.pages);
+      void started.done.then((end) => this.hostStartPdf(conversation, end.outcome, before, pdf)).catch(() => {});
+    }
     this.updateLive();
     this.busyChanged();
     return { turnId: started.turnId };

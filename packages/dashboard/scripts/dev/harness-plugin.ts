@@ -175,6 +175,8 @@ interface HarnessModel {
 
 /** The harness models whose endpoint row sees images (Qwen3.5 family): pictures in Chat, PDF pages in both modes. */
 const IMAGE_MODELS = new Set(['qwen3.5-4b', 'qwen3.5-9b']);
+/** `MLX_DEV_IMAGE_FAMILY`: the family the image models report (default `qwen3_5`). */
+const IMAGE_FAMILY = process.env.MLX_DEV_IMAGE_FAMILY ?? 'qwen3_5';
 
 const model = (
   name: string,
@@ -302,7 +304,7 @@ export function harnessChatOptions(
           base: entry.base,
           variant: entry.variant,
           format: entry.format,
-          ...(IMAGE_MODELS.has(entry.name) ? { modelType: 'qwen3_5', images: true } : {}),
+          ...(IMAGE_MODELS.has(entry.name) ? { modelType: IMAGE_FAMILY, images: true } : {}),
         })),
       }),
     modelSize: (path) => {

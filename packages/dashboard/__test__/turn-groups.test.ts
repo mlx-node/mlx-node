@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
-import { fill } from '../ui/src/lib/chat-strings.js';
+import { readPdfCommand } from '../src/chat/agent/pdf-tool.js';
+import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import {
   CONTRACT_RETRY_TITLE,
   groupTurns,
@@ -170,6 +171,14 @@ describe('turnTitle', () => {
     expect(turnTitle([{ kind: 'user', ts: 1, text: '  \n ', promptIndex: 0 }])).toBe('(no prompt)');
     expect(turnTitle([{ kind: 'model', ts: 1, modelId: 'm' }])).toBe('(no prompt)');
     expect(turnTitle([])).toBe('(no prompt)');
+  });
+
+  // Mutation: the Read it now command left as the title (its JSON shows) → red.
+  it('reads a Read it now command as the row it draws, by the name of its PDF', () => {
+    const command = readPdfCommand('laz3a7wn-40', 'What are the findings?', 'report.pdf');
+    const turn: TranscriptEntry[] = [{ kind: 'user', ts: 1, text: command, promptIndex: 0 }];
+    expect(turnTitle(turn, new Map([['laz3a7wn-40', 'report.pdf']]))).toBe('You started reading report.pdf');
+    expect(turnTitle(turn)).toBe(CHAT.pdf.hostStartBare);
   });
 
   it('says what woke the agent when no prompt was typed', () => {

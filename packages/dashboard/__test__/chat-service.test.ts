@@ -1244,6 +1244,57 @@ describe('Chat service — attachments', () => {
     }, 20_000);
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
+    // Mutations: the host start left out; the family check dropped; a second start after the model's own run → red.
+    it('Work: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
+      const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
+      const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
+      await withWork(
+        'chat-harness',
+        async (fake, project) => {
+          const svc = fake.service;
+          const texts = (session: string): string[] =>
+            prompts(fake)
+              .filter((p) => p.sessionId === session)
+              .map((p) => (p.prompt as Array<{ text?: string }>)[0]!.text ?? '');
+          /** Sends `text` with a 3-page tool PDF on `model`; its page, and its first turn's end as the page saw it. */
+          const send = async (text: string, model: string) => {
+            const stage = await staged(svc, 3);
+            const { conversation } = await svc.create({
+              mode: 'work',
+              text,
+              cwd: project,
+              modelId: model,
+              attachments: [tool(stage, 3)],
+            });
+            const page = new Page(svc, conversation.id);
+            const ended = () => {
+              const first = page.events[0];
+              return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0) > 0;
+            };
+            return { id: conversation.id, pdf: pdfToolId(stage, 3), page, ended };
+          };
+
+          const skipped = await send('pdfnot', GEMMA.name);
+          await until(() => texts(skipped.id).length === 2, 10_000);
+          expect(texts(skipped.id)).toEqual(['pdfnot', readPdfCommand(skipped.pdf, 'pdfnot', 'report.pdf')]);
+
+          const other = await send('pdfnot', INKLING.name);
+          await until(other.ended, 10_000);
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(texts(other.id)).toEqual(['pdfnot']);
+
+          const own = await send('pdftool', GEMMA.name);
+          await until(() => interactionsOf(own.page).length === 1, 10_000);
+          await svc.answer(own.id, interactionsOf(own.page)[0]!.id, { optionId: 'allow-once' });
+          await until(own.ended, 10_000);
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          expect(texts(own.id)).toEqual(['pdftool']);
+          for (const p of [skipped, other, own]) p.page.detach();
+        },
+        { endpointModels: [GEMMA, INKLING] },
+      );
+    }, 40_000);
+
     it("Work: a file of the person's named like the tool's turns it off, before any agent start", async () => {
       await withWork(
         'work-always',
