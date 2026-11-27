@@ -1,7 +1,7 @@
 name: Rust Lib Test Shard
 
 # Reusable shard runner called by `.github/workflows/ci.yml` under distinct job
-# IDs (`rust-lib-test-1`..`4`) instead of a single matrix job. GitHub Actions'
+# IDs (`rust-lib-test-1`..`6`) instead of a single matrix job. GitHub Actions'
 # matrix aggregator can leave `needs.<matrix>.result == 'success'` when a
 # `macos-26` leg is cancelled before acquiring a runner; distinct job IDs let
 # `done` and `publish` gate explicitly on every shard's success.

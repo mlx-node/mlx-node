@@ -467,6 +467,10 @@ mod tests {
     fn two_aligned_reads_share_one_no_copy_bank() {
         require_metal();
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Flush `MetalAllocator::buffer_cache_` so `PurgeableBank::new` gets an
+        // exact-size fresh `MTLBuffer` rather than an oversized cached buffer
+        // left behind by an earlier test in this process.
+        crate::array::memory::synchronize_and_clear_cache();
         let (temp, source) = TempFile::new("aligned");
         let active_before = get_active_memory();
         let reclaimable_before = reclaimable_purgeable_bytes();
@@ -489,6 +493,7 @@ mod tests {
     fn purgeable_state_round_trip_preserves_unpurged_bytes() {
         require_metal();
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::array::memory::synchronize_and_clear_cache();
         let (temp, source) = TempFile::new("round-trip");
         let bank = filled_bank(&temp);
         let reclaimable_before = reclaimable_purgeable_bytes();
@@ -540,6 +545,11 @@ mod tests {
     fn empty_state_evicts_pages_and_valid_reads_refill_them() {
         require_metal();
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Flush `MetalAllocator::buffer_cache_` before allocating. Any
+        // `MTLBuffer` previously bound to a GPU command buffer by an earlier
+        // test stays kernel-wired in IOGPU's page-table cache even after
+        // `PurgeableState::Empty`, so `mincore` keeps reporting resident pages.
+        crate::array::memory::synchronize_and_clear_cache();
         let (temp, source) = TempFile::new("empty");
         let bank = filled_bank(&temp);
         assert!(resident_pages(&bank).iter().all(|&v| v & 1 != 0));

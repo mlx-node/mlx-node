@@ -29,7 +29,7 @@ concurrency:
 #   lint-ts (ubuntu) ──────────────────────────────────────────────────┐
 #   ts-test-pure (ubuntu) ─────────────────────────────────────────────┤
 #   clippy  (macos) ───────────────────────────────────────────────────┤
-#   rust-lib-build (macos) ─▶ rust-lib-test ×4 (macos) ────────────────┤
+#   rust-lib-build (macos) ─▶ rust-lib-test ×6 (macos) ────────────────┤
 #   rust-int (macos; int + other crates + all --doc) ──────────────────┼─▶ publish (ubuntu, main only)
 #   build (macos) ─┬─▶ ts-test (macos; darwin-ts + addon) ─────────────┤
 #                  └─▶ model-test ×N (macos; main / label) ────────────┤
@@ -511,10 +511,10 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   # Compile mlx-core's `--lib` unit test binary ONCE (~858k LOC), then fan out
-  # its ~6.5k serial tests (`RUST_TEST_THREADS=1`) across 4 parallel macOS
-  # runners in `rust-lib-test-1..4`. Compiling once avoids burning ~17 min of
+  # its ~6.5k serial tests (`RUST_TEST_THREADS=1`) across 6 parallel macOS
+  # runners in `rust-lib-test-1..6`. Compiling once avoids burning ~17 min of
   # duplicate rustc work per shard while cutting the `rust-lib` critical path
-  # from ~35 min down to ~22 min (below `build + ts-test`). Its doc-tests run
+  # from ~35 min down to ~21-22 min (below `build + ts-test`). Its doc-tests run
   # in `rust-int`, reusing the non-test `mlx-core` rlib already built there.
   rust-lib-build:
     name: cargo build (mlx-core lib tests)
@@ -542,8 +542,10 @@ jobs:
         with:
           cache-bin: false
           prefix-key: v2-rust
-          shared-key: rust-lib
-          cache-on-failure: true
+          # Dedicated key with `cache-on-failure: false` so a cancelled mid-build
+          # PR run never saves an immutable partial cache under the primary key.
+          shared-key: rust-lib-build
+          cache-on-failure: false
 
       - name: Cache prebuilt MLX
         uses: actions/cache@v6
@@ -635,12 +637,12 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # Executes mlx-core's `--lib` unit tests in 4 parallel shards using the
-  # precompiled binary from `rust-lib-build` via `_rust-lib-shard.yml`.
+  # Executes mlx-core's `--lib` unit tests in 6 parallel LPT-balanced shards
+  # using the precompiled binary from `rust-lib-build` via `_rust-lib-shard.yml`.
   # Distinct non-matrix job IDs guarantee that a cancelled or missing shard can
   # never be hidden by GitHub's matrix result aggregator in `done` / `publish`.
   rust-lib-test-1:
-    name: cargo test (mlx-core lib 1/4)
+    name: cargo test (mlx-core lib 1/6)
     needs: rust-lib-build
     if: >-
       github.event.action != 'labeled' ||
@@ -648,10 +650,10 @@ jobs:
     uses: ./.github/workflows/_rust-lib-shard.yml
     with:
       shard: 1
-      shard-count: 4
+      shard-count: 6
 
   rust-lib-test-2:
-    name: cargo test (mlx-core lib 2/4)
+    name: cargo test (mlx-core lib 2/6)
     needs: rust-lib-build
     if: >-
       github.event.action != 'labeled' ||
@@ -659,10 +661,10 @@ jobs:
     uses: ./.github/workflows/_rust-lib-shard.yml
     with:
       shard: 2
-      shard-count: 4
+      shard-count: 6
 
   rust-lib-test-3:
-    name: cargo test (mlx-core lib 3/4)
+    name: cargo test (mlx-core lib 3/6)
     needs: rust-lib-build
     if: >-
       github.event.action != 'labeled' ||
@@ -670,10 +672,10 @@ jobs:
     uses: ./.github/workflows/_rust-lib-shard.yml
     with:
       shard: 3
-      shard-count: 4
+      shard-count: 6
 
   rust-lib-test-4:
-    name: cargo test (mlx-core lib 4/4)
+    name: cargo test (mlx-core lib 4/6)
     needs: rust-lib-build
     if: >-
       github.event.action != 'labeled' ||
@@ -681,10 +683,32 @@ jobs:
     uses: ./.github/workflows/_rust-lib-shard.yml
     with:
       shard: 4
-      shard-count: 4
+      shard-count: 6
+
+  rust-lib-test-5:
+    name: cargo test (mlx-core lib 5/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 5
+      shard-count: 6
+
+  rust-lib-test-6:
+    name: cargo test (mlx-core lib 6/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 6
+      shard-count: 6
 
   # Everything plain `cargo test` runs EXCEPT mlx-core's `--lib` (covered by
-  # `rust-lib-build` + `rust-lib-test-1..4`) and the 51 `e2e-tests`-gated real-model/bench integration
+  # `rust-lib-build` + `rust-lib-test-1..6`) and the 51 `e2e-tests`-gated real-model/bench integration
   # binaries (covered by `model-test` and clippy `--all-features`): every
   # ungated integration target across all crates, the unit tests of all other
   # crates (excluding `mlx-sys`, which has 0 unit tests), and ALL workspace
@@ -1304,6 +1328,8 @@ jobs:
       - rust-lib-test-2
       - rust-lib-test-3
       - rust-lib-test-4
+      - rust-lib-test-5
+      - rust-lib-test-6
       - rust-int
       - ts-test-pure
       - ts-test
@@ -1319,6 +1345,8 @@ jobs:
               needs.rust-lib-test-2.result != 'success' ||
               needs.rust-lib-test-3.result != 'success' ||
               needs.rust-lib-test-4.result != 'success' ||
+              needs.rust-lib-test-5.result != 'success' ||
+              needs.rust-lib-test-6.result != 'success' ||
               needs.ts-test-pure.result != 'success' ||
               !contains(needs.*.result, 'success') }}
 
@@ -1339,6 +1367,8 @@ jobs:
       - rust-lib-test-2
       - rust-lib-test-3
       - rust-lib-test-4
+      - rust-lib-test-5
+      - rust-lib-test-6
       - rust-int
       - ts-test-pure
       - ts-test
@@ -1359,6 +1389,8 @@ jobs:
       needs.rust-lib-test-2.result == 'success' &&
       needs.rust-lib-test-3.result == 'success' &&
       needs.rust-lib-test-4.result == 'success' &&
+      needs.rust-lib-test-5.result == 'success' &&
+      needs.rust-lib-test-6.result == 'success' &&
       needs.rust-int.result == 'success' &&
       needs.ts-test-pure.result == 'success' &&
       needs.ts-test.result == 'success' &&
