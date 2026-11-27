@@ -16,7 +16,9 @@ import {
   type PageSize,
   PDF_MESSAGE_PAGES,
   PDF_SOURCE_MAX_BYTES,
+  PDF_TOOL_MAX_PAGES,
   pdfPageSize,
+  type PdfWay,
   safeName,
   TEXT_SNIFF_BYTES,
   type TokenItem,
@@ -26,6 +28,7 @@ import { CHAT, fill } from './chat-strings';
 import type { ChatMode } from './chat-types';
 import { normalizeMime, readFileAsDataUrl } from './file-read';
 import { browserPdfCodec, type PdfCodec, type PdfDocument, PdfOpenError } from './pdf-pages';
+import { rateWords } from './pdf-run';
 import { nextDraftId } from './system-one';
 
 /** A file read into the composer, ready to send. */
@@ -33,8 +36,10 @@ export type DraftAttachment =
   | { id: string; kind: 'file'; name: string; bytes: number; numbered: number; text: string }
   | { id: string; kind: 'image'; name: string; mediaType: ImageMediaType; bytes: number; dataUrl: string }
   /**
-   * A PDF as its page images: base64 JPEG per page with no `data:` prefix, and each page's drawn size. `bytes` is the
-   * JPEG bytes of every page, `chars` their base64.
+   * A PDF as its drawn pages: each page's drawn size; `bytes` the JPEG bytes of every page, `chars` their base64. A PDF
+   * of at most 20 pages holds its pages here (base64 JPEG with no `data:` prefix), so the message can carry them; a
+   * longer one holds none. `stage`: the host's stage that holds every page for the PDF tool, null when this mode has no
+   * tool. `thumbnail`: page 1 as a data URL.
    */
   | {
       id: string;
@@ -44,6 +49,8 @@ export type DraftAttachment =
       chars: number;
       images: readonly string[];
       sizes: readonly PageSize[];
+      stage: string | null;
+      thumbnail: string;
     };
 
 /** A picture decoded upright (the photo's orientation applied). */
@@ -80,6 +87,14 @@ export interface PdfWatch {
   end(id: string): void;
 }
 
+/** The host's stages of the PDF tool, as the page sends a PDF's pages there while it draws them. */
+export interface PdfStageSink {
+  /** Sends page `page` of `pages` (base64 JPEG); `stage` null opens a stage with page 1. Answers the stage. */
+  page(stage: string | null, page: number, pages: number, data: string): Promise<string>;
+  /** Removes a stage whose PDF is not sent. */
+  drop(stage: string): void;
+}
+
 export interface IngestOptions {
   mode: ChatMode;
   /** Chat and the model row has images = true. */
@@ -87,6 +102,8 @@ export interface IngestOptions {
   /** The model row has images = true, in either mode: PDF pages go to it as images. */
   seesPages: boolean;
   watch?: PdfWatch;
+  /** The PDF tool is in this mode: every page also goes to a stage as it is drawn, and a PDF may have 320 pages. */
+  stage?: PdfStageSink;
 }
 
 export interface IngestResult {
@@ -281,20 +298,24 @@ function nextTask(): Promise<void> {
 
 /**
  * Every page is drawn again, one after another, at the size the agent's `read_file` passes through untouched, as
- * JPEG at falling quality until it fits. Any page that does not draw or fit refuses the whole PDF. The file's own
- * bytes are never sent.
+ * JPEG at falling quality until it fits. Any page that does not draw or fit refuses the whole PDF. With the PDF tool
+ * in this mode each page goes to a stage as it is drawn, and only a PDF of at most 20 pages keeps its pages here; a
+ * refusal or a cancel removes the stage. The file's own bytes are never sent.
  */
 async function readPdf(
   file: File,
   name: string,
   codec: PdfCodec,
   watch: PdfWatch | undefined,
+  sink: PdfStageSink | undefined,
 ): Promise<Read<DraftAttachment>> {
   const e = CHAT.attach.errors;
   if (file.size > PDF_SOURCE_MAX_BYTES) return refuse(e.pdfTooLarge, name);
   const id = nextDraftId('pdf');
   const signal = watch?.start(id, name) ?? new AbortController().signal;
+  let stage: string | null = null;
   const failed = (read: Read<DraftAttachment>): Read<DraftAttachment> => {
+    if (stage !== null) sink?.drop(stage);
     watch?.end(id);
     return read;
   };
@@ -310,32 +331,42 @@ async function readPdf(
     const total = doc.pages;
     if (signal.aborted) return failed(CANCELLED);
     if (total === 0) return failed(refuse(e.pdfEmpty, name));
-    if (total > PDF_MESSAGE_PAGES) {
+    if (sink === undefined && total > PDF_MESSAGE_PAGES) {
       return failed({ ok: false, sentence: fill(e.pdfTooLong, { name: noteName(name), n: total }) });
     }
+    if (total > PDF_TOOL_MAX_PAGES) {
+      return failed({ ok: false, sentence: fill(e.pdfTooManyPages, { name: noteName(name), n: total }) });
+    }
+    const keep = total <= PDF_MESSAGE_PAGES;
     watch?.progress(id, { done: 0, total, bytes: 0 });
     const images: string[] = [];
     const sizes: PageSize[] = [];
+    let thumbnail = '';
     let bytes = 0;
     let chars = 0;
     for (let n = 1; n <= total; n += 1) {
       const page = await readPage(doc, n);
       if (signal.aborted) return failed(CANCELLED);
       if (page === null) return failed({ ok: false, sentence: fill(e.pdfPage, { name: noteName(name), n }) });
-      images.push(page.data);
+      if (sink !== undefined) {
+        try {
+          stage = await sink.page(stage, n, total, page.data);
+        } catch {
+          if (signal.aborted) return failed(CANCELLED);
+          return failed(refuse(e.pdfSave, name));
+        }
+        if (signal.aborted) return failed(CANCELLED);
+      }
+      if (keep) images.push(page.data);
+      if (n === 1) thumbnail = `data:image/jpeg;base64,${page.data}`;
       sizes.push(page.size);
       bytes += page.bytes;
       chars += page.data.length;
-      watch?.progress(
-        id,
-        n === 1
-          ? { done: n, total, bytes, thumbnail: `data:image/jpeg;base64,${page.data}` }
-          : { done: n, total, bytes },
-      );
+      watch?.progress(id, n === 1 ? { done: n, total, bytes, thumbnail } : { done: n, total, bytes });
       await nextTask();
       if (signal.aborted) return failed(CANCELLED);
     }
-    return { ok: true, value: { id, kind: 'pdf', name, bytes, chars, images, sizes } };
+    return { ok: true, value: { id, kind: 'pdf', name, bytes, chars, images, sizes, stage, thumbnail } };
   } finally {
     await doc.close().catch(() => undefined);
   }
@@ -389,7 +420,7 @@ export async function ingestFiles(
       if (!options.seesPages) read = refuse(e.pdfModel, name);
       else {
         try {
-          read = await readPdf(file, name, pdfCodec, watch);
+          read = await readPdf(file, name, pdfCodec, watch, options.stage);
         } catch {
           read = refuse(e.pdfDamaged, name);
         }
@@ -454,17 +485,6 @@ export interface PdfDrawing {
   at: number;
 }
 
-function oneDecimal(n: number): string {
-  return n >= 10 ? String(Math.round(n)) : n.toFixed(1);
-}
-
-/** Pages per second as words: per second from 1 a second, else per minute. */
-export function pageRate(perSecond: number): string {
-  return perSecond >= 1
-    ? fill(CHAT.pdf.rateSecond, { n: oneDecimal(perSecond) })
-    : fill(CHAT.pdf.rateMinute, { n: oneDecimal(perSecond * 60) });
-}
-
 /** Elapsed time shows once it passes 1 s, and the rate once 8 pages and 1 s have passed. */
 const DRAW_CLOCK_MS = 1_000;
 const DRAW_RATE_PAGES = 8;
@@ -494,21 +514,35 @@ export function drawCaption(drawing: PdfDrawing, now: number): string {
   if (elapsed >= DRAW_CLOCK_MS) {
     parts.push(fill(CHAT.attach.pdfDrawTime, { n: (elapsed / 1_000).toFixed(1) }));
     const drawn = drawing.at - drawing.startedAt;
-    if (drawing.done >= DRAW_RATE_PAGES && drawn >= DRAW_CLOCK_MS) parts.push(pageRate(drawing.done / (drawn / 1_000)));
+    if (drawing.done >= DRAW_RATE_PAGES && drawn >= DRAW_CLOCK_MS)
+      parts.push(rateWords(drawing.done / (drawn / 1_000)));
   }
   return parts.join(' · ');
 }
 
-/** The wire form of a draft: a picture's `data` is its data URL after the first comma; a PDF sends its pages. */
-export function draftInput(draft: DraftAttachment): AttachmentInput {
+/** A PDF draft goes to the PDF tool: the way says so and its pages are at the host. */
+function toTool(
+  draft: DraftAttachment,
+  way: PdfWay,
+): draft is Extract<DraftAttachment, { kind: 'pdf' }> & {
+  stage: string;
+} {
+  return draft.kind === 'pdf' && way === 'tool' && draft.stage !== null;
+}
+
+/**
+ * The wire form of a draft: a picture's `data` is its data URL after the first comma; a PDF sends its pages, or for
+ * the PDF tool (`way`) its stage and page count.
+ */
+export function draftInput(draft: DraftAttachment, way: PdfWay = 'message'): AttachmentInput {
   if (draft.kind === 'file') return { kind: 'file', name: draft.name, text: draft.text };
+  if (toTool(draft, way)) return { kind: 'pdf', name: draft.name, stage: draft.stage, pages: draft.sizes.length };
   if (draft.kind === 'pdf') return { kind: 'pdf', name: draft.name, images: [...draft.images] };
   return { kind: 'image', mediaType: draft.mediaType, data: draft.dataUrl.slice(draft.dataUrl.indexOf(',') + 1) };
 }
 
-/** A draft as the token estimate reads it: a PDF with each page's drawn size. */
-export function draftTokens(draft: DraftAttachment): TokenItem {
-  return draft.kind === 'pdf'
-    ? { kind: 'pdf', name: draft.name, images: draft.images, sizes: draft.sizes }
-    : draftInput(draft);
+/** A draft as the token estimate reads it: a PDF in the message with each page's drawn size; for the tool, its note. */
+export function draftTokens(draft: DraftAttachment, way: PdfWay = 'message'): TokenItem {
+  if (draft.kind !== 'pdf' || toTool(draft, way)) return draftInput(draft, way);
+  return { kind: 'pdf', name: draft.name, images: draft.images, sizes: draft.sizes };
 }

@@ -1743,6 +1743,185 @@ function startWorkflow(session, w, n) {
   void runWorkflow(run, agent, w);
 }
 
+/** The PDF id a prompt's PDF tool note names (a `resource` block, `id: xxxxxxxx-N` after its marker), or null. */
+function promptPdf(blocks) {
+  for (const block of Array.isArray(blocks) ? blocks : []) {
+    const text = block?.type === 'resource' ? block.resource?.text : undefined;
+    if (typeof text !== 'string' || !text.startsWith('Portato PDF note 1\n')) continue;
+    for (const line of text.split('\n')) if (line.startsWith('id: ')) return line.slice('id: '.length);
+  }
+  return null;
+}
+
+/** `step` with each string `$PDF` in it set to the prompt's PDF id, and each `$RUN` to the turn's run id. */
+function withPdf(step, pdf, run) {
+  if (pdf === null) return step;
+  if (step === '$PDF') return pdf;
+  if (step === '$RUN') return run;
+  if (Array.isArray(step)) return step.map((item) => withPdf(item, pdf, run));
+  if (step === null || typeof step !== 'object') return step;
+  return Object.fromEntries(Object.entries(step).map(([key, value]) => [key, withPdf(value, pdf, run)]));
+}
+
+/** Pages as the script's `range_text` writes them: runs `a-b`, joined by `, `. */
+function pageRange(pages) {
+  const parts = [];
+  for (let k = 0; k < pages.length;) {
+    let end = k;
+    while (end + 1 < pages.length && pages[end + 1] === pages[end] + 1) end += 1;
+    parts.push(end === k ? `${pages[k]}` : `${pages[k]}-${pages[end]}`);
+    k = end + 1;
+  }
+  return parts.join(', ');
+}
+
+// A run of the PDF tool (`read-pdf`), as the saved workflow plays it: in "Read pages" one reader after another, 4
+// pages each ("pages 1-4"), each opening its pages with `read_file`, `pageMs` apart; group `fails` (from 1) returns no
+// notes and is read once more at the end ("pages 9-12 again"), which also fails with `failsTwice`; then "combine" in
+// "Combine notes", the report ("PDF read: R of T pages." and the pages not read) and the wake. `pdf`: the PDF id;
+// `pages`: the pages asked for (all when unset). Stop ends it at any time.
+function readPdfRun(session, w, n, pdf, pages) {
+  const total = Number(pdf.slice(pdf.lastIndexOf('-') + 1));
+  const chosen = pages ?? Array.from({ length: total }, (_, k) => k + 1);
+  const groups = [];
+  for (let k = 0; k < chosen.length; k += 4) groups.push(chosen.slice(k, k + 4));
+  const run = {
+    id: w.runId ?? `wf_pdf_${n}`,
+    session,
+    name: 'read-pdf',
+    objective: w.objective ?? 'Read the PDF.',
+    status: 'active',
+    revision: 0,
+    phases: ['Read pages', 'Combine notes'],
+    phase: 0,
+    budget: 2 * groups.length + 2,
+    agents: [],
+    lastEvent: 'run_started',
+    report: '',
+    startedAt: Date.now(),
+    stopped: false,
+    stopOn: null,
+    stopRejects: false,
+    stopFails: false,
+    drainOn: null,
+    drainStatus: null,
+    pauseDrainOn: null,
+    flow: w,
+    pauseMessage: null,
+  };
+  runs.set(run.id, run);
+  workflowUpdate(run);
+  void playReadPdf(run, w, n, pdf, groups);
+  return run;
+}
+
+/** One agent of a `read-pdf` run: spawned, its pages opened one by one, ended; false when the run was stopped. */
+async function readPdfAgent(run, n, label, pages, pdf, ms, fails) {
+  const session = run.session;
+  const id = `${session.id}-pdf-${n}-${run.agents.length + 1}`;
+  const a = { id, child: id, label, phase: run.phases[run.phase], state: 'running', tokens: 0, durationMs: 0 };
+  const started = Date.now();
+  run.agents.push(a);
+  update(
+    session,
+    'subagent_spawned',
+    {
+      subagent_id: id,
+      child_session_id: id,
+      parent_session_id: session.id,
+      subagent_type: 'pdf-reader',
+      description: label,
+      workflow_run_id: run.id,
+    },
+    true,
+  );
+  helpers.set(id, {
+    session,
+    description: label,
+    startedAt: started,
+    address: null,
+    run: run.id,
+    cancel: () => cancelRunAgent(run, a),
+  });
+  run.lastEvent = 'agent_started';
+  workflowUpdate(run);
+  const child = { id, cwd: session.cwd };
+  const meta = { 'x.ai/tool': xaiTool('read_file') };
+  const step = pages.length === 0 ? ms : ms / pages.length;
+  // The agent's live tick of the reader (never stored): what it does now shows only once one came.
+  const tick = (calls) =>
+    send({
+      method: '_x.ai/session_notification',
+      params: {
+        sessionId: session.id,
+        update: {
+          sessionUpdate: 'subagent_progress',
+          subagent_id: id,
+          parent_session_id: session.id,
+          child_session_id: id,
+          duration_ms: Date.now() - started,
+          context_window_tokens: 32_768,
+          tools_used: ['read_file'],
+          turn_count: 1,
+          tool_call_count: calls,
+          tokens_used: 2_400 * calls,
+          context_usage_pct: Math.min(99, 7 * calls),
+          error_count: 0,
+        },
+      },
+    });
+  tick(0);
+  for (const [k, page] of pages.entries()) {
+    const toolCallId = `${id}-page-${page}`;
+    const path = `/pdf/${pdf}/page-${String(page).padStart(3, '0')}.jpg`;
+    update(child, 'tool_call', { toolCallId, title: `Read \`${path}\``, rawInput: { path }, _meta: meta });
+    tick(k + 1);
+    if (!(await runGate(run, undefined, step)) || a.state !== 'running') return false;
+    update(child, 'tool_call_update', { toolCallId, status: 'completed' });
+  }
+  if (pages.length === 0 && !(await runGate(run, undefined, ms))) return false;
+  if (a.state !== 'running') return !run.stopped;
+  a.state = fails ? 'failed' : 'done';
+  a.tokens = 2_400 * Math.max(1, pages.length);
+  a.durationMs = Date.now() - started;
+  endRunAgent(
+    run,
+    a,
+    fails ? 'failed' : 'completed',
+    fails ? { error: 'The agent returned no output.' } : { output: `Notes of pages ${pageRange(pages)}.` },
+  );
+  workflowUpdate(run);
+  return true;
+}
+
+async function playReadPdf(run, w, n, pdf, groups) {
+  const ms = w.pageMs ?? 900;
+  const read = groups.map(() => false);
+  for (const [k, pages] of groups.entries()) {
+    const fails = w.fails === k + 1;
+    if (!(await readPdfAgent(run, n, `pages ${pageRange(pages)}`, pages, pdf, ms * pages.length, fails))) return;
+    read[k] = !fails && run.agents.at(-1).state === 'done';
+  }
+  for (const [k, pages] of groups.entries()) {
+    if (read[k]) continue;
+    const fails = w.failsTwice === true;
+    if (!(await readPdfAgent(run, n, `pages ${pageRange(pages)} again`, pages, pdf, ms * pages.length, fails))) return;
+    read[k] = !fails && run.agents.at(-1).state === 'done';
+  }
+  run.phase = 1;
+  run.lastEvent = 'phase_started';
+  workflowUpdate(run);
+  if (!(await readPdfAgent(run, n, 'combine', [], pdf, w.combineMs ?? 3_000, false))) return;
+  const unread = groups.filter((_, k) => !read[k]).flat();
+  const done = groups.filter((_, k) => read[k]).flat().length;
+  const head = `PDF read: ${done} of ${groups.flat().length} pages.${unread.length === 0 ? '' : ` Not read: ${pageRange(unread)}.`}`;
+  run.report = `${head}\n\n${w.answer ?? 'The findings are on pages 3 and 7 (p. 3, p. 7).'}\n\nNotes by page\n…`;
+  run.status = 'complete';
+  run.lastEvent = 'run_finished';
+  workflowUpdate(run);
+  await wakeTurn(run.session, `workflow-completed-${run.id}-${run.revision}`, w);
+}
+
 /** An agent beside a run's first: one tool call of its own after its gate, left open until it ends. */
 async function runMoreAgent(run, a, m, cwd) {
   if (typeof m.command !== 'string') return;
@@ -2073,6 +2252,25 @@ function manageRun(session, text) {
   if (op === 'pause') void pauseDrain(run, cancelled);
   else if (active) void drainRun(run, cancelled);
   return op === 'stop' ? `Stopped ${run.name}.` : `Paused ${run.name}.`;
+}
+
+/**
+ * `/workflow read-pdf {"pdf": …}` (the app's Read it now): the agent starts the PDF tool's run itself, played as
+ * {@link readPdfRun} with the Work scenario's `readPdf`. Null for any other text, and with no `readPdf` in the scenario.
+ */
+function readPdfStart(session, text) {
+  const head = '/workflow read-pdf ';
+  if (workSection?.readPdf === undefined || !text.trim().startsWith(head)) return null;
+  let args = null;
+  try {
+    args = JSON.parse(text.trim().slice(head.length));
+  } catch {
+    return 'The args are not JSON.';
+  }
+  if (typeof args?.pdf !== 'string') return 'read-pdf needs a pdf.';
+  session.steps = (session.steps ?? 0) + 1;
+  const run = readPdfRun(session, { ...workSection.readPdf, objective: args.objective }, session.steps, args.pdf, null);
+  return `Started workflow read-pdf (${run.id}).`;
 }
 
 // The statuses a stop does not apply to.
@@ -2660,7 +2858,10 @@ async function runPrompt(id, params) {
   // its output a live and stored `hostTurn` agent chunk, then `end_turn`. A script whose `match` names it plays instead;
   // a `goal` script plays only `/goal <objective>`, as `/goal pause|resume|clear|status` are the agent's own.
   const builtin =
-    index === -1 || (scripts[index].match ?? '') === '' || scripts[index].goal !== undefined
+    index === -1 ||
+    (scripts[index].match ?? '') === '' ||
+    scripts[index].goal !== undefined ||
+    text.trim().startsWith('/workflow read-pdf ')
       ? hostTurnCommand(session, text)
       : null;
   if (builtin !== null) {
@@ -2681,7 +2882,7 @@ async function runPrompt(id, params) {
     });
     // The scenario's words stand for a built-in typed bare (`/goal`, its status); a goal command says the agent's own.
     const scripted = goalWord === null || goalWord === '' || goalWord === 'status';
-    const managed = builtin === 'workflow' ? manageRun(session, text) : null;
+    const managed = builtin === 'workflow' ? (readPdfStart(session, text) ?? manageRun(session, text)) : null;
     const said = managed ?? (scripted ? scenario.hostTurnText?.[builtin] : undefined) ?? goalSaid ?? `Ran /${builtin}.`;
     update(session, 'agent_message_chunk', { content: { type: 'text', text: said }, _meta: { hostTurn: true } });
     persistSummary(session);
@@ -2730,6 +2931,19 @@ async function runPrompt(id, params) {
     },
     _meta: { eventId: `${session.id}-${++seq}`, agentTimestampMs: Date.now() },
   });
+  // The note of a PDF for the PDF tool, its own stored chunk, as the agent stores each block of a prompt.
+  for (const block of Array.isArray(params.prompt) ? params.prompt : []) {
+    if (promptPdf([block]) === null) continue;
+    persistLine(session, 'session/update', {
+      sessionId: session.id,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        content: block,
+        _meta: { modelId: session.model, promptIndex: session.messages - 1 },
+      },
+      _meta: { eventId: `${session.id}-${++seq}`, agentTimestampMs: Date.now() },
+    });
+  }
   // `promptPictures`: the agent's one-shots on the prompt's own pictures, made after its chunks (`turn.rs` writes the
   // chunks, then runs `normalize_images_with_notices`), sent and stored: `image_dropped` by default, or the
   // `sessionUpdate` named. The real store can put a later picture chunk of the prompt after them.
@@ -2748,7 +2962,10 @@ async function runPrompt(id, params) {
   }
   // Step numbers run on across the session's turns, so tool call ids stay unique, as the agent's are.
   let n = session.steps ?? 0;
-  for (const step of script.steps) {
+  const pdf = promptPdf(params.prompt);
+  const pdfRunId = `wf_pdf_${n + 1}`;
+  for (const scripted of script.steps) {
+    const step = withPdf(scripted, pdf, pdfRunId);
     if (session.turn === null) return;
     if (session.turn.cancelled) return endCancelled(id, session, 'MidTurnAbort');
     n += 1;
@@ -3012,12 +3229,13 @@ async function runPrompt(id, params) {
       record({ kind: 'exec', toolCallId, via, grantedBy });
       const output =
         p.outputEnv !== undefined ? `${p.outputEnv}=${process.env[p.outputEnv] ?? ''}` : (p.output ?? 'done');
-      // `complete: false`: a call that never reports its end.
+      // `complete: false`: a call that never reports its end. `rawOutput`: the tool's own result (a run's id).
       if (p.complete !== false) {
         update(session, 'tool_call_update', {
           toolCallId,
           status: 'completed',
           content: [{ type: 'content', content: { type: 'text', text: output } }],
+          ...(p.rawOutput === undefined ? {} : { rawOutput: p.rawOutput }),
         });
       }
     } else if (step.planMode !== undefined) {
@@ -3236,6 +3454,9 @@ async function runPrompt(id, params) {
       await shellStep(session, step.shell, step.shell.id ?? `toolu_${n}`);
     } else if (step.workflow !== undefined) {
       startWorkflow(session, step.workflow, n);
+    } else if (step.readPdf !== undefined) {
+      // With no PDF for the tool in the prompt, the model has none to read.
+      if (step.readPdf.pdf !== '$PDF') readPdfRun(session, step.readPdf, n, step.readPdf.pdf, null);
     } else if (step.runControl !== undefined) {
       runControlStep(session, step.runControl, step.runControl.id ?? `toolu_${n}`);
     } else if (step.plan !== undefined) {

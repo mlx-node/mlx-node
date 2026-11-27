@@ -9,7 +9,9 @@ import { progressLine } from '../ui/src/components/arc-x/activity-rail/progress-
 import type { AgentEnd, AgentNow, AgentRow } from '../ui/src/lib/agents.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { HelperProgress } from '../ui/src/lib/chat-types.js';
-import { CONTEXT_WARN_PCT, nowWords, rowWords } from '../ui/src/lib/helper-words.js';
+import { formatDuration } from '../ui/src/lib/format.js';
+import { CONTEXT_WARN_PCT, nowWords, readerWords, rowWords } from '../ui/src/lib/helper-words.js';
+import { pageOpened, readerFact } from '../ui/src/lib/pdf-run.js';
 
 const T0 = 1_795_674_158_000;
 const RUN = 'wf_01a2168534c27fd1a477edb6fad7b0a4';
@@ -179,5 +181,59 @@ describe("the rail's live line of an agent", () => {
     expect(quiet.startsWith(`${fill(a.progressQuiet, { time: '0:25' })} · ${fill(a.progressCalls, { n: 4 })}`)).toBe(
       true,
     );
+  });
+});
+
+describe('readerWords', () => {
+  const P = CHAT.pdf;
+  const reader = { pages: [41, 42, 43, 44], again: false };
+  const request = (phase: 'queued' | 'prefill' | 'decode', done: number | null = null) => ({
+    session: 'child-1',
+    modelId: 'm',
+    phase,
+    startedAt: T0,
+    prefillDone: done,
+    prefillTotal: done === null ? null : 4_300,
+    generated: null,
+  });
+
+  it("running: the engine's words for its session, then its time; the page it opened on the second line", () => {
+    const live = { progress: tick(), now: T0 + 136_000 };
+    const words = readerWords(now('running'), live, {
+      reader,
+      engine: readerFact(request('prefill', 2_100)),
+      opened: 43,
+    });
+    expect(words.word).toBe(fill(P.readerFacts.readingOf, { done: '2,100', total: '4,300' }));
+    expect(words.facts).toEqual(['2:16']);
+    expect(words.sub.at(-1)).toBe(fill(P.readerOpened, { n: 43 }));
+    expect(readerFact(request('prefill', 0))).toBe(P.readerFacts.reading);
+    expect(readerFact(request('queued'))).toBe(P.readerFacts.waiting);
+    expect(readerFact(request('decode'))).toBe(P.readerFacts.writing);
+    expect(readerWords(now('running'), live, { reader, engine: null, opened: null }).word).toBe(
+      rowWords(now('running'), live).word,
+    );
+  });
+
+  it('a second try says so; a failed reader says what becomes of its pages; an ended one drops its step', () => {
+    const live = { progress: null, now: T0 };
+    const failed = readerWords(now('failed', { durationMs: 48_000 }), live, { reader, engine: null, opened: 43 });
+    expect(failed.reason).toBe(P.readerFailed);
+    expect(failed.facts).toEqual([formatDuration(48_000)]);
+    expect(failed.sub.some((line) => line === fill(P.readerOpened, { n: 43 }))).toBe(false);
+    const twice = readerWords(now('failed', { durationMs: 48_000 }), live, {
+      reader: { ...reader, again: true },
+      engine: null,
+      opened: null,
+    });
+    expect(twice.reason).toBe(P.readerFailedTwice);
+    expect(twice.facts[0]).toBe(P.readerFacts.again);
+  });
+
+  it('the page a read names: page-NNN.jpg at the end of its path, else none', () => {
+    expect(pageOpened('Read `/x/work-pdf/abcdefgh-40/page-043.jpg`')).toBe(43);
+    expect(pageOpened('Read `/x/page-04.jpg`')).toBeNull();
+    expect(pageOpened('Read `/x/page-000.jpg`')).toBeNull();
+    expect(pageOpened('Read `/x/notes.md`')).toBeNull();
   });
 });

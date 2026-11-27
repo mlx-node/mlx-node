@@ -8,6 +8,7 @@ import type { AgentNow } from './agents';
 import { CHAT, fill } from './chat-strings';
 import type { RunBy, RunView } from './chat-types';
 import { formatClock, formatCount, formatDuration } from './format';
+import { type PdfRun, pdfRunOf } from './pdf-run';
 import type { TranscriptEntry } from './types';
 import { type RunPlace, runPlaces } from './work-tools';
 
@@ -483,13 +484,16 @@ export interface EndRow {
   cut: boolean;
 }
 
-/** The end row of a run's wake: everything from the stored update its prompt id names. Null for any other wake. */
-export function endRowOf(wake: WakeEntry): EndRow | null {
+/**
+ * The end row of a run's wake: everything from the stored update its prompt id names; `name` is the block's own name
+ * when it has one (a PDF run's). Null for any other wake.
+ */
+export function endRowOf(wake: WakeEntry, shownName?: string): EndRow | null {
   const run = wake.workflow;
   if (wake.cause !== 'workflow' || run === undefined) return null;
   const f = CHAT.run.finished;
   const shot = run.snapshot;
-  const name = run.name;
+  const name = shownName ?? run.name;
   if (shot === null) return { title: fill(f.ended, { name }), facts: [], tone: 'neutral', report: null, cut: false };
   const elapsed = formatDuration(shot.elapsedMs);
   const agents =
@@ -712,6 +716,8 @@ export interface RunFacts {
   wakes: WakeEntry[];
   /** The newest of them, by entry index ({@link wakeAt}). */
   resultAt: number | null;
+  /** A run of the PDF tool ({@link pdfRunOf}); null for any other run. */
+  pdf: PdfRun | null;
 }
 
 export interface RunsAt {
@@ -724,8 +730,14 @@ export interface RunsAt {
   names: ReadonlyMap<string, string>;
 }
 
+function samePdf(a: PdfRun | null, b: PdfRun | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.id === b.id && a.name === b.name && a.by === b.by && a.pages.join(',') === b.pages.join(',');
+}
+
 function sameFacts(a: RunFacts, b: RunFacts): boolean {
   return (
+    samePdf(a.pdf, b.pdf) &&
     a.entry === b.entry &&
     a.place.at === b.place.at &&
     a.place.kind === b.place.kind &&
@@ -771,6 +783,7 @@ export function runsAt(entries: readonly TranscriptEntry[], previous?: RunsAt): 
     const entry = at === null ? null : (entries[at] as RunEntry);
     const launch = place.kind === 'launch' ? (entries[place.at] as ToolEntry) : null;
     const facts: RunFacts = {
+      pdf: pdfRunOf(entries, { entry, launch, place }),
       runId,
       entry,
       place,
@@ -794,4 +807,11 @@ export function runsAt(entries: readonly TranscriptEntry[], previous?: RunsAt): 
   )
     return previous;
   return { runs, blocks, dataOnly, names };
+}
+
+/** The PDF ids the conversation's runs of the PDF tool read. */
+export function startedPdfs(runs: RunsAt): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const facts of runs.runs.values()) if (facts.pdf !== null) ids.add(facts.pdf.id);
+  return ids;
 }

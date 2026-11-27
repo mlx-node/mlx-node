@@ -48,6 +48,13 @@
  * Files: qwen3.5-4b and qwen3.5-9b see images, so they take pictures in Chat and PDFs (up to 20 pages, drawn into page
  * images in the composer) in both modes; every other model refuses both. With `MLX_DEV_FLIGHT=chat`, a Work message
  * with a PDF and the word "pdfwait" waits 40 s before any work, so its wait line names the pages it reads.
+ * The PDF tool (Work): a PDF of up to 320 pages goes to the host page by page as it is drawn; one past the message's
+ * room reads "40 pages · read by the PDF tool". The Work word "pdftool" asks to start `read-pdf` on it (the card reads
+ * "Read report.pdf with the PDF tool · 40 pages · 10 reader agents"); Allow runs the block "Reading report.pdf": one
+ * reader after another, 4 pages each, each row with the page it opened; pages 9-12 fail twice, so the end reads "36 of
+ * 40 pages read · … · pages 9-12 not read". The Work word "pdfnot" answers without reading the PDF: the turn ends with
+ * "The pages of report.pdf were not read." and Read it now, which starts the run as your own `/workflow` turn ("You
+ * started reading report.pdf"); its pages 5-8 fail once and are read at the end.
  * Pictures in tool results: the Work words "picture" and "readpdf" read a picture and three pages of a 12-page PDF; the
  * read row reads "1 picture · …" or "3 of 12 pages · …" and opens to tiles read from disk, and a tile opens the viewer
  * (← →, − + 0, Esc). The live Work session's 2nd answer reads a screenshot and a PDF the same way.

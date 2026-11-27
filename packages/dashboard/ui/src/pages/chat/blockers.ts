@@ -12,6 +12,8 @@ import {
   MESSAGE_FILES_MAX_BYTES,
   numberedBytes,
   pdfNotes,
+  type PdfPlan,
+  type PdfWay,
   planPdfs,
   storedPictureChars,
   type UserAttachment,
@@ -313,6 +315,40 @@ export function heldPictureChars(entries: readonly TranscriptEntry[]): number {
 }
 
 /**
+ * Which way each PDF of the files goes ({@link planPdfs}), and what the message and the readers cost; null with no
+ * PDF. The tool takes them only when every PDF's pages are at the host: one drawn while this mode had no tool has none.
+ */
+export function attachPlan(facts: Omit<AttachFacts, 'reading'>): PdfPlan | null {
+  const pdfs = facts.files.flatMap((file) => (file.kind === 'pdf' ? [file] : []));
+  if (pdfs.length === 0) return null;
+  const others: AttachmentInput[] = [];
+  for (const file of facts.files) if (file.kind !== 'pdf') others.push(draftInput(file));
+  return planPdfs({
+    text: facts.text,
+    attachments: others,
+    pdfs,
+    family: facts.family,
+    window: facts.windowTokens,
+    contextUsed: facts.contextUsed,
+    held: facts.heldImages,
+    stored: facts.heldPictures,
+    tool: facts.pdfTool && pdfs.every((pdf) => pdf.stage !== null),
+  });
+}
+
+/** Each file's way: a PDF's by the plan, in the order added; every other file goes in the message. */
+export function fileWays(files: readonly DraftAttachment[], plan: PdfPlan | null): PdfWay[] {
+  let n = 0;
+  return files.map((file) => (file.kind === 'pdf' ? (plan?.ways[n++] ?? 'message') : 'message'));
+}
+
+/** The files of a message as they are sent: each PDF its pages, or its stage when the plan sends it to the tool. */
+export function messageInputs(files: readonly DraftAttachment[], plan: PdfPlan | null): AttachmentInput[] {
+  const ways = fileWays(files, plan);
+  return files.map((file, i) => draftInput(file, ways[i]));
+}
+
+/**
  * Why a message with these files cannot go, first match wins; null when it can. The composer shows it beside Send,
  * and `send()` checks it again, so Retry and Send again cannot pass it.
  */
@@ -321,38 +357,32 @@ export function attachProblem(facts: AttachFacts): string | null {
   if (facts.reading > 0) return a.reading;
   if (facts.files.length === 0) return null;
   const pictures = facts.files.some((file) => file.kind === 'image');
-  const pdfs = facts.files.flatMap((file) => (file.kind === 'pdf' ? [file] : []));
+  const pdfs = facts.files.some((file) => file.kind === 'pdf');
   if (pictures && facts.mode === 'work') return a.blockedWork;
   if (pictures && !facts.seesImages) return a.blockedModel;
-  if (pdfs.length > 0 && !facts.seesPages) return a.blockedPdfModel;
+  if (pdfs && !facts.seesPages) return a.blockedPdfModel;
+  const plan = attachPlan(facts);
+  if (plan?.problem === 'one') return a.blockedPdfOne;
+  if (plan?.problem === 'room') return a.blockedPdfRoom;
   const others: AttachmentInput[] = [];
   for (const file of facts.files) if (file.kind !== 'pdf') others.push(draftInput(file));
-  if (pdfs.length > 0) {
-    const plan = planPdfs({
-      text: facts.text,
-      attachments: others,
-      pdfs,
-      family: facts.family,
-      window: facts.windowTokens,
-      contextUsed: facts.contextUsed,
-      held: facts.heldImages,
-      stored: facts.heldPictures,
-      tool: facts.pdfTool,
-    });
-    if (plan.problem === 'one') return a.blockedPdfOne;
-    if (plan.problem === 'room') return a.blockedPdfRoom;
-  }
   if (pictures && facts.heldPictures + storedPictureChars(others.map(attachmentView)) > CHAT_PICTURES_MAX_BASE64) {
     return CHAT.sendErrors['pictures-full'][0];
   }
+  const ways = fileWays(facts.files, plan);
   let bytes = utf8Bytes(facts.text);
   for (const file of facts.files) if (file.kind === 'file') bytes += file.numbered;
-  for (const note of pdfNotes(facts.files.map(draftInput))) bytes += numberedBytes(note);
+  for (const note of pdfNotes(messageInputs(facts.files, plan))) bytes += numberedBytes(note);
   if (bytes > MESSAGE_FILES_MAX_BYTES) return a.blockedLong;
   const window = facts.windowTokens;
   if (
     window !== null &&
-    estimateTokens(facts.text, facts.files.map(draftTokens), facts.family) > window * WINDOW_SHARE
+    estimateTokens(
+      facts.text,
+      facts.files.map((file, i) => draftTokens(file, ways[i])),
+      facts.family,
+    ) >
+      window * WINDOW_SHARE
   ) {
     return a.blockedWindow;
   }

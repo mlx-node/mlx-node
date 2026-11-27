@@ -98,9 +98,9 @@ import {
   type DraftAttachment,
   drawCaption,
   drawCount,
-  draftInput,
   draftTokens,
   drawingNow,
+  type PdfStageSink,
   type PdfWatch,
 } from '../lib/chat-attachments';
 import { isSlashText, slashRest, type AppCommand as AppCommandName } from '../lib/chat-input';
@@ -143,8 +143,11 @@ import { useScrollRoot } from '../shell/scroll-root';
 import { messageAgent, stopAgent } from './chat/agent-actions';
 import { AgentPane } from './chat/agent-pane';
 import {
+  attachPlan,
   attachProblem,
+  fileWays,
   heldPictureChars,
+  messageInputs,
   type BlockAction,
   copyDetails,
   engineLostNotice,
@@ -251,6 +254,8 @@ interface Sending {
   mode: ChatMode;
   text: string;
   files: readonly DraftAttachment[];
+  /** The files as they are sent, each PDF by its way. */
+  inputs: readonly AttachmentInput[];
   /** Entries of the conversation when it was sent: the stream has it once there are more. */
   base: number;
   lastEnd: ConversationState['lastEnd'];
@@ -284,6 +289,24 @@ function settleFailed(place: string): void {
     place,
     record.restored ? null : { ...record, strip: { tone: 'danger', text, action: { label, kind: 'retry' } } },
   );
+}
+
+/** The host's stages of the PDF tool: the pages of a PDF, one call each, in order. */
+const PDF_STAGE: PdfStageSink = {
+  page: async (stage, page, pages, data) =>
+    (await mutate<{ stage: string }>('POST', '/chat/pdf-stage', { stage, page, pages, data })).stage,
+  drop: (stage) => {
+    mutate('DELETE', `/chat/pdf-stage/${encodeURIComponent(stage)}`).catch(() => undefined);
+  },
+};
+
+/** A sent PDF whose pages went in the message no longer needs the stage that also holds them. */
+function dropSentStages(files: readonly DraftAttachment[], inputs: readonly AttachmentInput[]): void {
+  files.forEach((file, i) => {
+    const input = inputs[i];
+    if (file.kind === 'pdf' && file.stage !== null && input?.kind === 'pdf' && !('stage' in input))
+      PDF_STAGE.drop(file.stage);
+  });
 }
 
 const NO_RAISED: ChatHostState['permissionRaised'] = [];
@@ -1114,11 +1137,13 @@ export default function Chat(): ReactElement {
       if (prior !== null && readFailed(origin) === prior) writeFailed(origin, null, epoch);
     };
     const base = fromNew ? 0 : (conv?.entries.length ?? 0);
+    const inputs = messageInputs(files, attachPlan({ ...attachFacts, text, files }));
     const next: Sending = {
       conversationId: target,
       mode,
       text,
       files,
+      inputs,
       base,
       lastEnd: fromNew ? null : (conv?.lastEnd ?? null),
       ts: Date.now(),
@@ -1131,7 +1156,7 @@ export default function Chat(): ReactElement {
     if (files.length > 0 && stored.length === files.length && stored.every((item, i) => item.id === files[i]!.id)) {
       writeAttachments(origin, []);
     }
-    const attachments: AttachmentInput[] | undefined = files.length > 0 ? files.map(draftInput) : undefined;
+    const attachments: AttachmentInput[] | undefined = files.length > 0 ? inputs : undefined;
     // Work: `false` makes the agent leave plan mode, so a message always carries what the chip shows.
     const planSent = mode === 'work' ? plan.next : undefined;
     stick.pin();
@@ -1171,6 +1196,7 @@ export default function Chat(): ReactElement {
         }
         const id = reply.conversation.id;
         sent();
+        dropSentStages(files, inputs);
         writePlan(origin, null);
         setLastSent({ place: id, text, files });
         const answered = reply.conversation.permissionMode;
@@ -1195,6 +1221,7 @@ export default function Chat(): ReactElement {
           ...(planSent === undefined ? {} : { plan: planSent }),
         });
         sent();
+        dropSentStages(files, inputs);
         setLastSent({ place: target, text, files });
       }
     } catch (err) {
@@ -1274,7 +1301,8 @@ export default function Chat(): ReactElement {
     if (files.length > 0 && stored.length === files.length && stored.every((item, i) => item.id === files[i]!.id)) {
       writeAttachments(origin, []);
     }
-    const attachments: AttachmentInput[] | undefined = files.length > 0 ? files.map(draftInput) : undefined;
+    const inputs = messageInputs(files, attachPlan({ ...attachFacts, text, files }));
+    const attachments: AttachmentInput[] | undefined = files.length > 0 ? inputs : undefined;
     const planSent = mode === 'work' ? plan.next : undefined;
     try {
       const reply = await mutate<
@@ -1285,6 +1313,7 @@ export default function Chat(): ReactElement {
         ...(planSent === undefined ? {} : { plan: planSent }),
         whenBusy,
       });
+      dropSentStages(files, inputs);
       if ('steered' in reply) announce(CHAT.queue.status.sent);
       else if ('queued' in reply) {
         announce(fill(CHAT.queue.status.queued, { n: queued.items.length + 1 }));
@@ -1379,14 +1408,14 @@ export default function Chat(): ReactElement {
     };
     attachDrafts(
       files,
-      { mode, seesImages, seesPages, watch },
+      { mode, seesImages, seesPages, watch, ...(pdfTool ? { stage: PDF_STAGE } : {}) },
       { read: () => readAttachments(origin), write: (items) => writeAttachments(origin, items, epoch) },
     )
       .then(
         (result) => {
           for (const item of result.added) {
             if (item.kind !== 'pdf') continue;
-            const pages = item.images.length;
+            const pages = item.sizes.length;
             announce(fill(pages === 1 ? CHAT.attach.pdfReadyOne : CHAT.attach.pdfReady, { name: item.name, n: pages }));
           }
           const first = result.refused[0];
@@ -1407,10 +1436,12 @@ export default function Chat(): ReactElement {
   };
   const removeAttachment = (id: string): void => {
     if (!stopPending(place, id)) {
+      const removed = readAttachments(place).find((item) => item.id === id);
       writeAttachments(
         place,
         readAttachments(place).filter((item) => item.id !== id),
       );
+      if (removed?.kind === 'pdf' && removed.stage !== null) PDF_STAGE.drop(removed.stage);
     }
     setAttachNote(null);
   };
@@ -1572,6 +1603,15 @@ export default function Chat(): ReactElement {
             open: (path) => void navigate(path),
           }),
     [conversationId, announce, navigate, messageDrafts],
+  );
+
+  // Work: Read it now of a PDF the PDF tool did not read. The agent starts the run itself, as a turn of the host's.
+  const readPdfNow = useCallback(
+    async (pdf: string): Promise<void> => {
+      if (conversationId === null) return;
+      await mutate('POST', `${conversationPath(conversationId)}/pdf-read`, { pdf });
+    },
+    [conversationId],
   );
 
   // Work: the goal strip's buttons. The strip keeps its last true state; a press that failed is a toast. After Clear the
@@ -2669,7 +2709,7 @@ export default function Chat(): ReactElement {
   if (sendingHere && sending !== null) {
     if (entries.length <= sending.base) {
       const sent: TranscriptEntry = { kind: 'user', ts: sending.ts, text: sending.text, promptIndex: null };
-      if (sending.files.length > 0) sent.attachments = sending.files.map((file) => attachmentView(draftInput(file)));
+      if (sending.inputs.length > 0) sent.attachments = sending.inputs.map(attachmentView);
       entries = [...entries, sent];
     }
     threadTurn = turn ?? STARTING;
@@ -3011,6 +3051,7 @@ export default function Chat(): ReactElement {
         openAgent={viewRow?.childId ?? null}
         agentMarksOpen={marksOpen}
         live={conv?.live}
+        onReadPdf={mode === 'work' && seesPages && pdfTool ? readPdfNow : undefined}
         agentLive={conv?.conversation.hot === true}
         rewind={threadRewind}
         onRemoveRule={mode === 'work' ? removeThreadRule : undefined}
@@ -3080,7 +3121,10 @@ export default function Chat(): ReactElement {
           : CHAT.attach.noteNoImages,
   };
   const pictureProblem = seesImages ? undefined : mode === 'work' ? CHAT.attach.chipWork : CHAT.attach.chipModel;
-  const chips = held.map((item): AttachmentChipItem => {
+  // Which way each held PDF goes now: a model change or a fuller conversation can move one, with no second draw.
+  const heldPlan = held.length > 0 ? attachPlan({ ...attachFacts, text: draft, files: held }) : null;
+  const heldWays = fileWays(held, heldPlan);
+  const chips = held.map((item, index): AttachmentChipItem => {
     if (item.kind === 'file') return { id: item.id, kind: 'file', name: item.name, bytes: item.bytes };
     if (item.kind === 'pdf') {
       return {
@@ -3088,8 +3132,9 @@ export default function Chat(): ReactElement {
         kind: 'pdf',
         name: item.name,
         bytes: item.bytes,
-        pages: item.images.length,
-        thumbnail: `data:image/jpeg;base64,${item.images[0] ?? ''}`,
+        pages: item.sizes.length,
+        thumbnail: item.thumbnail,
+        way: heldWays[index],
         problem: seesPages ? undefined : CHAT.attach.chipModel,
       };
     }
@@ -3116,8 +3161,16 @@ export default function Chat(): ReactElement {
   }
   const drawn = drawingNow(pendingChips);
   const drawNow = useNow(drawn !== undefined);
-  const estimate = held.length > 0 ? estimateTokens(draft, held.map(draftTokens), family) : 0;
+  const estimate =
+    held.length > 0
+      ? estimateTokens(
+          draft,
+          held.map((item, index) => draftTokens(item, heldWays[index])),
+          family,
+        )
+      : 0;
   const nearFull = windowTokens !== null && (contextUsed ?? 0) + estimate > windowTokens * WINDOW_SHARE;
+  const readTokens = heldWays.includes('tool') ? (heldPlan?.readTokens ?? 0) : null;
   const attachStrip = (
     <AttachmentStrip
       items={chips}
@@ -3129,7 +3182,10 @@ export default function Chat(): ReactElement {
           : held.length === 0
             ? undefined
             : {
-                text: fill(nearFull ? CHAT.attach.tokensNearFull : CHAT.attach.tokens, { n: formatNumber(estimate) }),
+                text:
+                  readTokens !== null
+                    ? fill(CHAT.attach.pdfToolTokens, { n: formatNumber(estimate), m: formatNumber(readTokens) })
+                    : fill(nearFull ? CHAT.attach.tokensNearFull : CHAT.attach.tokens, { n: formatNumber(estimate) }),
                 tone: nearFull ? 'warning' : 'muted',
               }
       }

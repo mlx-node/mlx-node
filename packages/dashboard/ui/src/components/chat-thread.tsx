@@ -77,6 +77,7 @@ import {
   turnStartedAt,
   turnStats,
   turnStatsTitle,
+  type EngineRequest,
   type OutcomeLine,
   type ReadCounts,
   type RetryNotice,
@@ -101,6 +102,7 @@ import type {
 import { formatBytes, formatClock, formatCount } from '../lib/format';
 import { type RowWords, rowWords } from '../lib/helper-words';
 import { truncateMiddle } from '../lib/labels';
+import { hostStartWords, pdfNames, pdfRunName, pdfUnread } from '../lib/pdf-run';
 import {
   type AllowedMark,
   allowedWord,
@@ -111,7 +113,7 @@ import {
   subagentAllowedText,
   subagentDeniedText,
 } from '../lib/permission-text';
-import { countWords, runCounts, type RunsAt, runsAt } from '../lib/run-view';
+import { countWords, runCounts, type RunsAt, runsAt, startedPdfs } from '../lib/run-view';
 import { wakeTitle } from '../lib/sessions';
 import type { TranscriptEntry, TurnMetric } from '../lib/types';
 import type { WebResult } from '../lib/web-result-text';
@@ -170,6 +172,7 @@ import { CompactionMark } from './compaction-mark';
 import { RecapRow } from './history-mark';
 import { NoteRow } from './note-row';
 import { NoticeRow } from './notice-row';
+import { PdfUnreadRow } from './pdf-unread-row';
 import { PlanModeLine } from './plan-mode-line';
 import { RuleRow } from './rule-row';
 import { type HelperMarks, RunBlock } from './run-block';
@@ -261,6 +264,8 @@ export interface ChatThreadProps {
   agentMarksOpen?: AgentMarksOpen | null;
   /** Work: the host's live facts (agent progress). */
   live?: LiveActivity;
+  /** Work, while the conversation's model sees images: Read it now of a PDF sent to the PDF tool. */
+  onReadPdf?: (id: string) => Promise<void>;
   /**
    * Set to the thread's jump: it mounts the turn of entry `at` first (older turns wait behind a button), scrolls to it
    * and flashes it; a run's block opens and its head takes focus.
@@ -301,6 +306,8 @@ interface ThreadRuns {
   agentLive: boolean;
   /** The polite region. */
   announce: ((sentence: string) => void) | undefined;
+  /** The engine's requests now: a PDF reader's row reads its own. */
+  requests: readonly EngineRequest[];
 }
 
 const NO_RUNS: ThreadRuns = {
@@ -309,7 +316,26 @@ const NO_RUNS: ThreadRuns = {
   live: undefined,
   agentLive: true,
   announce: undefined,
+  requests: [],
 };
+
+/**
+ * The PDF tool in the thread: the names of the PDFs messages sent to it, the ids its runs read, whether an answer runs
+ * now, and Read it now (Work, while the model sees images).
+ */
+interface ThreadPdf {
+  names: ReadonlyMap<string, string>;
+  started: ReadonlySet<string>;
+  running: boolean;
+  onRead: ((id: string) => Promise<void>) | undefined;
+}
+
+const PdfContext = createContext<ThreadPdf>({
+  names: new Map(),
+  started: new Set(),
+  running: false,
+  onRead: undefined,
+});
 
 /**
  * The live facts every agent row reads (progress, stopping, messages, stopped by you), its asks and its buttons; the
@@ -425,7 +451,7 @@ function ThreadRunBlock(props: {
   temp: string | null;
 }): ReactElement | null {
   const { runId } = props;
-  const { runs, onStop, agentLive, announce } = useContext(RunsContext);
+  const { runs, onStop, agentLive, announce, requests } = useContext(RunsContext);
   const { live, asks, handlers, openId, marksOpen } = useContext(AgentsContext);
   const facts = useContext(RunsAtContext).runs.get(runId);
   const agents = useContext(RunHelpersContext).get(runId) ?? [];
@@ -457,6 +483,8 @@ function ThreadRunBlock(props: {
       temp={props.temp}
       onStatus={announce}
       focusTick={focusTick}
+      pdf={facts.pdf}
+      requests={requests}
     />
   );
 }
@@ -466,8 +494,16 @@ function ThreadRunEndRow({ entry }: { entry: Entry<'wake'> }): ReactElement | nu
   const runsAtNow = useContext(RunsAtContext);
   const jump = useContext(JumpContext);
   const runId = entry.workflow?.runId;
-  const place = runId === undefined ? undefined : runsAtNow.runs.get(runId)?.place;
-  return <RunEndRow entry={entry} runAt={place?.at ?? null} onJump={jump.to} />;
+  const facts = runId === undefined ? undefined : runsAtNow.runs.get(runId);
+  const pdf = facts?.pdf ?? null;
+  return (
+    <RunEndRow
+      entry={entry}
+      runAt={facts?.place.at ?? null}
+      onJump={jump.to}
+      {...(pdf === null ? {} : { name: pdfRunName(pdf) })}
+    />
+  );
 }
 
 /** The main agent's `workflow` call that is no launch: a check, a launch that did not start, a pause, stop or resume. */
@@ -1284,6 +1320,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement | nu
 
   const refused = useMemo(() => refusedCall(turn.entries, props.endOutcome), [props.endOutcome, turn.entries]);
   const places = useContext(RunsAtContext);
+  const pdfThread = useContext(PdfContext);
   const all = turn.entries.filter((entry, k) => isDrawn(entry, turn.start + k, mode, places));
   let cut = all.length;
   if (finished) while (cut > 1 && all[cut - 1]!.kind === 'model') cut -= 1;
@@ -1436,6 +1473,15 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement | nu
               <RotateCw size={12} strokeWidth={1.75} aria-hidden="true" />
               {CHAT.continued}
             </RuleLabel>,
+          );
+          break;
+        }
+        const started = hostStartWords(entry.text, pdfThread.names);
+        if (started !== null) {
+          items.push(
+            <EntryAnchor key={at} at={at}>
+              <EventRow icon={<FileText size={14} strokeWidth={1.75} />} label={started} text="" ts={entry.ts} />
+            </EntryAnchor>,
           );
           break;
         }
@@ -1633,6 +1679,10 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement | nu
       />,
     );
   }
+
+  if (finished && mode === 'work')
+    for (const pdf of pdfUnread(turn.entries, 0, pdfThread.running, pdfThread.started))
+      items.push(<PdfUnreadRow key={`pdf-${pdf.id}`} pdf={pdf} onRead={pdfThread.onRead} />);
 
   if (finished && (turn.end !== null || props.outcome !== null || turnPrompt(turn) !== null)) {
     const answer = answerMarkdown(turn.entries);
@@ -2422,6 +2472,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
   const onStopRun = props.onStopRun;
   const live = props.live;
   const agentLive = props.agentLive ?? true;
+  const requests = props.host?.requests ?? NO_RUNS.requests;
   const threadRuns = useMemo<ThreadRuns>(
     () => ({
       runs: runs ?? NO_RUNS.runs,
@@ -2429,8 +2480,24 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
       live,
       agentLive,
       announce: onStatus,
+      requests,
     }),
-    [runs, onStopRun, live, agentLive, onStatus],
+    [runs, onStopRun, live, agentLive, onStatus, requests],
+  );
+  const namesKept = useRef<ReadonlyMap<string, string>>(new Map());
+  const pdfNamesKept = useMemo(() => {
+    const next = pdfNames(entries);
+    const kept = namesKept.current;
+    if (kept.size === next.size && [...next].every(([id, name]) => kept.get(id) === name)) return kept;
+    namesKept.current = next;
+    return next;
+  }, [entries]);
+  const pdfStarted = useMemo(() => startedPdfs(places), [places]);
+  const pdfRunning = liveLast || props.creating === true;
+  const onReadPdf = props.onReadPdf;
+  const threadPdf = useMemo<ThreadPdf>(
+    () => ({ names: pdfNamesKept, started: pdfStarted, running: pdfRunning, onRead: onReadPdf }),
+    [pdfNamesKept, pdfStarted, pdfRunning, onReadPdf],
   );
   const agentHandlers = props.agentHandlers;
   const openAgent = props.openAgent ?? null;
@@ -2582,7 +2649,9 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
       <RunsAtContext.Provider value={places}>
         <JumpContext.Provider value={threadJump}>
           <SubagentRowsContext.Provider value={subagentsById}>
-            <RunHelpersContext.Provider value={helpersByRun}>{thread}</RunHelpersContext.Provider>
+            <RunHelpersContext.Provider value={helpersByRun}>
+              <PdfContext.Provider value={threadPdf}>{thread}</PdfContext.Provider>
+            </RunHelpersContext.Provider>
           </SubagentRowsContext.Provider>
         </JumpContext.Provider>
       </RunsAtContext.Provider>

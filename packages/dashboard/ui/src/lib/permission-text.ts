@@ -2,6 +2,7 @@
 
 import { CHAT, fill } from './chat-strings';
 import type { AutoAsk, CommandFlag, PermissionInteraction, PermissionMark, PermissionMode } from './chat-types';
+import { formatCount } from './format';
 import type { TranscriptEntry } from './types';
 import { oneLine } from './web-tools';
 
@@ -219,15 +220,26 @@ function firstSpace(text: string): number {
   return -1;
 }
 
+/** The card of a call that starts the PDF tool: `Read {name} with the PDF tool · {n} pages · {r} reader agents`. */
+export function pdfReadWords(read: NonNullable<PermissionInteraction['pdfRead']>): string {
+  const p = CHAT.pdf;
+  return fill(p.askCard, {
+    name: read.name,
+    pages: read.pages === 1 ? p.askPagesOne : fill(p.askPages, { n: formatCount(read.pages) }),
+    readers: read.readers === 1 ? p.askReadersOne : fill(p.askReaders, { n: formatCount(read.readers) }),
+  });
+}
+
 /**
  * What a card shows of the agent's own title: null when it only names the command or file that the well shows (whole,
  * or cut short by the server); only the words after it when more follow; else the title. The target counts as named
  * only where it ends at a word edge, so a longer word that starts with it is the agent's own text. A title the server
- * cut ends with "…", at a whole word when the last word is short.
+ * cut ends with "…", at a whole word when the last word is short. A call that starts the PDF tool says what it reads.
  */
 export function cardDescription(
-  i: Pick<PermissionInteraction, 'access' | 'title' | 'command' | 'path' | 'titleCut'>,
+  i: Pick<PermissionInteraction, 'access' | 'title' | 'command' | 'path' | 'titleCut' | 'pdfRead'>,
 ): string | null {
+  if (i.pdfRead !== undefined) return pdfReadWords(i.pdfRead);
   const text = oneLine(i.title).trim();
   if (text === '') return null;
   const target = i.access === 'bash' ? i.command : i.access === 'edit' ? i.path : null;

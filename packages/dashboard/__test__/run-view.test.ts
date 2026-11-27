@@ -12,11 +12,27 @@ import { describe, expect, it } from 'vite-plus/test';
 import { mergeRunState, parseRunState } from '../src/agent-sessions/run-state.js';
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
+import { readPdfCommand } from '../src/chat/agent/pdf-tool.js';
 import type { AgentEnd, AgentNow, AgentRow } from '../ui/src/lib/agents.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ConversationEvent, RunBy, RunView } from '../ui/src/lib/chat-types.js';
 import { formatClock } from '../ui/src/lib/format.js';
+import {
+  hostStartWords,
+  leftWords,
+  notStartedWords,
+  pdfLine,
+  pdfNames,
+  pdfProgress,
+  type PdfRun,
+  pdfRunName,
+  pdfUnread,
+  rangeText,
+  rateWords,
+  readerOf,
+  readPdfReportHead,
+} from '../ui/src/lib/pdf-run.js';
 import {
   agentGroups,
   budgetWords,
@@ -38,6 +54,7 @@ import {
   runsAt,
   runSnapshot,
   runState,
+  startedPdfs,
   stepChips,
   stepOf,
   stepWords,
@@ -645,5 +662,237 @@ describe('a launch the host names', () => {
     expect(read(together)).toBe('running');
     const gone = step(together, { type: 'runs', seq: 0, runs: [] });
     expect(read(gone)).toBe('ended-early');
+  });
+});
+
+describe('a run of the PDF tool', () => {
+  const ID = 'abcdefgh-40';
+  const P = CHAT.pdf;
+  const note: TranscriptEntry = {
+    kind: 'user',
+    ts: T0 - 5_000,
+    text: 'Summarize the findings',
+    promptIndex: 0,
+    attachments: [{ kind: 'pdf', name: 'report.pdf', pages: 40, way: 'tool', bytes: 0, chars: 0, id: ID }],
+  };
+  const call = (input: unknown, id = RUN): TranscriptEntry => ({
+    kind: 'tool',
+    ts: T0 - 1_000,
+    id: `call-${id}`,
+    name: 'workflow',
+    title: 'Workflow: read-pdf',
+    status: 'completed',
+    input: JSON.stringify(input),
+    run: { id, kind: 'launch' },
+  });
+  const launch = (args: Record<string, unknown>, name = 'read-pdf') =>
+    call({ variant: 'Workflow', source: { type: 'name', name }, args });
+  const pdfRun = (over: Partial<RunEntry> = {}): RunEntry =>
+    run({
+      name: 'read-pdf',
+      phases: [
+        { title: 'Read pages', state: 'active' },
+        { title: 'Combine notes', state: 'pending' },
+      ],
+      currentPhase: 'Read pages',
+      phasesEntered: [{ title: 'Read pages', ts: T0 }],
+      ...over,
+    });
+  const pdfOf = (entries: TranscriptEntry[]) => runsAt(entries).runs.get(RUN)?.pdf ?? null;
+  const all = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+  const READ: PdfRun = { id: ID, name: 'report.pdf', pages: all(40), by: 'model' };
+
+  /** A reader of the run: its label, its state, and its spawn and finish times (ms after T0). */
+  const reader = (label: string, state: AgentEnd, start: number, end?: number): AgentNow => {
+    ids += 1;
+    const childId = `reader-${ids}`;
+    return {
+      row: {
+        childId,
+        label,
+        run: RUN,
+        phase: 'Read pages',
+        entry: {
+          kind: 'subagent',
+          ts: T0 + start,
+          childId,
+          type: 'pdf-reader',
+          description: label,
+          run: RUN,
+          ...(end === undefined ? {} : { endTs: T0 + end, durationMs: end - start }),
+        },
+        attempts: [childId],
+        at: [],
+        roster: null,
+        rosterTs: null,
+        continues: null,
+        tokens: null,
+        durationMs: end === undefined ? 0 : end - start,
+      },
+      state,
+      until: null,
+    };
+  };
+  const progress = (
+    agents: AgentNow[],
+    over: { entry?: RunEntry; running?: boolean; now?: number; run?: PdfRun } = {},
+  ) =>
+    pdfProgress({
+      run: over.run ?? READ,
+      agents,
+      entry: over.entry ?? pdfRun(),
+      running: over.running ?? true,
+      now: over.now ?? T0 + 1_000_000,
+    });
+
+  it("is a run of the PDF tool when the model's call names read-pdf and an id; its pages from the call", () => {
+    const entries = [note, launch({ pdf: ID, question: 'q', pages: '9-12, 1-4, 3' }), pdfRun()];
+    expect(pdfOf(entries)).toEqual({ id: ID, name: 'report.pdf', pages: [1, 2, 3, 4, 9, 10, 11, 12], by: 'model' });
+    expect(pdfOf([note, launch({ pdf: ID, question: 'q' }), pdfRun()])?.pages).toEqual(all(40));
+    expect(pdfOf([launch({ pdf: ID, question: 'q' }), pdfRun()])?.name).toBeNull();
+    expect(pdfOf([note, launch({ pdf: ID }, 'deep-research'), pdfRun()])).toBeNull();
+    expect(pdfOf([note, launch({ pdf: '../x-12' }), pdfRun()])).toBeNull();
+    expect(pdfOf([note, launch({ pdf: ID }), pdfRun({ name: 'deep-research' })])).toBeNull();
+    const script = call({ variant: 'Workflow', source: { type: 'script', script: 'read-pdf' }, args: { pdf: ID } });
+    expect(pdfOf([note, script, pdfRun()])).toBeNull();
+  });
+
+  it('a Read it now that opens the turn of the run names its PDF; any other prompt there does not', () => {
+    const typed: TranscriptEntry = {
+      kind: 'user',
+      ts: T0 - 500,
+      text: readPdfCommand(ID, 'Summarize the findings', 'report.pdf'),
+      promptIndex: 1,
+    };
+    expect(pdfOf([note, typed, pdfRun()])).toEqual({ id: ID, name: 'report.pdf', pages: all(40), by: 'you' });
+    const end: TranscriptEntry = { kind: 'turn-end', ts: T0 - 200, stopReason: 'end_turn' };
+    expect(pdfOf([note, typed, end, pdfRun()])).toBeNull();
+    expect(pdfOf([note, pdfRun()])).toBeNull();
+    const names = pdfNames([note]);
+    expect(hostStartWords(typed.text, names)).toBe(fill(P.hostStart, { name: 'report.pdf' }));
+    expect(hostStartWords(typed.text, new Map())).toBe(P.hostStartBare);
+    expect(hostStartWords('/workflow read-pdf {"pdf": "nope"}', names)).toBeNull();
+    expect(hostStartWords('Summarize the findings', names)).toBeNull();
+    expect(pdfRunName({ name: 'report.pdf' })).toBe('Reading report.pdf');
+    expect(pdfRunName({ name: null })).toBe(P.runNameBare);
+  });
+
+  it('a reader is known by its label; the cuts and the combine are not readers', () => {
+    expect(readerOf('pages 33-36', 40)).toEqual({ pages: [33, 34, 35, 36], again: false });
+    expect(readerOf('pages 9-12 again', 40)).toEqual({ pages: [9, 10, 11, 12], again: true });
+    expect(readerOf('pages 1, 3, 10-11', 40)).toEqual({ pages: [1, 3, 10, 11], again: false });
+    expect(readerOf('pages 39-42', 40)).toBeNull();
+    expect(readerOf('cut 1', 40)).toBeNull();
+    expect(readerOf('combine', 40)).toBeNull();
+    expect(rangeText([1, 2, 3, 5, 7, 8])).toBe('1-3, 5, 7-8');
+  });
+
+  // Mutation: the rate from one reader → a guess shows after the first reader.
+  it('the rate shows once 2 readers ended well, from their pages over their span', () => {
+    const one = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'running', 60_000)];
+    expect(progress(one).rate).toBeNull();
+    const two = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 120_000)];
+    expect(progress(two).rate).toBeCloseTo(8 / 120);
+    expect(rateWords(progress(two).rate!)).toBe('4.0 pages/min');
+  });
+
+  // Mutation: the rate over summed reader times → the queue wait between readers is left out.
+  it('the rate spans the wait between readers, not the sum of their times', () => {
+    const agents = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 180_000, 240_000)];
+    expect(progress(agents).rate).toBeCloseTo(8 / 240);
+  });
+
+  it('the rate reads the 5 newest readers that ended well', () => {
+    const agents = [
+      reader('pages 1-4', 'done', 0, 600_000),
+      ...[1, 2, 3, 4, 5].map((k) =>
+        reader(`pages ${k * 4 + 1}-${k * 4 + 4}`, 'done', 540_000 + k * 60_000, 600_000 + k * 60_000),
+      ),
+    ];
+    expect(progress(agents).rate).toBeCloseTo(20 / 300);
+  });
+
+  // Mutation: a retried group counted twice → more pages read than the PDF has.
+  it('pages read count a group once, whether it was read at its first try or its second', () => {
+    const agents = [
+      reader('pages 1-4', 'done', 0, 60_000),
+      reader('pages 5-8', 'failed', 60_000, 70_000),
+      reader('pages 9-12', 'done', 70_000, 130_000),
+      reader('pages 1-4 again', 'done', 130_000, 190_000),
+      reader('pages 5-8 again', 'done', 190_000, 250_000),
+      reader('cut 1', 'done', 250_000, 260_000),
+    ];
+    expect(progress(agents).read).toBe(12);
+    expect(progress(agents).notStarted).toBe(28);
+  });
+
+  // Mutation: time left in step 2 → the combine step shows a time left for pages already read.
+  it('time left: the pages left at the rate, less the time since a reader last ended, only in step 1 while it runs', () => {
+    const agents = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 120_000)];
+    expect(progress(agents, { now: T0 + 120_000 }).leftMs).toBeCloseTo(32 / (8 / 120_000));
+    expect(progress(agents, { now: T0 + 180_000 }).leftMs).toBeCloseTo(32 / (8 / 120_000) - 60_000);
+    expect(progress(agents, { now: T0 + 100_000_000 }).leftMs).toBe(0);
+    const combine = pdfRun({ currentPhase: 'Combine notes' });
+    expect(progress(agents, { entry: combine }).leftMs).toBeNull();
+    expect(progress(agents, { running: false }).leftMs).toBeNull();
+    expect(progress([reader('pages 1-4', 'done', 0, 60_000)]).leftMs).toBeNull();
+    const ended = pdfRun({ status: 'complete', currentPhase: 'Combine notes' });
+    expect(progress(agents, { entry: ended }).leftMs).toBeNull();
+  });
+
+  it('after the end the report says how many pages were read and which were not; the rate is over the read', () => {
+    const report = 'PDF read: 36 of 40 pages. Not read: 21-24.\n\nThe answer (p. 3).\n\nNotes by page\n…';
+    expect(readPdfReportHead(report)).toEqual({ read: 36, total: 40, unread: [21, 22, 23, 24] });
+    expect(readPdfReportHead('PDF read: 5 of 5 pages.\n\nok')).toEqual({ read: 5, total: 5, unread: [] });
+    expect(readPdfReportHead('PDF read: 6 of 5 pages.')).toBeNull();
+    expect(readPdfReportHead('PDF read: 5 of 5 pages. Not read: soon.')).toBeNull();
+    expect(readPdfReportHead('# Findings')).toBeNull();
+    const agents = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 240_000)];
+    const ended = progress(agents, { entry: pdfRun({ status: 'complete', currentPhase: 'Combine notes', report }) });
+    expect(ended).toMatchObject({ read: 36, unread: [21, 22, 23, 24], leftMs: null, notStarted: null });
+    expect(ended.rate).toBeCloseTo(36 / 240);
+    const one = progress([reader('pages 1-4', 'done', 0, 60_000)], {
+      entry: pdfRun({ status: 'complete', currentPhase: 'Combine notes', report: 'PDF read: 4 of 4 pages.' }),
+      run: { ...READ, pages: [1, 2, 3, 4] },
+    });
+    expect(one.rate).toBeCloseTo(4 / 60);
+    expect(pdfLine(READ, ended)).toEqual({
+      text: `${fill(P.line, { range: '1-40', done: 36, total: 40 })} · ${rateWords(36 / 240)}`,
+      unread: fill(P.notRead, { list: '21-24' }),
+    });
+  });
+
+  it('the line: pages, counts, rate and time left when known; one page and one left read as one', () => {
+    const agents = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 120_000)];
+    const live = progress(agents, { now: T0 + 120_000 });
+    expect(pdfLine(READ, live)?.text).toBe(
+      [fill(P.line, { range: '1-40', done: 8, total: 40 }), '4.0 pages/min', fill(P.left.minutes, { n: 8 })].join(
+        ' · ',
+      ),
+    );
+    expect(notStartedWords(live)).toBe(fill(P.notStarted, { n: 32 }));
+    const single: PdfRun = { ...READ, pages: [7] };
+    expect(pdfLine(single, progress([], { run: single }))?.text).toBe(fill(P.lineOne, { range: '7', done: 0 }));
+    expect(notStartedWords(progress([], { run: single }))).toBe(P.notStartedOne);
+    expect(leftWords(59_999)).toBe(P.left.minute);
+    expect(leftWords(19 * 60_000)).toBe(fill(P.left.minutes, { n: 19 }));
+    expect(leftWords(59.6 * 60_000)).toBe(fill(P.left.hours, { n: 1 }));
+    expect(leftWords(2 * 3_600_000)).toBe(fill(P.left.hours, { n: 2 }));
+  });
+
+  // Mutation: Read it now while the turn runs → a second run starts beside the model's own.
+  it('Read it now: a PDF sent to the tool that no run read, once its turn ended, never while an answer runs', () => {
+    const entries = [note];
+    expect(pdfUnread(entries, 0, false, new Set())).toEqual([{ id: ID, name: 'report.pdf' }]);
+    expect(pdfUnread(entries, 0, true, new Set())).toEqual([]);
+    const read = [note, launch({ pdf: ID, question: 'q' }), pdfRun()];
+    expect(pdfUnread(read, 0, false, startedPdfs(runsAt(read)))).toEqual([]);
+    const other = [note, launch({ pdf: 'zzzzzzzz-40', question: 'q' }), pdfRun()];
+    expect(pdfUnread(other, 0, false, startedPdfs(runsAt(other)))).toEqual([{ id: ID, name: 'report.pdf' }]);
+    const inMessage: TranscriptEntry = {
+      ...note,
+      attachments: [{ kind: 'pdf', name: 'short.pdf', pages: 2, way: 'message', bytes: 9, chars: 12 }],
+    };
+    expect(pdfUnread([inMessage], 0, false, new Set())).toEqual([]);
   });
 });

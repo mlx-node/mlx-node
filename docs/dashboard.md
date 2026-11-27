@@ -1740,6 +1740,34 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   Any other workflow still asks (`helper-start`). The card of a launch carries `pdfRead: {name, pages, readers}`. Read
   it now (`POST …/pdf-read`) sends the agent's own `/workflow read-pdf {json}` with the message's text as the
   question: no model call and no permission request.
+  - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
+    320 pages: "{name} has {n} pages. Up to 320 pages can be read."); only a PDF of 20 pages or fewer keeps its pages
+    in the window too, so a model change moves it between the two ways with no second draw. The page plans the ways
+    with the host's own `planPdfs`: a PDF the message has no room for goes to the tool, its chip reads "{n} pages · read
+    by the PDF tool" and the caption "About {n} tokens now · about {m} to read the pages". A page the host could not
+    save refuses the PDF ("{name} could not be saved for reading. Add it again.") and drops its stage; removing the chip
+    drops it too, and so does a Send that carried the PDF in the message. The tool way is offered only when every PDF
+    held has a stage. Without the tool a PDF over 20 pages is refused as before.
+  - Run block (`ui/src/lib/pdf-run.ts`, `run-block.tsx`). A run is the PDF tool's when its `workflow` call names
+    `read-pdf` and a valid id, or when the prompt that opens its turn is a Read it now command. Its block is named
+    "Reading {name}" ("Reading a PDF" when no note of the conversation names the id; also its end row). Under the step
+    line: "Pages {range} · {done} of {total} pages read · {rate} · {time left}" and a `Meter` filled by pages read. A
+    group counts once, when one of its readers ended well; the rate is the pages of the newest 5 such readers over the
+    span from the earliest start to the last end, shown from 2 readers; time left shows only in the first step while
+    the run runs, less the time since a reader last ended. After the end the counts are the report's first line, the
+    rate is pages read over the read step, and the pages not read are in warning ink ("pages 9-12 not read"). Under
+    the groups: "{n} pages not started". The objective line is not drawn.
+  - Reader rows. A reader (`pages A-B`, `pages A-B again`) reads "Pages A-B"; its first fact is the engine's request
+    for its session ("Waiting for the model", "Reading · {done} of {total} tokens", "Reading", "Writing notes"), then
+    its time; a second try adds "second try"; its second line adds "page {n} opened" from its newest `read_file` of a
+    `page-NNN.jpg`. A failed reader reads "It returned no notes. It is read once more at the end.", a failed second
+    try "It failed twice. Its pages were not read." The cuts and "combine" keep the plain row.
+  - Read it now. Under a finished Work turn that sent a PDF to the tool and that no run read: "The pages of {name} were
+    not read." with Read it now while the conversation's model sees images and nothing runs ("The PDF tool could not
+    start. Try again." on a failure). Its command turn is drawn as one row, "You started reading {name}".
+  - Ask. The launch card reads "Read {name} with the PDF tool · {n} pages · {r} reader agents".
+  - Sessions. The transcript draws the same chip, block, line, rows and end row from stored lines, the unread line with
+    no button, and the command turn as its row.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip
@@ -3017,7 +3045,13 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   `docs/api-spec.pdf` in its 2nd answer, after that answer's picture rows. The harness endpoint gives `qwen3.5-4b`
   and `qwen3.5-9b` `images: true` and the `qwen3_5` family, so they take pictures in Chat and PDFs in both modes and
   every other model refuses both. With `MLX_DEV_FLIGHT=chat`, a Work message with a PDF and "pdfwait" waits 40 s
-  before any work, so its wait line names the pages ("Reading the conversation and 3 pages · …"). A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
+  before any work, so its wait line names the pages ("Reading the conversation and 3 pages · …"). A Work message with
+  a PDF past the message's room and "pdftool" launches `read-pdf` on it (`readPdf` step; `$PDF` and `$RUN` in a
+  script's steps stand for the PDF id its note names and the turn's run id): readers one after another, 4 pages
+  each, each opening its pages with `read_file` and a live tick, pages 9-12 failing twice, then "combine", the report
+  and the wake. "pdfnot" answers without reading, which leaves the Read it now line; its `/workflow read-pdf` turn
+  starts the same run from the Work scenario's `readPdf` (pages 5-8 fail once). The fake agent stores a tool PDF's
+  note as its own chunk, so the Sessions transcript shows its chip. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
   `model_auto_switched` line and `end_turn`, nothing stored): "No model answered." with the agent's words under it;
   the scenario's `session.modelGoneOnLoad` plays the load cases. The fixture's live session stores both picture
   one-shots after its 2nd prompt's chunk, which the Sessions transcript draws before that answer's first call.

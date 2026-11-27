@@ -764,6 +764,11 @@
         ]
       }
     },
+    "readPdf": {
+      "pageMs": 600,
+      "fails": 2,
+      "wakeAnswer": "The report is ready: all pages were read."
+    },
     "prompts": [
       {
         "match": "/goal ",
@@ -2939,6 +2944,81 @@
             "turnCompleted": {
               "inputTokens": 900,
               "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "pdftool",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow read-pdf",
+              "rawInput": {
+                "variant": "Workflow",
+                "source": {
+                  "type": "name",
+                  "name": "read-pdf"
+                },
+                "args": {
+                  "pdf": "$PDF",
+                  "question": "What are the findings?"
+                }
+              },
+              "output": "Started workflow read-pdf.",
+              "rawOutput": {
+                "type": "Workflow",
+                "run_id": "$RUN",
+                "name": "read-pdf"
+              }
+            }
+          },
+          {
+            "readPdf": {
+              "pdf": "$PDF",
+              "runId": "$RUN",
+              "fails": 3,
+              "failsTwice": true,
+              "pageMs": 700,
+              "objective": "Read the PDF",
+              "wakeAnswer": "The findings are on pages 3 and 7. Pages 9-12 were not read."
+            }
+          },
+          {
+            "text": "The PDF tool reads the pages one reader at a time. Its report comes when it ends.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "pdfnot",
+        "steps": [
+          {
+            "text": "I answered from the message alone; the PDF was not read.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
             }
           },
           {

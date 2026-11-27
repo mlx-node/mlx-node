@@ -16,10 +16,22 @@ import {
   stoppedByYou,
 } from '../lib/agents';
 import { CHAT, fill } from '../lib/chat-strings';
-import { formatElapsed } from '../lib/chat-turns';
+import { type EngineRequest, formatElapsed } from '../lib/chat-turns';
 import type { HelperProgress, LiveActivity, RunBy, RunView } from '../lib/chat-types';
 import { formatClock, formatCount, formatDuration } from '../lib/format';
-import { rowWords } from '../lib/helper-words';
+import { readerWords, rowWords } from '../lib/helper-words';
+import {
+  notStartedWords,
+  pageOpened,
+  type PdfRun,
+  pdfLine,
+  pdfProgress,
+  pdfRunName,
+  readerFact,
+  readerName,
+  readerRequest,
+  runReader,
+} from '../lib/pdf-run';
 import { type AllowedMark, type DeniedMark, subagentAllowedText, subagentDeniedText } from '../lib/permission-text';
 import {
   agentGroups,
@@ -132,9 +144,14 @@ export interface RunBlockProps {
   workHref?: string;
   /** Changes when a jump lands on the block: it opens and its head takes focus. */
   focusTick?: number;
+  /** A run of the PDF tool: its name, its PDF line and meter, its reader rows. */
+  pdf?: PdfRun | null;
+  /** The engine's requests now (the thread only): a reader row's words. */
+  requests?: readonly EngineRequest[];
 }
 
 const INSTANT = { duration: 0 } as const;
+const NO_REQUESTS: readonly EngineRequest[] = [];
 
 /** `Done ({n})` with its count ticking. */
 function countTitle(template: string, n: number): ReactNode {
@@ -170,9 +187,16 @@ function BlockRow(props: {
   marks: HelperMarks | null;
   temp: string | null;
   controls?: BlockControls;
+  pdf: PdfRun | null;
+  requests: readonly EngineRequest[];
 }): ReactElement {
   const { agent, progress, controls } = props;
   const row = agent.row;
+  // The page a reader's open `read_file` names stays on its row until it opens the next one.
+  const seen = progress?.now?.kind === 'tool' ? pageOpened(progress.now.title) : null;
+  const [opened, setOpened] = useState<number | null>(null);
+  if (seen !== null && seen !== opened) setOpened(seen);
+  const reader = props.pdf === null ? null : runReader(props.pdf, row.label);
   const entry = row.entry;
   const opens = props.live
     ? transcriptOpens(entry?.exists, progress, entry?.endTs !== undefined ? entry : undefined)
@@ -183,21 +207,27 @@ function BlockRow(props: {
   if (allowed !== null) more.push(subagentAllowedText(allowed));
   if (denied !== null) more.push(subagentDeniedText(denied.length));
   const held = controls === undefined ? null : agentLiveOf(controls.live, row);
-  const words = rowWords(agent, {
+  const rowLive = {
     progress,
     now: props.now,
     ask: props.ask === null ? null : { title: props.ask.title, since: props.ask.openedAt },
     stopping: held?.stopping === true,
     stoppedByYou: controls !== undefined && stoppedByYou(controls.live, row),
-  });
+  };
+  const engine = props.live && agent.state === 'running' ? readerRequest(props.requests, row.childId) : null;
+  const words =
+    reader === null
+      ? rowWords(agent, rowLive)
+      : readerWords(agent, rowLive, { reader, engine: readerFact(engine), opened });
+  const label = reader === null ? row.label : readerName(reader);
   const buttons = agentButtons({ workflow: true, state: agent.state, held, askId: props.ask?.id ?? null });
-  const target = { id: row.childId, title: row.label };
+  const target = { id: row.childId, title: label };
   const marksOpen = controls?.marksOpen ?? null;
   const openId = controls?.openId ?? null;
   return (
     <AgentRow
       id={row.childId}
-      label={row.label}
+      label={label}
       words={words}
       {...(controls !== undefined
         ? {
@@ -205,13 +235,13 @@ function BlockRow(props: {
             open: openId !== null && row.attempts.includes(openId),
           }
         : { to: opens ? transcriptPath(row.childId) : undefined })}
-      openLabel={fill(CHAT.agent.open, { label: row.label })}
+      openLabel={fill(CHAT.agent.open, { label })}
       more={more}
       controls={
         controls === undefined || !anyButton(buttons) ? undefined : (
           <AgentControls
             id={row.childId}
-            label={row.label}
+            label={label}
             workflow
             buttons={buttons}
             onStop={() => controls.handlers.onStop(target)}
@@ -320,12 +350,14 @@ export function RunBlock(props: RunBlockProps): ReactElement {
     head.current?.focus({ preventScroll: true });
   }, [focusTick]);
 
+  const pdf = props.pdf ?? null;
+  const name = pdf !== null ? pdfRunName(pdf) : (entry?.name ?? CHAT.run.bare);
   const said = useRef<RunSnapshot | null>(null);
   const onStatus = props.onStatus;
   useEffect(() => {
     if (entry === null || state === null || !live) return;
     const snap = runSnapshot(entry, agents, state);
-    for (const sentence of runAnnouncements(entry, agents, said.current, snap)) onStatus?.(sentence);
+    for (const sentence of runAnnouncements({ ...entry, name }, agents, said.current, snap)) onStatus?.(sentence);
     said.current = snap;
   });
 
@@ -346,6 +378,8 @@ export function RunBlock(props: RunBlockProps): ReactElement {
         marks={props.marksOf?.(agent.row) ?? null}
         temp={props.temp ?? null}
         controls={live ? props.agentControls : undefined}
+        pdf={pdf}
+        requests={props.requests ?? NO_REQUESTS}
       />
     ),
   });
@@ -435,8 +469,11 @@ export function RunBlock(props: RunBlockProps): ReactElement {
         : entry.elapsedMs > 0
           ? formatDuration(entry.elapsedMs)
           : null;
-  const name = entry?.name ?? CHAT.run.bare;
   const countParts = countWords({ ...counts, failed: 0 });
+  const pdfNow =
+    pdf === null ? null : pdfProgress({ run: pdf, agents, entry, running: live && state?.kind === 'running', now });
+  const pdfWords = pdf === null || pdfNow === null ? null : pdfLine(pdf, pdfNow);
+  const notStarted = pdfNow === null || ended ? null : notStartedWords(pdfNow);
 
   return (
     <section
@@ -538,7 +575,30 @@ export function RunBlock(props: RunBlockProps): ReactElement {
         }}
       >
         <div className={styles.body}>
-          {entry?.objective !== undefined && entry.objective !== '' ? (
+          {pdfWords !== null && pdfNow !== null ? (
+            <div className={styles.pdf}>
+              <p className={styles.pdfLine}>
+                {pdfWords.text}
+                {pdfWords.unread !== null ? (
+                  <>
+                    {' · '}
+                    <span className={styles.pdfUnread}>{pdfWords.unread}</span>
+                  </>
+                ) : null}
+              </p>
+              <Meter
+                kind="progress"
+                label={CHAT.pdf.meter}
+                value={pdfNow.read}
+                max={pdfNow.total}
+                formatValue={() => pdfWords.text}
+                size="dense"
+                warnAt={2}
+                dangerAt={2}
+              />
+            </div>
+          ) : null}
+          {pdf === null && entry?.objective !== undefined && entry.objective !== '' ? (
             <ExpandableText lines={2} moreLabel={CHAT.run.showMore} lessLabel={CHAT.run.showLess}>
               <p className={styles.goal}>{entry.objective}</p>
             </ExpandableText>
@@ -608,6 +668,7 @@ export function RunBlock(props: RunBlockProps): ReactElement {
               }}
             />
           ) : null}
+          {notStarted !== null ? <p className={styles.note}>{notStarted}</p> : null}
           {logs > 0 || props.launch != null || place.home === 'block' || (ended && props.resultAt !== null) ? (
             <div className={styles.folds}>
               {logs > 0 ? (
