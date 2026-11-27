@@ -851,6 +851,7 @@ describe('helper progress on the rail rows (#10)', () => {
     tokens: 18_200,
     contextPct: 41,
     errors: 0,
+    failedCalls: 0,
     durationMs: 9_000,
     at: T0 + 10_000,
   });

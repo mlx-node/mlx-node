@@ -2010,15 +2010,17 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   for ever. The reply judges only the helpers tracked when the request went: the agent read its list before a helper
   that started since, so that helper stays.
 - **Helpers tick while they run (#10).** The agent sends each running helper's numbers every ~2 s
-  (`subagent_progress` on the parent session: turns, tool calls, context tokens and percent, errors, run time; at least
-  one every 8 s) and stores none of them. The host takes the line before the live filter, so the reducer never sees
+  (`subagent_progress` on the parent session: turns, tool calls, context tokens and percent, errors, failed tool calls,
+  run time; at least one every 8 s) and stores none of them. Each failed tool call is also in `error_count`, so the
+  host reads `tool_failure_count` apart and counts the other errors as `error_count` minus it; a tick with no
+  `tool_failure_count`, or one above `error_count`, is dropped. The host takes the line before the live filter, so the reducer never sees
   it, keeps the last tick per helper in the tracker (a tick for a helper the conversation did not start, such as a
   helper's own helper, is dropped), and sends the page the whole live state as the conversation event `activity` at
   most once a second (the first change starts a 1 s timer; ten ticks in it make one event); `sync.live` carries it to
   a page that attaches later. A helper's end, the idle guard dropping it, or the process exit takes it out. The rail's
   helper row gets a third line: "Starting…" before the first tick, then "12 calls · 41% full · 18.2K tokens"
-  (errors first, in danger ink; a context of 80% or more in warning ink; "Quiet for 0:35", muted, after 20 s with no
-  tick), with "turn 2" on its second line; the line is the row button's description, not a live region. The thread's
+  (errors first, then failed calls ("2 failed calls"); only errors are in danger ink, so a failed call the helper got
+  past is not red; a context of 80% or more in warning ink; "Quiet for 0:35", muted, after 20 s with no tick), with "turn 2" on its second line; the line is the row button's description, not a live region. The thread's
   subagent row holds three facts in its head: "Running · 2:14 · 12 tool calls" while it runs (Quiet for … in place of
   Running), "completed · 2m 14s · 21.5K tokens" after its end, "not finished" when no end is stored and no agent
   process holds the conversation; the rest is a second muted line ("turn 2 · 41% of context · 18.2K tokens", after the

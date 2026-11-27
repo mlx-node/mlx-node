@@ -272,6 +272,7 @@ describe('contextWords', () => {
     tokens: 41_000,
     contextPct: 32,
     errors: 0,
+    failedCalls: 0,
     durationMs: 1,
     contextWindow,
     at: 1,

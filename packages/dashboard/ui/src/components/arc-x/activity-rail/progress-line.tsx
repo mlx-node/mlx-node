@@ -5,7 +5,7 @@ import { CHAT, fill } from '../../../lib/chat-strings';
 import { formatElapsed } from '../../../lib/chat-turns';
 import type { HelperProgress } from '../../../lib/chat-types';
 import { formatCount } from '../../../lib/format';
-import { nowWords } from '../../../lib/helper-words';
+import { errorWords, nowWords } from '../../../lib/helper-words';
 import { SwapText } from '../swap-text/swap-text';
 import styles from './activity-rail.module.css';
 
@@ -13,8 +13,8 @@ export type ProgressTone = 'normal' | 'muted' | 'warning' | 'danger';
 
 /**
  * An agent's live line in the rail, ordered by need so a cut loses the least: what it does now (once its own lines
- * said) or how long it is quiet, errors, calls, context, tokens. Ink: errors danger, a high context warning, quiet
- * muted.
+ * said) or how long it is quiet, errors, failed calls, calls, context, tokens. Ink: errors danger (a failed call is
+ * not one), a high context warning, quiet muted.
  */
 export function progressLine(progress: HelperProgress | null, now: number): { text: string; tone: ProgressTone } {
   if (progress === null) return { text: CHAT.activity.progressStarting, tone: 'muted' };
@@ -23,10 +23,7 @@ export function progressLine(progress: HelperProgress | null, now: number): { te
   const quiet = quietFor(progress, now);
   if (quiet !== null) parts.push(fill(a.progressQuiet, { time: formatElapsed(quiet) }));
   else if (progress.now !== null) parts.push(nowWords(progress.now));
-  if (progress.errors > 0)
-    parts.push(
-      progress.errors === 1 ? a.progressErrorsOne : fill(a.progressErrors, { n: formatCount(progress.errors) }),
-    );
+  parts.push(...errorWords(progress.errors, progress.failedCalls));
   parts.push(
     progress.toolCalls === 1 ? a.progressCallsOne : fill(a.progressCalls, { n: formatCount(progress.toolCalls) }),
   );

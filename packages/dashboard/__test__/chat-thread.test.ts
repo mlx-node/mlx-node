@@ -537,6 +537,7 @@ describe('ChatThread: a subagent row ticks while it runs, then keeps its final n
     tokens: 18_200,
     contextPct: 41,
     errors: 0,
+    failedCalls: 0,
     durationMs: 134_000,
     at: T0 + 134_100,
     ...over,

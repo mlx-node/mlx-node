@@ -84,16 +84,30 @@ function elapsedOf(agent: AgentNow, live: RowLive): string | null {
   return entry === undefined ? null : formatElapsed(now - entry.ts);
 }
 
+/** A tick's errors, then its failed tool calls (`1 error`, `2 failed calls`); none at 0. */
+export function errorWords(errors: number, failedCalls: number): string[] {
+  const a = CHAT.activity;
+  const out: string[] = [];
+  if (errors > 0) out.push(errors === 1 ? a.progressErrorsOne : fill(a.progressErrors, { n: formatCount(errors) }));
+  if (failedCalls > 0)
+    out.push(
+      failedCalls === 1 ? a.progressFailedCallsOne : fill(a.progressFailedCalls, { n: formatCount(failedCalls) }),
+    );
+  return out;
+}
+
 /** Live, the turn it is on (`turn 2`); ended, how many it took (`3 turns`). */
-function countsOf(live: boolean, turns: number | undefined, toolCalls: number | undefined, errors?: number): string[] {
+function countsOf(
+  live: boolean,
+  turns: number | undefined,
+  toolCalls: number | undefined,
+  tick?: Pick<HelperProgress, 'errors' | 'failedCalls'>,
+): string[] {
   const out: string[] = [];
   if (turns !== undefined && turns > 0)
     out.push(live ? fill(CHAT.activity.progressTurn, { n: turns }) : turnsWords(turns));
   if (toolCalls !== undefined) out.push(toolCallsWords(toolCalls));
-  if (errors !== undefined && errors > 0)
-    out.push(
-      errors === 1 ? CHAT.activity.progressErrorsOne : fill(CHAT.activity.progressErrors, { n: formatCount(errors) }),
-    );
+  if (tick !== undefined) out.push(...errorWords(tick.errors, tick.failedCalls));
   return out;
 }
 
@@ -121,7 +135,7 @@ export function rowWords(agent: AgentNow, live: RowLive): RowWords {
     case 'running': {
       const progress = live.progress;
       const sub = [
-        ...(progress === null ? [] : countsOf(true, progress.turns, progress.toolCalls, progress.errors)),
+        ...(progress === null ? [] : countsOf(true, progress.turns, progress.toolCalls, progress)),
         ...attempts,
       ];
       const elapsed = elapsedOf(agent, live);

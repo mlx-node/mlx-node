@@ -587,7 +587,10 @@ export interface SubagentProgress {
   tokens: number;
   /** Clamped to 0..100. */
   contextPct: number;
+  /** Errors other than failed tool calls. */
   errors: number;
+  /** Failed tool calls; `errors` are the other errors. */
+  failedCalls: number;
   durationMs: number;
   /** `context_window_tokens`; null when the tick names none. */
   contextWindow: number | null;
@@ -595,7 +598,8 @@ export interface SubagentProgress {
 
 /**
  * A `subagent_progress` line (xAI only, never stored: `S/agent/subagent/mod.rs` `spawn_progress_publisher`) with a
- * child session id and every count a whole number (the window may be missing); any other shape is null.
+ * child session id and every count a whole number (the window may be missing); any other shape is null. Each failed
+ * tool call is also in `error_count`, so a `tool_failure_count` above it is no tick.
  */
 export function readSubagentProgress(update: Json): SubagentProgress | null {
   if (update.sessionUpdate !== 'subagent_progress') return null;
@@ -605,11 +609,23 @@ export function readSubagentProgress(update: Json): SubagentProgress | null {
   const tokens = count(update.tokens_used);
   const pct = count(update.context_usage_pct);
   const errors = count(update.error_count);
+  const failedCalls = count(update.tool_failure_count);
   const durationMs = count(update.duration_ms);
   if (childId === null || childId === '' || turns === null || toolCalls === null || tokens === null) return null;
-  if (pct === null || errors === null || durationMs === null) return null;
+  if (pct === null || errors === null || failedCalls === null || failedCalls > errors || durationMs === null)
+    return null;
   const contextWindow = count(update.context_window_tokens);
-  return { childId, turns, toolCalls, tokens, contextPct: Math.min(pct, 100), errors, durationMs, contextWindow };
+  return {
+    childId,
+    turns,
+    toolCalls,
+    tokens,
+    contextPct: Math.min(pct, 100),
+    errors: errors - failedCalls,
+    failedCalls,
+    durationMs,
+    contextWindow,
+  };
 }
 
 /** A monitor's output line or batch: its task id, its description and its raw text (not the model's XML copy). */

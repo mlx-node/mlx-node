@@ -454,6 +454,7 @@ describe('what an agent does now (T31)', () => {
       context_window_tokens: 131_072,
       context_usage_pct: 0,
       error_count: 0,
+      tool_failure_count: 0,
     })!;
   const line = (sessionUpdate: string, fields: Record<string, unknown> = {}) => ({ sessionUpdate, ...fields });
   const nowOf = (t: ActivityTracker) => t.live().helpers[0]?.now;
@@ -688,6 +689,7 @@ describe('helper progress ticks', () => {
     context_usage_pct: 41,
     tools_used: ['read_file', 'grep'],
     error_count: 0,
+    tool_failure_count: 0,
     ...over,
   });
 
@@ -699,6 +701,7 @@ describe('helper progress ticks', () => {
       tokens: 18_200,
       contextPct: 41,
       errors: 0,
+      failedCalls: 0,
       durationMs: 4_100,
       contextWindow: 44_000,
     });
@@ -720,6 +723,22 @@ describe('helper progress ticks', () => {
     }
   });
 
+  // Mutation: no subtraction → a failed call reads as an error too (3 errors).
+  // Mutation: a missing `tool_failure_count` read as 0 → a tick with no failed-call count is kept.
+  // Mutation: drop the subset guard → more failed calls than errors give a negative error count.
+  it('a failed tool call is counted apart from the other errors; a count that is missing or past the errors is no tick', () => {
+    expect(readSubagentProgress(tick(CHILD, { error_count: 3, tool_failure_count: 2 }))).toMatchObject({
+      errors: 1,
+      failedCalls: 2,
+    });
+    expect(readSubagentProgress(tick(CHILD, { error_count: 2, tool_failure_count: 2 }))).toMatchObject({
+      errors: 0,
+      failedCalls: 2,
+    });
+    expect(readSubagentProgress(tick(CHILD, { tool_failure_count: undefined }))).toBeNull();
+    expect(readSubagentProgress(tick(CHILD, { error_count: 1, tool_failure_count: 2 }))).toBeNull();
+  });
+
   // Mutation: keep a tick for any child id → the stranger is listed.
   it('a tick of a known helper is kept with the host time; one for an unknown child is dropped', () => {
     const t = new ActivityTracker();
@@ -736,6 +755,7 @@ describe('helper progress ticks', () => {
         tokens: 18_200,
         contextPct: 41,
         errors: 0,
+        failedCalls: 0,
         durationMs: 4_100,
         contextWindow: 44_000,
         at: 500,

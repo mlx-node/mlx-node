@@ -1881,6 +1881,7 @@ async function readPdfAgent(run, n, label, pages, pdf, ms, fails) {
           tokens_used: 2_400 * calls,
           context_usage_pct: Math.min(99, 7 * calls),
           error_count: 0,
+          tool_failure_count: 0,
         },
       },
     });
@@ -1976,6 +1977,7 @@ async function tickRunAgents(run, everyMs) {
             tokens_used: 4_000 * turn + 1_000 * k,
             context_usage_pct: Math.min(99, 3 * turn + k),
             error_count: 0,
+            tool_failure_count: 0,
           },
         },
       });
@@ -4005,7 +4007,14 @@ function helperProgressStep(session, p) {
   const startedAt = Date.now();
   void (async () => {
     if ((p.on !== undefined || p.afterMs !== undefined) && !(await gateOpens(p.on, p.afterMs))) return;
-    let last = { turn_count: 1, tool_call_count: 0, tokens_used: 1_000, context_usage_pct: 3, error_count: 0 };
+    let last = {
+      turn_count: 1,
+      tool_call_count: 0,
+      tokens_used: 1_000,
+      context_usage_pct: 3,
+      error_count: 0,
+      tool_failure_count: 0,
+    };
     for (const [i, tick] of (p.ticks ?? [{}]).entries()) {
       if (i > 0 && typeof p.everyMs === 'number') await sleep(p.everyMs);
       last = { ...last, ...tick };

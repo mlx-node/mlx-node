@@ -10,7 +10,7 @@ import type { AgentEnd, AgentNow, AgentRow } from '../ui/src/lib/agents.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { HelperProgress } from '../ui/src/lib/chat-types.js';
 import { formatDuration } from '../ui/src/lib/format.js';
-import { CONTEXT_WARN_PCT, nowWords, readerWords, rowWords } from '../ui/src/lib/helper-words.js';
+import { CONTEXT_WARN_PCT, errorWords, nowWords, readerWords, rowWords } from '../ui/src/lib/helper-words.js';
 import { pageOpened, readerFact } from '../ui/src/lib/pdf-run.js';
 
 const T0 = 1_795_674_158_000;
@@ -54,6 +54,7 @@ const tick = (over: Partial<HelperProgress> = {}): HelperProgress => ({
   tokens: 18_200,
   contextPct: 41,
   errors: 0,
+  failedCalls: 0,
   durationMs: 134_000,
   at: T0 + 134_000,
   ...over,
@@ -150,6 +151,26 @@ describe('rowWords', () => {
   });
 });
 
+describe('the error words of a tick', () => {
+  const a = CHAT.activity;
+
+  // Mutation: failed calls first → `2 failed calls · 1 error`.
+  // Mutation: failed calls added to the errors → `3 errors`.
+  // Mutation: a word at 0 → `0 errors` beside a failed call.
+  it('errors first, then failed tool calls; none at 0', () => {
+    expect(errorWords(0, 1)).toEqual([a.progressFailedCallsOne]);
+    expect(errorWords(1, 2)).toEqual([a.progressErrorsOne, fill(a.progressFailedCalls, { n: '2' })]);
+    expect(errorWords(0, 0)).toEqual([]);
+  });
+
+  // Mutation: the row's counts leave the failed calls out → a running row hides its 2 failed calls.
+  it("a running row's second line names its failed calls, and no error when there is none", () => {
+    const words = rowWords(now('running'), { progress: tick({ errors: 0, failedCalls: 2, at: T0 }), now: T0 });
+    expect(words.sub).toContain(fill(a.progressFailedCalls, { n: '2' }));
+    expect(words.sub.some((word) => word.includes('error'))).toBe(false);
+  });
+});
+
 describe("the rail's live line of an agent", () => {
   const tick = (over: Partial<HelperProgress> = {}): HelperProgress => ({
     childId: 'child-1',
@@ -158,11 +179,25 @@ describe("the rail's live line of an agent", () => {
     tokens: 13_000,
     contextPct: 10,
     errors: 0,
+    failedCalls: 0,
     durationMs: 5_000,
     contextWindow: 131_072,
     at: T0,
     now: { kind: 'tool', title: 'rg -n "Ref::new" crates/napi/src' },
     ...over,
+  });
+
+  // Mutation: the line leaves the failed calls out → `1 error · 4 calls`, and the failed call is not named.
+  it('names its failed calls after its errors; only the errors are in danger ink', () => {
+    const a = CHAT.activity;
+    const failing = progressLine(tick({ now: null, failedCalls: 2 }), T0);
+    expect(
+      failing.text.startsWith(`${fill(a.progressFailedCalls, { n: '2' })} · ${fill(a.progressCalls, { n: 4 })}`),
+    ).toBe(true);
+    expect(failing.tone).toBe('normal');
+    const both = progressLine(tick({ now: null, errors: 1, failedCalls: 1 }), T0);
+    expect(both.text.startsWith(`${a.progressErrorsOne} · ${a.progressFailedCallsOne} · `)).toBe(true);
+    expect(both.tone).toBe('danger');
   });
 
   // Mutation: push the now word while quiet too → a quiet agent still reads as busy first.
