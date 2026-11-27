@@ -82,14 +82,27 @@ impl TierRig {
                     temp_root: Some(tmp),
                 };
                 let fp = ColdCacheFingerprint::from_components([seed]);
-                let id = PersistentIdentity {
-                    namespace: ns.into(),
-                    state: fp,
-                    kv: fp,
-                };
-                let t = open_disk_tier(&opts, || Some(id), shape.span_bytes()).unwrap();
-                assert!(t.persistent);
-                t
+                // A closed session's writer thread drops the namespace lock
+                // when it exits, after the close returns, and a test open
+                // tries the lock once: open again until it lets go.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let id = PersistentIdentity {
+                        namespace: ns.into(),
+                        state: fp,
+                        kv: fp,
+                    };
+                    let t = open_disk_tier(&opts, || Some(id), shape.span_bytes()).unwrap();
+                    if t.persistent {
+                        break t;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the namespace's lock is free in time"
+                    );
+                    drop(t);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         };
         let (manager, fp) = (Arc::clone(&tier.manager), tier.state_fingerprint);
