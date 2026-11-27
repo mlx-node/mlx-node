@@ -2066,7 +2066,10 @@ export class AgentHost {
 
   private cancelTurnLater(session: HostSession, cause: TurnEndCause): void {
     if (session.turn !== null && session.turn.recorded === null) session.turn.recorded = cause;
-    setImmediate(() => this.cancelTurn(session, cause));
+    // Two microtasks: the first lets `answerRequest`'s `.then(...)` write the
+    // permission response, and the second writes `session/cancel` before the
+    // I/O poll loop can read the agent's prompt reply and clear `session.turn`.
+    queueMicrotask(() => queueMicrotask(() => this.cancelTurn(session, cause)));
   }
 
   private chatPermission(req: PermissionRequest): PermissionAnswer {
@@ -2085,13 +2088,15 @@ export class AgentHost {
       if (decision.cancelTurn) this.cancelTurnLater(session, decision.cause);
     } else if (decision.cancelTurn && this.running !== null) {
       const running = this.running;
-      setImmediate(() => {
-        try {
-          running.process.client.notify('session/cancel', { sessionId: req.sessionId });
-        } catch {
-          // The process is gone.
-        }
-      });
+      queueMicrotask(() =>
+        queueMicrotask(() => {
+          try {
+            running.process.client.notify('session/cancel', { sessionId: req.sessionId });
+          } catch {
+            // The process is gone.
+          }
+        }),
+      );
     }
     return decision.answer;
   }

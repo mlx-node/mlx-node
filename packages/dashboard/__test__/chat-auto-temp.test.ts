@@ -542,8 +542,9 @@ describe('the temp root resolver', () => {
     const ok = info.isDirectory() && info.uid === 0 && (info.mode & 0o1000) !== 0;
     const away = join(root, 'home-away');
     const want = ok ? [{ top: real, spellings: real === '/tmp' ? [real] : [real, '/tmp'], kind: 'temp' }] : [];
+    const realTmp = realpathSync(tmpdir());
     expect(resolveTempRoot('/tmp', away, [tmpdir()])).toEqual(
-      realpathSync(tmpdir()).startsWith(`${real}/`) ? [] : want,
+      realTmp === real || realTmp.startsWith(`${real}/`) ? [] : want,
     );
     expect(resolveTempRoot('/tmp', away, [join(real, 'x')])).toEqual([]);
     expect(resolveTempRoot('/tmp', join(real, 'home-in-tmp'), [])).toEqual([]);

@@ -309,7 +309,7 @@ describe('Chat host', () => {
       const answers = permissionAnswers(fake);
       expect(answers).toHaveLength(9);
       expect(answers[8]).toEqual({ outcome: 'cancelled' });
-      expect(fake.sent().some((m) => m.method === 'session/cancel' && (m.params as Json).sessionId === id)).toBe(true);
+      await until(() => fake.sent().some((m) => m.method === 'session/cancel' && (m.params as Json).sessionId === id));
     });
   });
 

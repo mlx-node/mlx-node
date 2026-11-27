@@ -86,6 +86,9 @@ export const DARWIN_TS: string[] = [
   'packages/agent/__test__/cold-tier-root.test.ts',
   'packages/dashboard/__test__/api-prefix-cache.test.ts',
   'packages/dashboard/__test__/chat-work-landing.test.ts',
+  // Exercises macOS `/bin/zsh` login-shell PATH rules (9/11 tests skip without
+  // `/bin/zsh`, and Ubuntu's `/etc/profile.d/apps-bin-path.sh` appends `/snap/bin`).
+  'packages/dashboard/__test__/chat-work-path.test.ts',
   'packages/dashboard/__test__/download.test.ts',
   'packages/dashboard/__test__/prefix-cache.test.ts',
   // Inspects the real macOS `.node` and `.metallib` artifacts from `yarn build:native`.
