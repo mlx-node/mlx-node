@@ -30,12 +30,17 @@ export interface AgentRow {
   /** The roster row of its newest attempt, and the time of the update that carried it. */
   roster: RosterRow | null;
   rosterTs: number | null;
-  /** The attempt its first spawn resumed, when that spawn is no retry of it: `continues {label}`. */
+  /** The child its first spawn resumed: `continues {label}`. */
   continues: { childId: string; label: string } | null;
-  /** The roster's total use once it ended (`used`), else the newest attempt's context at its end. */
+  /**
+   * The roster's total use once it ended (`used`). Else, for a run's agent, the sum of its attempts' billed tokens
+   * (`used`) when every attempt ended with one; for a Task subagent, its context at its end.
+   */
   tokens: { n: number; kind: 'used' | 'context' } | null;
   /** The roster's time once it ended, else the sum of its attempts' times. */
   durationMs: number;
+  /** Sums over its attempts before the newest (each ended): a retried row counts every attempt. */
+  earlier: { turns: number; toolCalls: number; durationMs: number };
 }
 
 /** An agent's open permission request: its row waits for the person. */
@@ -90,37 +95,12 @@ interface Draft {
 }
 
 /**
- * B is A's next attempt: the same run (set) and label, A ended before B started, no spawn took A's place yet, and the
- * run's roster (`listed`) does not name both: a retry takes its first attempt's roster row. A script's
- * `agent({resume_from})` with A's label is its own row once the roster names it, or after A's retry; so is a resumed
- * Task subagent.
+ * B is A's next attempt only when B's spawn names A's newest attempt as `retry_of` (the run's contract retry). Any
+ * other spawn is its own row: a script's `agent({resume_from})`, also with A's label, and a resumed Task subagent.
  */
-function retries(
-  a: SubagentEntry,
-  b: SubagentEntry,
-  taken: ReadonlySet<string>,
-  listed: ReadonlyMap<string, ReadonlySet<string>>,
-): boolean {
-  const roster = b.run === undefined ? undefined : listed.get(b.run);
-  return (
-    b.run !== undefined &&
-    b.run === a.run &&
-    b.description === a.description &&
-    a.endTs !== undefined &&
-    a.endTs <= b.ts &&
-    !taken.has(a.childId) &&
-    !(roster?.has(a.childId) === true && roster.has(b.childId))
-  );
-}
-
 function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Map<string, Draft> } {
   const drafts: Draft[] = [];
   const owner = new Map<string, Draft>();
-  const taken = new Set<string>();
-  const listed = new Map<string, ReadonlySet<string>>();
-  for (const entry of entries) {
-    if (entry.kind === 'workflow') listed.set(entry.runId, new Set(entry.agents.map((agent) => agent.agentId)));
-  }
   entries.forEach((entry, i) => {
     if (entry.kind !== 'subagent') return;
     const known = owner.get(entry.childId);
@@ -129,18 +109,21 @@ function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Ma
       known.entries.set(entry.childId, entry);
       return;
     }
-    const from = entry.resumedFrom ?? null;
-    const prior = from === null ? undefined : owner.get(from);
-    const priorEntry = from === null ? undefined : prior?.entries.get(from);
-    if (prior !== undefined && priorEntry !== undefined && from !== null && retries(priorEntry, entry, taken, listed)) {
-      taken.add(from);
+    const retryOf = entry.retryOf;
+    const prior = retryOf === undefined ? undefined : owner.get(retryOf);
+    if (prior !== undefined && prior.attempts.at(-1) === retryOf) {
       prior.attempts.push(entry.childId);
       prior.at.push(i);
       prior.entries.set(entry.childId, entry);
       owner.set(entry.childId, prior);
       return;
     }
-    const draft: Draft = { attempts: [entry.childId], at: [i], entries: new Map([[entry.childId, entry]]), from };
+    const draft: Draft = {
+      attempts: [entry.childId],
+      at: [i],
+      entries: new Map([[entry.childId, entry]]),
+      from: entry.resumedFrom ?? null,
+    };
     drafts.push(draft);
     owner.set(entry.childId, draft);
   });
@@ -153,25 +136,49 @@ function enteredBefore(run: RunEntry | undefined, ts: number): string | null {
   return phase;
 }
 
+function billed(draft: Draft | null): AgentRow['tokens'] {
+  if (draft === null) return null;
+  let n = 0;
+  for (const id of draft.attempts) {
+    const used = draft.entries.get(id)!.tokensUsed;
+    if (used === undefined) return null;
+    n += used;
+  }
+  return { n, kind: 'used' };
+}
+
 function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonly RosterRow[]): AgentRow {
   const childId = draft?.attempts.at(-1) ?? rostered[0]!.agentId;
   const entry = draft?.entries.get(childId);
   const first = draft === null ? undefined : draft.entries.get(draft.attempts[0]!);
-  const roster = rostered.find((row) => row.agentId === childId) ?? null;
+  const roster =
+    rostered.find((row) => row.agentId === childId) ??
+    rostered.find((row) => draft !== null && !draft.entries.has(row.agentId)) ??
+    null;
   const named = roster ?? rostered[0] ?? null;
   const description = first?.description ?? '';
   const ended = roster !== null && ROSTER_ENDS.has(roster.state);
   let durationMs = 0;
   for (const id of draft?.attempts ?? []) durationMs += draft!.entries.get(id)!.durationMs ?? 0;
+  const earlier = { turns: 0, toolCalls: 0, durationMs: 0 };
+  for (const id of draft?.attempts.slice(0, -1) ?? []) {
+    const attempt = draft!.entries.get(id)!;
+    earlier.turns += attempt.turns ?? 0;
+    earlier.toolCalls += attempt.toolCalls ?? 0;
+    earlier.durationMs += attempt.durationMs ?? 0;
+  }
+  const runId = first?.run ?? run?.runId ?? null;
   const tokens: AgentRow['tokens'] = ended
     ? { n: roster.tokens, kind: 'used' }
-    : entry?.endTs !== undefined && entry.tokens !== undefined
-      ? { n: entry.tokens, kind: 'context' }
-      : null;
+    : runId !== null
+      ? billed(draft)
+      : entry?.endTs !== undefined && entry.tokens !== undefined
+        ? { n: entry.tokens, kind: 'context' }
+        : null;
   return {
     childId,
     label: named?.label ?? (description !== '' ? description : childId),
-    run: first?.run ?? run?.runId ?? null,
+    run: runId,
     phase: named?.phase ?? (first === undefined ? null : enteredBefore(run, first.ts)),
     ...(entry === undefined ? {} : { entry }),
     attempts: draft?.attempts ?? [childId],
@@ -181,6 +188,7 @@ function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonl
     continues: null,
     tokens,
     durationMs: ended ? roster.durationMs : durationMs,
+    earlier,
   };
 }
 
@@ -208,7 +216,10 @@ function sameRow(a: AgentRow, b: AgentRow): boolean {
     a.continues?.label === b.continues?.label &&
     a.tokens?.n === b.tokens?.n &&
     a.tokens?.kind === b.tokens?.kind &&
-    a.durationMs === b.durationMs
+    a.durationMs === b.durationMs &&
+    a.earlier.turns === b.earlier.turns &&
+    a.earlier.toolCalls === b.earlier.toolCalls &&
+    a.earlier.durationMs === b.earlier.durationMs
   );
 }
 
@@ -244,6 +255,18 @@ export function runAgents(
       const rows = rostered.get(key);
       if (rows === undefined) rostered.set(key, [agent]);
       else rows.push(agent);
+    }
+    for (const [key, agents] of rostered) {
+      if (typeof key !== 'string') continue;
+      const draft = list.find(
+        (d) =>
+          !rostered.has(d) &&
+          d.entries.get(d.attempts.at(-1)!)!.endTs !== undefined &&
+          d.entries.get(d.attempts[0]!)!.description === agents[0]!.label,
+      );
+      if (draft === undefined) continue;
+      rostered.delete(key);
+      rostered.set(draft, agents);
     }
     const rows: AgentRow[] = list.map((draft) => rowOf(draft, run, rostered.get(draft) ?? []));
     list.forEach((draft, n) => labelOf.set(draft, rows[n]!.label));
@@ -380,7 +403,7 @@ export function agentStateWords(state: AgentEnd, stoppedByYou: boolean): string 
   }
 }
 
-/** `618K tokens used` from the roster, else `41K context at end`; null with neither. */
+/** `618K tokens used` (the roster's, or a run agent's attempts' sum), else `41K context at end`; null with neither. */
 export function tokenWords(row: AgentRow): string | null {
   if (row.tokens === null) return null;
   const n = formatCount(row.tokens.n);

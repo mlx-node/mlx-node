@@ -373,6 +373,7 @@ describe('Work: the run block shows its agents live (#10)', () => {
     tokens: 12_400,
     contextPct: 33,
     errors: 0,
+    failedCalls: 0,
     durationMs: 42_000,
     contextWindow: null,
     at: Date.now(),

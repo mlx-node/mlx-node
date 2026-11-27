@@ -1647,7 +1647,7 @@ async function runGate(run, path, ms) {
 // the agent's watcher does after a slow drain); `pauseDrainOn` holds the helper ends of a typed `/workflow pause`
 // (`pauseDrain`). A `status` other than `complete` ends the run so (a paused one sends
 // `pause_message` and no wake, as the agent sends none for a pause). `retry: true`: the helper's first attempt ends
-// at once and the run retries it as its output contract does (a new child, `resumed_from` the first, the same label;
+// at once and the run retries it as its output contract does (a new child, `resumed_from` and `retry_of` the first, the same label;
 // the roster names the newest attempt). `retry: 'on-cancel'`: the first attempt runs until a cancel of it comes; then
 // it ends `completed`, its retry spawns, and the cancel is answered `already_finished`, as when the cancel reaches the
 // agent in the 47 ms between the first attempt's end and its retry's spawn. `_x.ai/subagent/cancel` of the helper
@@ -1697,7 +1697,7 @@ function startWorkflow(session, w, n) {
     durationMs: 0,
   };
   run.agents.push(agent);
-  const spawnOne = (a, resumedFrom) => {
+  const spawnOne = (a, retryOf) => {
     update(
       session,
       'subagent_spawned',
@@ -1708,7 +1708,7 @@ function startWorkflow(session, w, n) {
         subagent_type: 'general-purpose',
         description: a.label,
         workflow_run_id: run.id,
-        ...(resumedFrom === null ? {} : { resumed_from: resumedFrom, effective_context_source: 'resumed' }),
+        ...(retryOf === null ? {} : { resumed_from: retryOf, retry_of: retryOf, effective_context_source: 'resumed' }),
       },
       true,
     );
@@ -1722,7 +1722,7 @@ function startWorkflow(session, w, n) {
     });
     session.lastHelper = a.child;
   };
-  const spawn = (resumedFrom) => spawnOne(agent, resumedFrom);
+  const spawn = (retryOf) => spawnOne(agent, retryOf);
   spawn(null);
   const more = (w.more ?? []).map((m, k) => {
     const id = m.childSessionId ?? `${childId}-${k + 2}`;
@@ -1881,6 +1881,7 @@ async function readPdfAgent(run, n, label, pages, pdf, ms, fails) {
           tokens_used: 2_400 * calls,
           context_usage_pct: Math.min(99, 7 * calls),
           error_count: 0,
+          tool_failure_count: 0,
         },
       },
     });
@@ -1976,6 +1977,7 @@ async function tickRunAgents(run, everyMs) {
             tokens_used: 4_000 * turn + 1_000 * k,
             context_usage_pct: Math.min(99, 3 * turn + k),
             error_count: 0,
+            tool_failure_count: 0,
           },
         },
       });
@@ -2000,6 +2002,7 @@ function endRunAgent(run, agent, status, fields = {}) {
       turns: 1,
       duration_ms: Date.now() - run.startedAt,
       tokens_used: agent.tokens,
+      total_tokens_used: agent.tokens,
       will_wake: false,
       ...fields,
     },
@@ -2013,7 +2016,12 @@ function endRunAgent(run, agent, status, fields = {}) {
  */
 function cancelRunAgent(run, agent) {
   agent.state = 'failed';
-  endRunAgent(run, agent, 'cancelled', { error: 'Subagent was cancelled', tool_calls: 0, tokens_used: 0 });
+  endRunAgent(run, agent, 'cancelled', {
+    error: 'Subagent was cancelled',
+    tool_calls: 0,
+    tokens_used: 0,
+    total_tokens_used: 0,
+  });
   workflowUpdate(run);
 }
 
@@ -2237,6 +2245,7 @@ function endHelpers(run, cancelled) {
         turns: 0,
         duration_ms: Date.now() - run.startedAt,
         tokens_used: 0,
+        total_tokens_used: 0,
         will_wake: false,
       },
       true,
@@ -2899,7 +2908,7 @@ async function runPrompt(id, params) {
     const managed = builtin === 'workflow' ? (readPdfStart(session, text) ?? manageRun(session, text)) : null;
     const said = managed ?? (scripted ? scenario.hostTurnText?.[builtin] : undefined) ?? goalSaid ?? `Ran /${builtin}.`;
     update(session, 'agent_message_chunk', { content: { type: 'text', text: said }, _meta: { hostTurn: true } });
-    // v0.3.6 ends a `/workflow` turn with a live and stored `turn_completed`.
+    // v0.3.7 ends a `/workflow` turn with a live and stored `turn_completed`.
     if (builtin === 'workflow')
       update(session, 'turn_completed', { prompt_id: randomUUID(), stop_reason: 'end_turn', elapsed_ms: 28 }, true);
     persistSummary(session);
@@ -3821,6 +3830,7 @@ function helperStep(session, h, toolCallId) {
         turns: 2,
         duration_ms: Date.now() - startedAt,
         tokens_used: 1200,
+        total_tokens_used: 3400,
         ...(status === 'completed' ? { output: 'Found it.' } : {}),
         will_wake: wake,
       },
@@ -3997,7 +4007,14 @@ function helperProgressStep(session, p) {
   const startedAt = Date.now();
   void (async () => {
     if ((p.on !== undefined || p.afterMs !== undefined) && !(await gateOpens(p.on, p.afterMs))) return;
-    let last = { turn_count: 1, tool_call_count: 0, tokens_used: 1_000, context_usage_pct: 3, error_count: 0 };
+    let last = {
+      turn_count: 1,
+      tool_call_count: 0,
+      tokens_used: 1_000,
+      context_usage_pct: 3,
+      error_count: 0,
+      tool_failure_count: 0,
+    };
     for (const [i, tick] of (p.ticks ?? [{}]).entries()) {
       if (i > 0 && typeof p.everyMs === 'number') await sleep(p.everyMs);
       last = { ...last, ...tick };
@@ -4306,6 +4323,7 @@ async function fireSchedule(session, taskId, prompt, every, s) {
       turns: 1,
       duration_ms: Date.now() - startedAt,
       tokens_used: 900,
+      total_tokens_used: 2600,
       output: 'Checked.',
       will_wake: false,
     },

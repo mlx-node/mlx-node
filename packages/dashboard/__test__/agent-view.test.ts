@@ -62,6 +62,7 @@ function row(childId: string, attempts: string[] = [childId], run: string | null
     continues: null,
     tokens: null,
     durationMs: 0,
+    earlier: { turns: 0, toolCalls: 0, durationMs: 0 },
   };
 }
 
@@ -272,6 +273,7 @@ describe('contextWords', () => {
     tokens: 41_000,
     contextPct: 32,
     errors: 0,
+    failedCalls: 0,
     durationMs: 1,
     contextWindow,
     at: 1,

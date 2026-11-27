@@ -104,7 +104,7 @@ Work asks before every shell command. On its own the agent runs a built-in safe 
 `head`, read-only `git`, a bare `touch` or `mkdir`, …) with no permission request. So the app writes a guard plugin of
 its own (`~/.mlx-node/chat/work-guard/plugin.json`, before every Work agent start) and sends it first in each Work
 session's `pluginDirs`; its `PreToolUse` hook answers "ask" for every `Bash` and `monitor` call (both run a shell
-command). Its name is `mlx-work-guard-<16 random hex>`, new at every start: a folder's `.grok/config.toml`
+command). Its name is `mlx-work-guard-<16 random hex>`, new at every start: a folder's `.mlx-agent/config.toml`
 `[plugins] disabled` list is read with no trust, so a fixed name could be switched off by the folder itself. A managed
 `allow_managed_hooks_only` pin (`~/.mlx-agent` or `/etc/grok`) still skips every plugin hook, and a hook whose `sh`
 fails does not ask: the guard then fails open. A `[permission]` ask rule cannot carry
@@ -133,7 +133,7 @@ checkpoint templates kept in `crates/mlx-core/src/tokenizer/fixtures`). The defa
 that names it runs as one that names none. No level raises the 12,000 budget, so the caps above hold for every family
 whose engine enforces that budget. Inkling2's engine does not (`ThinkingPolicy::None`):
 its levels only set the effort number in its prompt (Off 0, Low 0.2, Medium 0.7, High 0.9), so at any level a long
-Inkling2 thought can use the answer room. The agent (the app and `mlx agent` need mlx-agent v0.3.6 or later,
+Inkling2 thought can use the answer room. The agent (the app and `mlx agent` need mlx-agent v0.3.7 or later,
 `MLX_AGENT_MIN_RELEASE`) builds its `reasoning_effort` session option from those rows and adds the level as
 `extra_body.reasoning_effort` (`none` for Off, never `minimal`) only for a model whose `/v1/models` row has
 `owned_by: "mlx-node"` and lists `reasoningEfforts` or `reasoning_efforts` (it reads `reasoningEfforts` first). There it goes beside `output_config.effort` and
@@ -2010,15 +2010,17 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   for ever. The reply judges only the helpers tracked when the request went: the agent read its list before a helper
   that started since, so that helper stays.
 - **Helpers tick while they run (#10).** The agent sends each running helper's numbers every ~2 s
-  (`subagent_progress` on the parent session: turns, tool calls, context tokens and percent, errors, run time; at least
-  one every 8 s) and stores none of them. The host takes the line before the live filter, so the reducer never sees
+  (`subagent_progress` on the parent session: turns, tool calls, context tokens and percent, errors, failed tool calls,
+  run time; at least one every 8 s) and stores none of them. Each failed tool call is also in `error_count`, so the
+  host reads `tool_failure_count` apart and counts the other errors as `error_count` minus it; a tick with no
+  `tool_failure_count`, or one above `error_count`, is dropped. The host takes the line before the live filter, so the reducer never sees
   it, keeps the last tick per helper in the tracker (a tick for a helper the conversation did not start, such as a
   helper's own helper, is dropped), and sends the page the whole live state as the conversation event `activity` at
   most once a second (the first change starts a 1 s timer; ten ticks in it make one event); `sync.live` carries it to
   a page that attaches later. A helper's end, the idle guard dropping it, or the process exit takes it out. The rail's
   helper row gets a third line: "Starting…" before the first tick, then "12 calls · 41% full · 18.2K tokens"
-  (errors first, in danger ink; a context of 80% or more in warning ink; "Quiet for 0:35", muted, after 20 s with no
-  tick), with "turn 2" on its second line; the line is the row button's description, not a live region. The thread's
+  (errors first, then failed calls ("2 failed calls"); only errors are in danger ink, so a failed call the helper got
+  past is not red; a context of 80% or more in warning ink; "Quiet for 0:35", muted, after 20 s with no tick), with "turn 2" on its second line; the line is the row button's description, not a live region. The thread's
   subagent row holds three facts in its head: "Running · 2:14 · 12 tool calls" while it runs (Quiet for … in place of
   Running), "completed · 2m 14s · 21.5K tokens" after its end, "not finished" when no end is stored and no agent
   process holds the conversation; the rest is a second muted line ("turn 2 · 41% of context · 18.2K tokens", after the
@@ -2030,18 +2032,19 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   run card's running helper shows its step, its run time and tool calls, with context and tokens under it, while the
   host holds the run; a done helper keeps the numbers of `workflow_updated`. A conversation not loaded in a running
   agent lists no helper on the rail.
-- **A workflow run's helpers are drawn once (`ui/src/lib/run-helpers.ts`).** A helper's `subagent_spawned` names its
-  run (`workflow_run_id`); the reducer keeps it as the entry's `run` when the run's `workflow` entry came before it,
-  and the retried attempt as `resumedFrom` (`resumed_from`). Such a helper has no Subagent row in the thread or on the
-  Sessions transcript: its run card lists it. The card's rows are the run's roster (`agents` of `workflow_updated`, in
-  its order, each the latest attempt by child id) joined to the helpers' entries, then the run's helpers the roster
-  does not list, by spawn: the agent stores the roster only at the run's start, at each step and at its end, so a
-  transcript read from disk can hold helpers its roster does not name. A helper the run retried is one row, its latest
-  attempt; a roster row that still says running for a helper whose `subagent_finished` came after it takes that line's
-  facts. A script call that resumes a helper (`agent({resume_from})`) has a roster row of its own, so both rows stay,
-  each with its own call's attempts; a roster row folds into the spawn that resumed it only when that spawn is on no
-  roster row's line (a roster stored before the retry). A row built from the entries sums its attempts' run times. A
-  row with no end reads Running only while its run is live (not ended, and in the thread held by the host), else
+- **A workflow run's helpers are drawn once (`ui/src/lib/agents.ts`).** A helper's `subagent_spawned` names its run
+  (`workflow_run_id`); the reducer keeps it as the entry's `run`, the child it resumed as `resumedFrom`
+  (`resumed_from`), and the attempt a contract retry follows as `retryOf` (`retry_of`). Such a helper has no Subagent
+  row in the thread or on the Sessions transcript: its run card lists it. The card's rows are the helpers' entries,
+  one row per agent by spawn, joined to the run's roster (`agents` of `workflow_updated`, each row the newest attempt
+  by child id), then the roster rows with no spawn line: the agent stores the roster only at the run's start, at each
+  step and at its end, so a transcript read from disk can hold helpers its roster does not name. A spawn joins a row
+  only when its `retry_of` is that row's newest attempt; any other spawn is its own row, and one that resumed a child
+  (`agent({resume_from})`, also under the same label) reads "continues {label}". A roster row that still says running
+  for a helper whose `subagent_finished` came after it takes that line's facts. A retried row counts every attempt:
+  its tool calls and time while it runs (its turn stays the running attempt's), its turns, tool calls and time once
+  it ended. A row with no ended roster reads its attempts' billed tokens (`total_tokens_used`) summed as tokens used,
+  and no figure when an attempt has none. A row with no end reads Running only while its run is live (not ended, and in the thread held by the host), else
   "not finished". The thread keeps a run's list of rows while they stay the same, so streamed text does not redraw
   the run cards. A card row links to the helper's session like a Subagent row, and in the thread carries the helper's allowed
   and denied calls (all its attempts'). On the rail, a run the host holds is one row with "2 agents running" in its
@@ -2455,9 +2458,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   the page search). A built-in such as `/goal pause` is the agent's host turn: the reply is a `hostTurn` agent chunk and
   the typed text is stored as a `hostTurn` user chunk, so live and reopened threads show the same bubble and answer.
   `__test__/chat-commands-real-agent.test.ts` pins this on the real agent: the pull after the load and the push after
-  an answer give the same rows (the four built-ins and a skill from the Work folder's `.grok/skills`), the fake agent
-  plays the same rows, `/yolo` and `/compact` never reach it, a skill goes as typed and the agent adds its body, `/goal`
-  and `/workflow runs` are host turns with no model call, and the live rows equal the rows read back from disk.
+  an answer give the same rows (the four built-ins and a skill from the Work folder's `.mlx-agent/skills`), the fake
+  agent plays the same rows, `/yolo` and `/compact` never reach it, a skill goes as typed and the agent adds its body,
+  `/goal` and `/workflow runs` are host turns with no model call, and the live rows equal the rows read back from disk.
 - **Permission mode** (`ui/src/pages/chat/work/permission-mode.tsx`, `src/chat/agent/auto.ts`,
   `src/chat/agent/auto-scan.ts`, `src/chat/permission-log.ts`). Each Work conversation has one of three modes, the
   chip before Plan first in the tools row (and, while not Ask, a chip in the thread header): **Ask** (every request is
@@ -2685,7 +2688,7 @@ Chat and Work add, under `~/.mlx-node/chat` (0700):
 | `providers.json`                                       | provider selection and check results; never a key                                                              |
 | `plugins/<id>/`                                        | provider skill folders copied from the bundle                                                                  |
 | `work-guard/plugin.json`                               | the Work guard plugin: one `PreToolUse` hook that asks before every shell command                              |
-| `work-process/`                                        | the Work agent's process cwd: empty, so `$HOME` (and grok-build's `~/.grok`) is never read as a project        |
+| `work-process/`                                        | the Work agent's process cwd: empty, so `$HOME` is never read as a project                                     |
 | `chat-agent/`, `chat-home/`, `chat-workspace/`, `tmp/` | the Chat agent's own home, cwd and temp folders; the agent writes its sessions there                           |
 | `composer/<id>.json`                                   | the messages queued while an answer runs (text and files) until they are sent, and the thinking level; 0600    |
 | `scratch-folders.json`                                 | the folders Work without a folder made: real path, device and inode numbers; 0600                              |

@@ -2241,16 +2241,19 @@ function writeTurn(
       });
       const finish = runChild(kids, child, spawn, random);
       if (finish !== null) {
+        const toolCalls = int(random, 2, 9);
+        const context = int(random, 4_000, 30_000);
         const finished = {
           sessionUpdate: 'subagent_finished',
           subagent_id: child.id,
           attempt_id: 'at1.1',
           child_session_id: child.id,
           status: child.status,
-          tool_calls: int(random, 2, 9),
+          tool_calls: toolCalls,
           turns: 1,
           duration_ms: finish - spawn,
-          tokens_used: int(random, 4_000, 30_000),
+          tokens_used: context,
+          total_tokens_used: context * (toolCalls + 1),
           will_wake: child.mode === 'background',
           ...(child.status === 'failed' ? { error: 'The subagent stopped after its tool budget.' } : {}),
         };
@@ -2488,16 +2491,19 @@ function backgroundWorkflow(
   const finished = (child: ChildPlan, spawned: number, ms: number): void => {
     const runs = kids.get(child.id)!.runs;
     runs[runs.length - 1]!.finish = ms;
+    const toolCalls = child.tools ?? 3;
+    const context = int(random, 4_000, 30_000);
     sessionEvent(writer, LONG_SESSION_ID, ms, custom, {
       sessionUpdate: 'subagent_finished',
       subagent_id: child.id,
       attempt_id: 'at1.1',
       child_session_id: child.id,
       status: child.status,
-      tool_calls: child.tools ?? 3,
+      tool_calls: toolCalls,
       turns: 1,
       duration_ms: ms - spawned,
-      tokens_used: int(random, 4_000, 30_000),
+      tokens_used: context,
+      total_tokens_used: context * (toolCalls + 1),
       will_wake: false,
     });
   };

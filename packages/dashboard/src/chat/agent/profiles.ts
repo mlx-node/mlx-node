@@ -200,7 +200,7 @@ export function chatSessionParams(input: ChatSessionInput): Record<string, unkno
  * `[permission]` ask rule would do the same, but `GROK_CONFIG` drops that table and every file that carries one lives
  * in `~/.mlx-agent`. A hook "ask" also outranks the user's allow rules and saved bash grants; a deny still wins.
  * `monitor` runs a shell command too and gets the same safe list, so it is matched as well.
- * The name gets a new random suffix at every agent start: a folder's `.grok/config.toml` `[plugins] disabled` list is
+ * The name gets a new random suffix at every agent start: a folder's `.mlx-agent/config.toml` `[plugins] disabled` list is
  * read with no trust and would otherwise switch the guard off.
  */
 export const WORK_GUARD_PREFIX = 'mlx-work-guard-';

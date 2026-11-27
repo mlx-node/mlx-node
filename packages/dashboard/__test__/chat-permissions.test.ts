@@ -627,7 +627,7 @@ describe('Work: a launch of the PDF tool', () => {
     { optionId: 'reject-once', name: 'No', kind: 'reject_once' },
   ];
   const ARGS = { pdf: 'k3f7a2c4-40', question: 'What are the findings?' };
-  /** The request the agent raised for the model's call, as measured on agent 0.3.6. */
+  /** The request the agent raised for the model's call, as measured on agent 0.3.7. */
   function launch(over: Record<string, unknown> = {}, meta: Record<string, unknown> = {}): PermissionRequest {
     return readPermissionRequest({
       sessionId: 's',

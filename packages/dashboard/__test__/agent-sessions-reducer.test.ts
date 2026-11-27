@@ -1052,6 +1052,7 @@ describe('helper progress (#10): live ticks make nothing, the end stores turns a
     context_usage_pct: 27,
     tools_used: ['grep'],
     error_count: 0,
+    tool_failure_count: 0,
   });
   /** grok `SubagentFinished`: stored. */
   const finished = xai({
@@ -1063,6 +1064,7 @@ describe('helper progress (#10): live ticks make nothing, the end stores turns a
     turns: 3,
     duration_ms: 134_000,
     tokens_used: 21_480,
+    total_tokens_used: 120_400,
     output: 'Found it.',
     will_wake: false,
   });
@@ -1081,7 +1083,14 @@ describe('helper progress (#10): live ticks make nothing, the end stores turns a
     const ops: TranscriptOp[] = [];
     for (const line of [spawned, tick, finished]) ops.push(...r.apply(line));
     const row = r.snapshot().entries.find((e) => e.kind === 'subagent');
-    expect(row).toMatchObject({ status: 'completed', turns: 3, toolCalls: 14, tokens: 21_480, durationMs: 134_000 });
+    expect(row).toMatchObject({
+      status: 'completed',
+      turns: 3,
+      toolCalls: 14,
+      tokens: 21_480,
+      tokensUsed: 120_400,
+      durationMs: 134_000,
+    });
     expect(replay(ops).entries).toEqual(r.snapshot().entries);
     const disk = parseUpdates(
       [spawned, finished]
@@ -1092,6 +1101,35 @@ describe('helper progress (#10): live ticks make nothing, the end stores turns a
       entries.flatMap((e) => (e.kind === 'subagent' ? [{ ...e, ts: 0, endTs: 0 }] : []));
     expect(shape(disk)).toEqual(shape(r.snapshot().entries));
   });
+});
+
+// Mutation: read `tokens_used` as the billed tokens → 21,480; keep a 0 → an orphan's finish reads 0 tokens used.
+it("subagent_finished keeps the attempt's billed tokens apart from its context, and none at 0", () => {
+  const line = (child: string, total: number) =>
+    JSON.stringify({
+      method: '_x.ai/session/update',
+      params: {
+        sessionId: 's',
+        update: {
+          sessionUpdate: 'subagent_finished',
+          subagent_id: child,
+          child_session_id: child,
+          status: 'completed',
+          tool_calls: 0,
+          turns: 0,
+          duration_ms: 5,
+          tokens_used: 41,
+          total_tokens_used: total,
+        },
+      },
+    });
+  const rows = parseUpdates(`${line('c1', 120)}\n${line('c2', 0)}\n`).transcript.flatMap((e) =>
+    e.kind === 'subagent' ? [[e.childId, e.tokens, 'tokensUsed' in e ? e.tokensUsed : 'absent']] : [],
+  );
+  expect(rows).toEqual([
+    ['c1', 41, 120],
+    ['c2', 41, 'absent'],
+  ]);
 });
 
 describe('a stopped task (T1): `killed` from the end line', () => {

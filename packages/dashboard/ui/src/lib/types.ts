@@ -689,7 +689,10 @@ export type TranscriptEntry = (
       description: string;
       status?: string;
       durationMs?: number;
+      /** `tokens_used`: the context size at the end of this attempt. */
       tokens?: number;
+      /** `total_tokens_used`: input plus output tokens this attempt billed, nested subagents included; absent at 0. */
+      tokensUsed?: number;
       /** `subagent_finished`: the helper's tool calls and turns. */
       toolCalls?: number;
       turns?: number;
@@ -702,8 +705,10 @@ export type TranscriptEntry = (
       noSpawn?: true;
       /** `workflow_run_id`: the run that started it, whether or not the run's `workflow` entry is in the transcript. */
       run?: string;
-      /** `resumed_from`: the child session of the attempt this one retries. */
+      /** `resumed_from`: the child session it resumed, by a contract retry, a script `resume_from` or a Task `resume_from`. */
       resumedFrom?: string;
+      /** `retry_of`: the attempt this contract retry follows. */
+      retryOf?: string;
       /** `subagent_spawned.model`: the model it runs on. */
       model?: string;
     }

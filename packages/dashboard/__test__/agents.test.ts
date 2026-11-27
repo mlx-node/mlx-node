@@ -43,14 +43,16 @@ const RUN = 'wf_01a2168534c27fd1a477edb6fad7b0a4';
 const T0 = 1_795_674_158_000;
 const TRACKS = ['track:process', 'track:holes', 'track:claims-check', 'track:fix-reality'] as const;
 const child = (n: number): string => `01a21685-34f1-7d63-8879-00000000000${n}`;
-/** The run's contract retry of `track:process`: a new child, resumed from the first. */
+/** The run's contract retry of `track:process`: a new child, `retry_of` and resumed from the first. */
 const RETRY = '01a21688-13f5-7b32-873d-247e85ca5c3f';
 /** A script call `agent({resume_from})` that resumes `track:process` on its first attempt. */
 const FOLLOW = '01a2168a-0000-7000-8000-00000000f011';
-/** That call's own contract retry, resumed from it. */
+/** That call's own contract retry. */
 const FOLLOW_RETRY = '01a2168a-0000-7000-8000-00000000f012';
-/** A second script call that resumes `track:process`'s first attempt with its label, after its retry took it. */
+/** A spawn whose `retry_of` names `track:process`'s first attempt after its retry took it. */
 const AGAIN = '01a2168a-0000-7000-8000-00000000f013';
+/** A script call `agent({resume_from})` with `track:process`'s label that resumes its retry. */
+const RESUME = '01a2168a-0000-7000-8000-00000000f014';
 const RUN2 = 'wf_01a2168534c27fd1a477edb6fad7b0b5';
 const OTHER = '01a21685-34f1-7d63-8879-0000000000b0';
 
@@ -97,7 +99,14 @@ const spawn = (ms: number, id: string, label: string, extra: object = {}): strin
     ...extra,
   });
 
-const finished = (ms: number, id: string, tokens: number, durationMs: number, status = 'completed'): string =>
+const finished = (
+  ms: number,
+  id: string,
+  tokens: number,
+  durationMs: number,
+  status = 'completed',
+  extra: object = {},
+): string =>
   xai(ms, {
     sessionUpdate: 'subagent_finished',
     subagent_id: id,
@@ -107,7 +116,9 @@ const finished = (ms: number, id: string, tokens: number, durationMs: number, st
     turns: 1,
     duration_ms: durationMs,
     tokens_used: tokens,
+    ...extra,
   });
+const billed = (n: number) => ({ total_tokens_used: n });
 
 const roster = (agents: Array<[string, string, string, number, number]>) =>
   agents.map(([agent_id, label, state, tokens_used, duration_ms]) => ({
@@ -129,7 +140,11 @@ const START = [
 const RETRIED = [
   ...START,
   finished(T0 + 187_923, child(0), 25_262, 187_923),
-  spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0), effective_context_source: 'resumed' }),
+  spawn(T0 + 187_970, RETRY, 'track:process', {
+    resumed_from: child(0),
+    retry_of: child(0),
+    effective_context_source: 'resumed',
+  }),
 ];
 /** `track:process` ended, then a script call resumed it as `track:process-followup`. */
 const FOLLOWED = [
@@ -156,7 +171,7 @@ describe('runAgents: the rows of a run', () => {
     expect(agentsNow(rows, LIVE(T0 + 20)).map((agent) => agent.state)).toEqual(TRACKS.map(() => 'running'));
   });
 
-  // Mutation: drop the fold → track:process is listed twice.
+  // Mutation: ignore `retry_of` → track:process is listed twice.
   it('an agent the run retried is one row in its first place: its newest attempt, with both attempts', () => {
     const entries = read(RETRIED);
     const rows = runAgents(entries).get(RUN)!;
@@ -206,7 +221,7 @@ describe('runAgents: the rows of a run', () => {
         ),
       }),
       finished(T0 + 187_923, child(0), 25_262, 187_923),
-      spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0) }),
+      spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0), retry_of: child(0) }),
     ];
     const rows = runAgents(read(lines)).get(RUN)!;
     expect(agentsNow(rows, LIVE(T0 + 190_000)).map((a) => [a.row.label, a.row.childId, a.state])).toEqual([
@@ -243,7 +258,7 @@ describe('runAgents: the rows of a run', () => {
     const entries = read([
       ...FOLLOWED,
       finished(T0 + 250_000, FOLLOW, 9_000, 62_000),
-      spawn(T0 + 250_100, FOLLOW_RETRY, 'track:process-followup', { resumed_from: FOLLOW }),
+      spawn(T0 + 250_100, FOLLOW_RETRY, 'track:process-followup', { resumed_from: FOLLOW, retry_of: FOLLOW }),
       revision(T0 + 260_000, 6, {
         agents: roster([
           [child(0), 'track:process', 'done', 188_922, 187_923],
@@ -263,7 +278,7 @@ describe('runAgents: the rows of a run', () => {
       ...START.slice(0, 3),
       revision(T0 + 100, 3, { agents: roster([[child(0), 'track:process', 'running', 0, 0]]) }),
       finished(T0 + 187_923, child(0), 25_262, 187_923),
-      spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0) }),
+      spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0), retry_of: child(0) }),
     ]);
     const rows = runAgents(entries).get(RUN)!;
     expect(rows.map((row) => [row.childId, row.entry?.childId, row.at, row.roster])).toEqual([
@@ -272,10 +287,48 @@ describe('runAgents: the rows of a run', () => {
   });
 
   // Mutation: take the newest attempt's run time alone → 120,527 ms.
-  it('a retried row built from its entries sums the run time of its attempts and reads its context at end', () => {
-    const rows = runAgents(read([...RETRIED, finished(T0 + 308_450, RETRY, 27_462, 120_527)])).get(RUN)!;
-    expect(rows[0]).toMatchObject({ childId: RETRY, durationMs: 308_450, tokens: { n: 27_462, kind: 'context' } });
-    expect(tokenWords(rows[0]!)).toBe(fill(CHAT.agent.facts.contextAtEnd, { n: '27.5K' }));
+  // Mutation: take the newest attempt's billed tokens alone → 13 tokens used.
+  // Mutation: read a run agent's context at end when it has no roster → 27.5K context at end.
+  it('a retried row built from its entries sums the run time and the billed tokens of its attempts', () => {
+    const lines = [
+      ...START,
+      finished(T0 + 187_923, child(0), 25_262, 187_923, 'completed', billed(43)),
+      ...RETRIED.slice(START.length + 1),
+      finished(T0 + 308_450, RETRY, 27_462, 120_527, 'completed', billed(13)),
+    ];
+    const rows = runAgents(read(lines)).get(RUN)!;
+    expect(rows[0]).toMatchObject({ childId: RETRY, durationMs: 308_450, tokens: { n: 56, kind: 'used' } });
+    expect(tokenWords(rows[0]!)).toBe(fill(CHAT.agent.facts.tokensUsed, { n: '56' }));
+  });
+
+  // Mutation: skip the move of a roster row that has no spawn line → track:process is listed twice and the run sums 86 tokens.
+  // Mutation: drop rowOf's find of a roster row that is none of the draft's attempts → the row reads done from its finish line.
+  it('a retry that ended before its spawn line puts its roster row on the agent it retried: one row, billed once', () => {
+    const states = (['failed', 'cancelled'] as const).map((state) => {
+      const entries = read([
+        ...START.slice(0, 3),
+        finished(T0 + 187_923, child(0), 25_262, 187_923, 'completed', billed(43)),
+        revision(T0 + 190_000, 9, {
+          status: 'failed',
+          agents: roster([[RETRY, 'track:process', state, 43, 187_923]]),
+        }),
+      ]);
+      const rows = runAgents(entries).get(RUN)!;
+      expect(rows.map((row) => [row.childId, row.attempts, row.tokens])).toEqual([
+        [child(0), [child(0)], { n: 43, kind: 'used' }],
+      ]);
+      return agentState(rows[0]!, STORED).state;
+    });
+    expect(states).toEqual(['failed', 'stopped']);
+  });
+
+  // Mutation: sum the attempts that have a figure → 13 tokens used, though the first attempt's use is unknown.
+  it('a row built from its entries has no token figure when an attempt has no billed tokens, never a context', () => {
+    const rows = runAgents(
+      read([...RETRIED, finished(T0 + 308_450, RETRY, 27_462, 120_527, 'completed', billed(13))]),
+    ).get(RUN)!;
+    expect(rows[0]!.tokens).toBeNull();
+    expect(tokenWords(rows[0]!)).toBeNull();
   });
 
   // Mutation: read the stored state alone → an agent with no end reads running after its run ended.
@@ -289,12 +342,17 @@ describe('runAgents: the rows of a run', () => {
 });
 
 describe('the attempt fold', () => {
-  // Mutation: fold every `resumed_from` → two different agents on one row.
-  it('folds only a spawn of the same run and label that resumed an attempt that had ended', () => {
+  // Mutation: fold on `resumed_from` → a spawn that resumed an ended agent with its label joins its row.
+  it('a spawn with no `retry_of` is its own row, whatever its label, run or start time', () => {
     const early = [
       ...START,
       spawn(T0 + 100_000, FOLLOW, 'track:process', { resumed_from: child(0) }),
       finished(T0 + 187_923, child(0), 25_262, 187_923),
+    ];
+    const sameLabel = [
+      ...START,
+      finished(T0 + 187_923, child(0), 25_262, 187_923),
+      spawn(T0 + 188_000, FOLLOW, 'track:process', { resumed_from: child(0) }),
     ];
     const otherRun = [
       ...START,
@@ -314,6 +372,7 @@ describe('the attempt fold', () => {
     ];
     for (const [name, lines, id] of [
       ['new label', FOLLOWED, FOLLOW],
+      ['same label', sameLabel, FOLLOW],
       ['before its end', early, FOLLOW],
     ] as const) {
       const rows = runAgents(read(lines)).get(RUN)!;
@@ -331,39 +390,34 @@ describe('the attempt fold', () => {
     expect(runAgents(read(task)).get(RUN)![0]!.attempts).toEqual([child(0)]);
   });
 
-  // Mutation: no roster check in the fold → the follow-up takes the first agent's row, and that id controls it.
-  it('a script call that resumes an ended agent with its label is its own row once the roster names both', () => {
+  // Mutation: fold on `resumed_from` → the call that resumes the retry with its label is the row's third attempt.
+  it("a script call with the agent's label that resumes its retry is its own row, also under a stale roster", () => {
     const entries = read([
       ...START,
+      revision(T0 + 100, 3, { agents: roster([[child(0), 'track:process', 'running', 0, 0]]) }),
       finished(T0 + 187_923, child(0), 25_262, 187_923),
-      spawn(T0 + 188_000, FOLLOW, 'track:process', { resumed_from: child(0) }),
-      revision(T0 + 200_000, 5, {
-        agents: roster([
-          [child(0), 'track:process', 'done', 188_922, 187_923],
-          [FOLLOW, 'track:process', 'running', 0, 0],
-        ]),
-      }),
+      spawn(T0 + 187_970, RETRY, 'track:process', { resumed_from: child(0), retry_of: child(0) }),
+      finished(T0 + 308_450, RETRY, 27_462, 120_527),
+      spawn(T0 + 400_000, RESUME, 'track:process', { resumed_from: RETRY }),
     ]);
     const rows = runAgents(entries).get(RUN)!;
-    expect([rows[0], rows[4]].map((row) => [row!.childId, row!.attempts, row!.continues?.childId ?? null])).toEqual([
-      [child(0), [child(0)], null],
-      [FOLLOW, [FOLLOW], child(0)],
+    expect(rows.map((row) => [row.childId, row.attempts, row.continues])).toEqual([
+      [RETRY, [child(0), RETRY], null],
+      [child(1), [child(1)], null],
+      [child(2), [child(2)], null],
+      [child(3), [child(3)], null],
+      [RESUME, [RESUME], { childId: RETRY, label: 'track:process' }],
     ]);
-    expect(controlTarget(rows, child(0))).toBe(child(0));
+    expect(controlTarget(rows, child(0))).toBe(RETRY);
+    expect(attemptWords(rows[4]!)).toEqual([fill(CHAT.agent.facts.continues, { label: 'track:process' })]);
   });
 
-  // Mutation: drop "A has no folded successor yet" → the second call folds into the retried row, and its rows clash.
-  it('each attempt has one row: after the retry took the first attempt, a later call that resumes it is its own row', () => {
+  // Mutation: fold onto any row that holds the id → the spawn joins the retried row, and its rows clash.
+  it("a `retry_of` that names an attempt that is no longer its row's newest is its own row", () => {
     const entries = read([
       ...RETRIED,
       finished(T0 + 308_450, RETRY, 27_462, 120_527),
-      spawn(T0 + 400_000, AGAIN, 'track:process', { resumed_from: child(0) }),
-      revision(T0 + 400_100, 9, {
-        agents: roster([
-          [RETRY, 'track:process', 'done', 188_922, 308_450],
-          [AGAIN, 'track:process', 'running', 0, 0],
-        ]),
-      }),
+      spawn(T0 + 400_000, AGAIN, 'track:process', { resumed_from: child(0), retry_of: child(0) }),
     ]);
     const rows = runAgents(entries).get(RUN)!;
     expect(rows.map((row) => [row.childId, row.attempts, row.continues?.childId ?? null])).toEqual([
@@ -374,7 +428,6 @@ describe('the attempt fold', () => {
       [AGAIN, [AGAIN], child(0)],
     ]);
     expect(agentRowOf(rows, child(0))?.childId).toBe(RETRY);
-    expect(attemptWords(rows[4]!)).toEqual([fill(CHAT.agent.facts.continues, { label: 'track:process' })]);
   });
 });
 
@@ -411,7 +464,7 @@ describe('the end state rule', () => {
     expect(agentState(row!, LIVE(end + FINISH_WAIT_MS)).state).toBe('done');
     expect(agentState(row!, STORED).state).toBe('done');
     const [retried] = runAgents(
-      read([...lines, spawn(end + 47, RETRY, 'track:process', { resumed_from: child(0) })]),
+      read([...lines, spawn(end + 47, RETRY, 'track:process', { resumed_from: child(0), retry_of: child(0) })]),
     ).get(RUN)!;
     expect(agentState(retried!, LIVE(end + 2_000))).toMatchObject({ state: 'running', until: null });
     const moved = read([
@@ -490,6 +543,19 @@ describe('runAgents keeps its lists while their rows stay the same', () => {
     expect(next.get(RUN)).not.toBe(first.get(RUN));
     const row = next.get(RUN)!.find((r) => r.childId === child(1))!;
     expect([agentState(row, STORED).state, row.durationMs]).toEqual(['done', 845_266]);
+  });
+
+  // Mutation: leave the earlier attempts' counts out of the compare → the retried row keeps its old tool calls.
+  it("an earlier attempt's counts that change give the retried row a new list", () => {
+    const entries = read(RETRIED);
+    const first = runAgents(entries);
+    const end = indexOfChild(entries, child(0));
+    const moved = entries.map((entry, i): TranscriptEntry =>
+      i === end && entry.kind === 'subagent' ? { ...entry, toolCalls: 12 } : entry,
+    );
+    const next = runAgents(moved, first);
+    expect(next.get(RUN)).not.toBe(first.get(RUN));
+    expect(next.get(RUN)![0]!.earlier.toolCalls).toBe(12);
   });
 });
 
@@ -778,6 +844,18 @@ describe('Task subagent rows', () => {
     expect(attemptWords(rows.get(FOLLOW)!)).toEqual([
       fill(CHAT.agent.facts.continues, { label: 'Find the flaky test' }),
     ]);
+  });
+
+  // Mutation: give a Task subagent its billed tokens → its row reads 3,400 tokens used, not its context at end.
+  it('an ended Task subagent reads its context at end, also when its finish line names its billed tokens', () => {
+    const entries = read([
+      ...START,
+      task(T0 + 20, OTHER, 'Find the flaky test'),
+      finished(T0 + 30, OTHER, 1_200, 10, 'completed', billed(3_400)),
+    ]);
+    const row = subagentRows(entries).get(OTHER)!;
+    expect(row.tokens).toEqual({ n: 1_200, kind: 'context' });
+    expect(tokenWords(row)).toBe(fill(CHAT.agent.facts.contextAtEnd, { n: '1,200' }));
   });
 
   // Mutation: return a new map every time → every finished turn's rows re-render on each stream event.

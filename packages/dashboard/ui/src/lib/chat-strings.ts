@@ -472,6 +472,8 @@ export const CHAT = {
     progressTokens: '{n} tokens',
     progressErrors: '{n} errors',
     progressErrorsOne: '1 error',
+    progressFailedCalls: '{n} failed calls',
+    progressFailedCallsOne: '1 failed call',
     /** No tick for 20 s: the agent sends one at least every 8 s. */
     progressQuiet: 'Quiet for {time}',
     /** Work: the conversation's goal; it never opens the docked rail by itself. */

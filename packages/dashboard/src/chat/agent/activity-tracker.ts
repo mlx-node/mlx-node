@@ -44,8 +44,6 @@ interface HelperLive {
   subagentId: string;
   /** The workflow run the helper works for, or null for the conversation's own subagent. */
   run: string | null;
-  /** Its start line's `description`: a contract retry names the same. */
-  description: string;
   /** Child sessions of its attempts, oldest first; the last is its own. */
   attempts: string[];
   /** Its last `subagent_progress` tick, with the host time; null before the first. */
@@ -71,11 +69,7 @@ interface Doing {
 
 /** A workflow agent that ended, for the retry that may follow it. */
 interface EndedAgent {
-  run: string;
-  description: string;
   attempts: string[];
-  /** A retry took its place already: a later spawn that resumes it is an agent of its own. */
-  taken: boolean;
 }
 
 function doingOf(d: Doing): AgentDoing | null {
@@ -398,14 +392,12 @@ export class ActivityTracker {
         const child = id(u.child_session_id);
         if (child === null || this.helpers.has(child)) return false;
         const run = id(u.workflow_run_id);
-        const description = typeof u.description === 'string' ? u.description : '';
-        const prior = this.retried(id(u.resumed_from), run, description);
+        const prior = this.retried(id(u.retry_of));
         const attempts = prior === null ? [child] : [...prior.attempts, child];
         for (const old of attempts) if (old !== child) this.aliases.set(old, child);
         this.helpers.set(child, {
           subagentId: id(u.subagent_id) ?? child,
           run,
-          description,
           attempts,
           progress: null,
           doing: { chunk: null, tools: new Map(), compacting: false },
@@ -626,26 +618,21 @@ export class ActivityTracker {
   }
 
   /**
-   * The ended agent a spawn retries: the same run (set) and description, resumed from it, and no retry took its place
-   * yet. A script's `agent({resume_from})` under its own description, or a resumed Task subagent, is an agent of its
-   * own.
+   * The ended workflow agent whose newest attempt a spawn's `retry_of` names; the retry takes it, so that attempt is no
+   * agent's newest any more. A script's `agent({resume_from})`, also under the same label, or a resumed Task subagent,
+   * is an agent of its own.
    */
-  private retried(from: string | null, run: string | null, description: string): EndedAgent | null {
-    if (from === null || run === null) return null;
-    const ended = this.endedAgents.get(from);
-    if (ended === undefined || ended.taken || ended.run !== run || ended.description !== description) return null;
-    ended.taken = true;
+  private retried(retryOf: string | null): EndedAgent | null {
+    if (retryOf === null) return null;
+    const ended = this.endedAgents.get(retryOf);
+    if (ended === undefined) return null;
+    this.endedAgents.delete(retryOf);
     return ended;
   }
 
   private keepEnded(child: string, helper: HelperLive): void {
     if (helper.run === null) return;
-    this.endedAgents.set(child, {
-      run: helper.run,
-      description: helper.description,
-      attempts: helper.attempts,
-      taken: false,
-    });
+    this.endedAgents.set(child, { attempts: helper.attempts });
     for (const old of this.endedAgents.keys()) {
       if (this.endedAgents.size <= ENDED_AGENTS_KEPT) break;
       this.endedAgents.delete(old);

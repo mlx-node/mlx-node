@@ -547,8 +547,40 @@ describe('the user’s hooks', () => {
     writeFileSync(join(agentHome, 'config.toml'), '[hooks]\nPreToolUse = []\n');
     expect(await findUserHooks(at)).toBe(true);
     rmSync(join(agentHome, 'config.toml'));
-    mkdirSync(join(cwd, '.grok', 'hooks'), { recursive: true });
-    writeFileSync(join(cwd, '.grok', 'hooks', 'h.json'), '{}');
+    // Mutation: the folder's hooks read from `.grok` again → red.
+    mkdirSync(join(cwd, '.mlx-agent', 'hooks'), { recursive: true });
+    writeFileSync(join(cwd, '.mlx-agent', 'hooks', 'h.json'), '{}');
     expect(await findUserHooks(at)).toBe(true);
+  });
+
+  it("a folder's `.mlx-agent` holds its hooks; its `.grok` is grok-build's and is not read", async () => {
+    const home = join(root, 'project-hook-home');
+    const agentHome = join(root, 'project-hook-agent');
+    const grokOnly = join(root, 'project-grok-only');
+    const toml = join(root, 'project-toml');
+    for (const dir of [home, agentHome]) mkdirSync(dir, { recursive: true });
+    // Mutation: reading `.grok/hooks` beside `.mlx-agent/hooks` → red.
+    mkdirSync(join(grokOnly, '.grok', 'hooks'), { recursive: true });
+    writeFileSync(join(grokOnly, '.grok', 'hooks', 'h.json'), '{}');
+    writeFileSync(join(grokOnly, '.grok', 'config.toml'), '[hooks]\nPreToolUse = []\n');
+    expect(await findUserHooks({ home, agentHome, cwd: grokOnly })).toBe(false);
+    // Mutation: the folder's `config.toml` read from `.grok` again → red.
+    mkdirSync(join(toml, '.mlx-agent'), { recursive: true });
+    writeFileSync(join(toml, '.mlx-agent', 'config.toml'), '[hooks]\nPreToolUse = []\n');
+    expect(await findUserHooks({ home, agentHome, cwd: toml })).toBe(true);
+  });
+
+  // Mutation: the home skip dropped (the home's `.mlx-agent` read as a project folder) → red.
+  it('a Work folder that is the home has no project folder: its `.mlx-agent/hooks` is not read', async () => {
+    const home = join(root, 'home-as-folder');
+    const agentHome = join(root, 'home-as-folder-agent');
+    mkdirSync(join(home, '.mlx-agent', 'hooks'), { recursive: true });
+    mkdirSync(agentHome, { recursive: true });
+    writeFileSync(join(home, '.mlx-agent', 'hooks', 'h.json'), '{}');
+    expect(await findUserHooks({ home, agentHome, cwd: home })).toBe(false);
+    const inside = join(home, 'app');
+    mkdirSync(join(inside, '.mlx-agent', 'hooks'), { recursive: true });
+    writeFileSync(join(inside, '.mlx-agent', 'hooks', 'h.json'), '{}');
+    expect(await findUserHooks({ home, agentHome, cwd: inside })).toBe(true);
   });
 });

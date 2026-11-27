@@ -267,7 +267,7 @@ export const HARNESS_MODELS: readonly HarnessModel[] = [
 ];
 
 /** The release the harness's fake agent reports: one that sends thinking levels, so the Thinking row shows. */
-export const HARNESS_AGENT_TAG = 'mlx-agent-v0.3.6';
+export const HARNESS_AGENT_TAG = 'mlx-agent-v0.3.7';
 
 /**
  * Chat for the harness: the fake agent, keys in memory, the fake providers (`providerBaseUrls`, all loopback), an app

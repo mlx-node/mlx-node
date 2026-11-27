@@ -624,7 +624,9 @@ export interface HelperProgress {
   tokens: number;
   /** 0..100. */
   contextPct: number;
+  /** Errors other than failed tool calls. */
   errors: number;
+  failedCalls: number;
   /** The helper's run time at the tick, by the agent's clock. */
   durationMs: number;
   /** The model's window in tokens, as the tick names it; null when it names none. */

@@ -357,13 +357,15 @@ describe("a workflow agent's contract retry", () => {
   const spawn = (child: string, extra: Record<string, unknown> = {}): TrackedLine =>
     xai({ ...spawned(child, RUN).update, description: 'track:process', ...extra });
 
+  const retry = (child: string, of: string): TrackedLine => spawn(child, { resumed_from: of, retry_of: of });
+
   // Mutation: no alias → a Stop sent with the first attempt's id finds no agent (not-live), and the retry runs on.
   it("takes the row: both attempts are listed, the first attempt's id reaches the retry, until it ends", () => {
     const t = new ActivityTracker();
     t.apply(spawn('a1'));
     t.apply(finished('a1'));
     expect(t.agent('a1')).toBeNull();
-    t.apply(spawn('a2', { resumed_from: 'a1' }));
+    t.apply(retry('a2', 'a1'));
     expect(t.live().agents).toEqual([
       { childId: 'a2', run: RUN, attempts: ['a1', 'a2'], stopping: false, messages: 'no-address' },
     ]);
@@ -372,14 +374,8 @@ describe("a workflow agent's contract retry", () => {
     expect(t.agent('a2')?.stopping).toBe(true);
     expect(t.stopTaken('a1')).toBe(true);
     expect(t.live().stoppedByYou).toEqual(['a2']);
-    // A script's `agent({resume_from})` of the first attempt under its own label is an agent of its own.
-    t.apply(spawn('c', { resumed_from: 'a1', description: 'track:process-follow-up' }));
-    expect(t.live().agents.map((a) => a.attempts)).toEqual([['a1', 'a2'], ['c']]);
     t.apply(finished('a2'));
     expect([t.agent('a1'), t.agent('a2')]).toEqual([null, null]);
-    // The first attempt was retried once already: another spawn that resumes it is its own row.
-    t.apply(spawn('d', { resumed_from: 'a1' }));
-    expect(t.live().agents.map((a) => a.attempts)).toEqual([['c'], ['d']]);
   });
 
   // Mutation: a drop keeps no ended agent → the retry is a row of its own, and the first attempt's id finds nothing.
@@ -388,7 +384,7 @@ describe("a workflow agent's contract retry", () => {
     t.apply(spawn('a1'));
     expect(t.dropHelper('a1', 'a1')).toBe(true);
     expect(t.apply(finished('a1'))).toBe(false);
-    t.apply(spawn('a2', { resumed_from: 'a1' }));
+    t.apply(retry('a2', 'a1'));
     expect(t.agent('a1')?.childId).toBe('a2');
     expect([t.attempts('a1'), t.attempts('a2')]).toEqual([
       ['a1', 'a2'],
@@ -396,23 +392,36 @@ describe("a workflow agent's contract retry", () => {
     ]);
   });
 
-  // Mutation: fold every `resumed_from` of the run → the script's follow-up call under its own label takes the row.
-  it("a script's resume of an ended agent under its own label is its own row; the retry after it still folds", () => {
+  // Mutation: fold on `resumed_from` → the script's call with the same label takes the row of the agent it resumed.
+  it("a script's resume of an ended agent, also under its own label, is its own row; the retry after it still folds", () => {
     const t = new ActivityTracker();
     t.apply(spawn('a1'));
     t.apply(finished('a1'));
-    t.apply(spawn('c', { resumed_from: 'a1', description: 'track:process-follow-up' }));
-    t.apply(spawn('a2', { resumed_from: 'a1' }));
-    expect(t.live().agents.map((a) => a.attempts)).toEqual([['c'], ['a1', 'a2']]);
+    t.apply(spawn('c', { resumed_from: 'a1' }));
+    t.apply(spawn('e', { resumed_from: 'a1', description: 'track:process-follow-up' }));
+    t.apply(retry('a2', 'a1'));
+    expect(t.live().agents.map((a) => a.attempts)).toEqual([['c'], ['e'], ['a1', 'a2']]);
   });
 
-  // Mutation: take the first ended agent that names the id → attempt 1's id gives attempt 1 alone once both ended.
+  // Mutation: keep the ended agent once a retry took it → a second `retry_of` of the first attempt joins the row.
+  it("a `retry_of` of an attempt that is no longer its row's newest is its own row", () => {
+    const t = new ActivityTracker();
+    t.apply(spawn('a1'));
+    t.apply(finished('a1'));
+    t.apply(retry('a2', 'a1'));
+    t.apply(finished('a2'));
+    t.apply(retry('d', 'a1'));
+    expect(t.live().agents.map((a) => a.attempts)).toEqual([['d']]);
+    expect(t.attempts('a1')).toEqual(['a1', 'a2']);
+  });
+
+  // Mutation: keep an ended agent's newest attempt alone → attempt 1's id gives attempt 1 alone once both ended.
   it("names a row's attempts by any attempt's id, while it runs and after it ended", () => {
     const t = new ActivityTracker();
     t.apply(spawn('a1'));
     expect(t.attempts('a1')).toEqual(['a1']);
     t.apply(finished('a1'));
-    t.apply(spawn('a2', { resumed_from: 'a1' }));
+    t.apply(retry('a2', 'a1'));
     expect([t.attempts('a1'), t.attempts('a2')]).toEqual([
       ['a1', 'a2'],
       ['a1', 'a2'],
@@ -425,9 +434,9 @@ describe("a workflow agent's contract retry", () => {
     const t = new ActivityTracker();
     t.apply(xai({ ...spawned('t1').update }));
     t.apply(finished('t1'));
-    t.apply(xai({ ...spawned('t2').update, resumed_from: 't1' }));
+    t.apply(xai({ ...spawned('t2').update, resumed_from: 't1', retry_of: 't1' }));
     t.apply(spawn('w1'));
-    t.apply(spawn('w2', { resumed_from: 'w1' }));
+    t.apply(retry('w2', 'w1'));
     expect(t.live().agents.map((a) => a.attempts)).toEqual([['t2'], ['w1'], ['w2']]);
   });
 });
@@ -445,6 +454,7 @@ describe('what an agent does now (T31)', () => {
       context_window_tokens: 131_072,
       context_usage_pct: 0,
       error_count: 0,
+      tool_failure_count: 0,
     })!;
   const line = (sessionUpdate: string, fields: Record<string, unknown> = {}) => ({ sessionUpdate, ...fields });
   const nowOf = (t: ActivityTracker) => t.live().helpers[0]?.now;
@@ -679,6 +689,7 @@ describe('helper progress ticks', () => {
     context_usage_pct: 41,
     tools_used: ['read_file', 'grep'],
     error_count: 0,
+    tool_failure_count: 0,
     ...over,
   });
 
@@ -690,6 +701,7 @@ describe('helper progress ticks', () => {
       tokens: 18_200,
       contextPct: 41,
       errors: 0,
+      failedCalls: 0,
       durationMs: 4_100,
       contextWindow: 44_000,
     });
@@ -711,6 +723,22 @@ describe('helper progress ticks', () => {
     }
   });
 
+  // Mutation: no subtraction → a failed call reads as an error too (3 errors).
+  // Mutation: a missing `tool_failure_count` read as 0 → a tick with no failed-call count is kept.
+  // Mutation: drop the subset guard → more failed calls than errors give a negative error count.
+  it('a failed tool call is counted apart from the other errors; a count that is missing or past the errors is no tick', () => {
+    expect(readSubagentProgress(tick(CHILD, { error_count: 3, tool_failure_count: 2 }))).toMatchObject({
+      errors: 1,
+      failedCalls: 2,
+    });
+    expect(readSubagentProgress(tick(CHILD, { error_count: 2, tool_failure_count: 2 }))).toMatchObject({
+      errors: 0,
+      failedCalls: 2,
+    });
+    expect(readSubagentProgress(tick(CHILD, { tool_failure_count: undefined }))).toBeNull();
+    expect(readSubagentProgress(tick(CHILD, { error_count: 1, tool_failure_count: 2 }))).toBeNull();
+  });
+
   // Mutation: keep a tick for any child id → the stranger is listed.
   it('a tick of a known helper is kept with the host time; one for an unknown child is dropped', () => {
     const t = new ActivityTracker();
@@ -727,6 +755,7 @@ describe('helper progress ticks', () => {
         tokens: 18_200,
         contextPct: 41,
         errors: 0,
+        failedCalls: 0,
         durationMs: 4_100,
         contextWindow: 44_000,
         at: 500,

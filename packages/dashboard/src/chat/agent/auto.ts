@@ -5,7 +5,7 @@
  */
 
 import type { Stats } from 'node:fs';
-import { lstat, readdir, readFile, readlink, stat } from 'node:fs/promises';
+import { lstat, readdir, readFile, readlink, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, join, sep } from 'node:path';
 
 import type { PermissionRequest } from '../acp/messages.js';
@@ -1618,6 +1618,7 @@ export interface HookPlace {
 export async function findUserHooks(place: HookPlace): Promise<boolean> {
   const root = await gitRoot(place.cwd);
   const folders = root === place.cwd ? [place.cwd] : [place.cwd, root];
+  const home = await realpath(place.home).catch(() => place.home);
   const checks: Array<Promise<boolean>> = [
     settingsHook(join(place.home, '.claude', 'settings.json')),
     settingsHook(join(place.home, '.claude', 'settings.local.json')),
@@ -1633,9 +1634,11 @@ export async function findUserHooks(place: HookPlace): Promise<boolean> {
       settingsHook(join(folder, '.claude', 'settings.json')),
       settingsHook(join(folder, '.claude', 'settings.local.json')),
       settingsHook(join(folder, '.cursor', 'hooks.json')),
-      hookFolder(join(folder, '.grok', 'hooks')),
-      tomlHook(join(folder, '.grok', 'config.toml')),
     );
+    // The agent reads no project folder in the home: `<home>/.mlx-agent` is the default agent home.
+    if ((await realpath(folder).catch(() => folder)) !== home) {
+      checks.push(hookFolder(join(folder, '.mlx-agent', 'hooks')), tomlHook(join(folder, '.mlx-agent', 'config.toml')));
+    }
   }
   const found = await Promise.all(checks);
   return found.some((f) => f);

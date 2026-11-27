@@ -239,6 +239,7 @@ describe('ActivityRail: a helper row ticks (#10)', () => {
     tokens: 18_200,
     contextPct: 41,
     errors: 0,
+    failedCalls: 0,
     durationMs: 134_000,
     at: NOW,
     ...over,

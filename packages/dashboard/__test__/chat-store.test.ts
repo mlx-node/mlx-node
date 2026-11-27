@@ -471,6 +471,7 @@ describe('permission modes in the stores', () => {
       tokens: 9_000,
       contextPct: 27,
       errors: 0,
+      failedCalls: 0,
       durationMs: 2_000,
       at: 5,
     });

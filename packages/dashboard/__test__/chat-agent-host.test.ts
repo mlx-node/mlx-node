@@ -41,7 +41,7 @@ import { gate } from './helpers/fake-engine.js';
 import { runView } from './helpers/run-views.js';
 
 const MODEL = 'qwen3.5-4b';
-/** The agent's own lines for a Stop of one workflow agent (mlx-agent v0.3.6, recorded). */
+/** The agent's own lines for a Stop of one workflow agent (mlx-agent v0.3.7, recorded). */
 const STOP_RECORD = JSON.parse(
   readFileSync(fileURLToPath(new URL('./fixtures/workflow-agent-stop.json', import.meta.url)), 'utf8'),
 ) as { lines: Array<{ params?: { update?: Json } }> };
@@ -163,11 +163,16 @@ describe('launchFromProbe', () => {
     expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.5' })).toEqual({
       failure: 'agent-too-old',
     });
+    // Mutation: the minimum left at v0.3.6 → Work starts an agent that reads `.grok` project folders and sends no
+    // `tool_failure_count`.
     expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.6' })).toEqual({
+      failure: 'agent-too-old',
+    });
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.7' })).toEqual({
       command: '/m',
       args: ['--disable-web-search', 'agent', '--no-leader', 'stdio'],
       source: 'managed',
-      tag: 'mlx-agent-v0.3.6',
+      tag: 'mlx-agent-v0.3.7',
       versionVerified: true,
     });
     expect(launchFromProbe({ source: 'env', path: '/e' })).toMatchObject({
@@ -201,7 +206,6 @@ describe('Chat host', () => {
           'GROK_CURSOR_HOOKS_ENABLED',
           'GROK_CURSOR_MCPS_ENABLED',
           'GROK_CURSOR_SKILLS_ENABLED',
-          'GROK_DISABLE_AUTOUPDATER',
           'GROK_HOME',
           'GROK_IMAGE_EDIT',
           'GROK_IMAGE_GEN',
@@ -1030,7 +1034,7 @@ describe('Work host', () => {
           expect.arrayContaining(['GROK_HOME', 'HOME', 'PATH', 'XAI_API_KEY', 'GROK_RESUME_COMMAND']),
         );
         expect(start.envNames).not.toContain('ELECTRON_RUN_AS_NODE');
-        // Mutation: the process started in the user's home again (its `.grok` is grok-build's) → red.
+        // Mutation: the process started in the user's home again (the agent reads it as a project) → red.
         expect(realpathSync(start.cwd as string)).toBe(realpathSync(fake.paths.workProcess));
         expect(readdirSync(fake.paths.workProcess)).toEqual([]);
         const started = fake.host.startTurn(created.sessionId, 'list files', { modelId: MODEL, cwd: fake.project });

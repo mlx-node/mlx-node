@@ -427,6 +427,12 @@ describe('dev fixture content for the manage pages', () => {
     }
     expect(long.transcript.some((entry) => entry.kind === 'tool' && entry.status === 'failed')).toBe(true);
     expect(long.session.subagents.filter((child) => !child.exists)).toHaveLength(1);
+    const ended = long.transcript.flatMap((entry) =>
+      entry.kind === 'subagent' && entry.endTs !== undefined ? [entry] : [],
+    );
+    expect(ended.some((entry) => entry.run === undefined)).toBe(true);
+    expect(ended.some((entry) => entry.run !== undefined)).toBe(true);
+    for (const entry of ended) expect(entry.tokensUsed).toBeGreaterThan(entry.tokens!);
 
     const live = reader.detail(LIVE_SESSION_ID)!;
     expect(live.session.live).toBe(true);

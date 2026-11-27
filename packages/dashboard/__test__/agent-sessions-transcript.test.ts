@@ -1085,9 +1085,9 @@ describe('parseUpdates: workflow runs', () => {
     expect(shown.report).not.toContain(key.slice(0, 5));
   });
 
-  // Mutations: drop `run` → the thread draws the helper twice; drop `resumedFrom` → a retried helper is listed twice in
-  // its card.
-  it("a helper's spawn names its run, also before the run's entry, and the attempt it retries", () => {
+  // Mutations: drop `run` → the thread draws the helper twice; drop `retryOf` → a retried helper is listed twice in its
+  // card; keep an empty `retry_of` → a spawn folds onto no row.
+  it("a helper's spawn names its run, also before the run's entry, what it resumed and the attempt it retries", () => {
     const spawn = (child: string, n: number, extra: object) =>
       xai(
         {
@@ -1106,16 +1106,16 @@ describe('parseUpdates: workflow runs', () => {
         spawn('c0', 1, { workflow_run_id: 'wf_1' }),
         line('wf_1', 1, 'active', 2),
         spawn('c1', 3, { workflow_run_id: 'wf_1' }),
-        spawn('c2', 4, { workflow_run_id: 'wf_1', resumed_from: 'c1' }),
-        spawn('c3', 5, {}),
+        spawn('c2', 4, { workflow_run_id: 'wf_1', resumed_from: 'c1', retry_of: 'c1' }),
+        spawn('c3', 5, { resumed_from: 'c2', retry_of: '' }),
       ].join('\n')}\n`,
     );
     const helpers = parsed.transcript.filter((e) => e.kind === 'subagent');
-    expect(helpers.map((e) => [e.childId, e.run, e.resumedFrom])).toEqual([
-      ['c0', 'wf_1', undefined],
-      ['c1', 'wf_1', undefined],
-      ['c2', 'wf_1', 'c1'],
-      ['c3', undefined, undefined],
+    expect(helpers.map((e) => [e.childId, e.run, e.resumedFrom, 'retryOf' in e ? e.retryOf : 'absent'])).toEqual([
+      ['c0', 'wf_1', undefined, 'absent'],
+      ['c1', 'wf_1', undefined, 'absent'],
+      ['c2', 'wf_1', 'c1', 'c1'],
+      ['c3', undefined, 'c2', 'absent'],
     ]);
   });
 });

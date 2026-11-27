@@ -2069,7 +2069,15 @@ describe('helper progress (#10)', () => {
         expect((await start(fake, id).done).outcome).toBe('completed');
         await until(() => fake.events.activity.length > 0, 5_000);
         await sleep(500);
-        const tick = { childId: 'helper-1', turns: 1, toolCalls: 10, tokens: 1_000, contextPct: 3, errors: 0 };
+        const tick = {
+          childId: 'helper-1',
+          turns: 1,
+          toolCalls: 10,
+          tokens: 1_000,
+          contextPct: 3,
+          errors: 0,
+          failedCalls: 0,
+        };
         expect(fake.events.activity).toEqual([
           {
             sessionId: id,

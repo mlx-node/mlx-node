@@ -349,6 +349,7 @@ describe('a key in a monitor’s output (T2)', () => {
         tokens: 0,
         contextPct: 0,
         errors: 0,
+        failedCalls: 0,
         durationMs: 0,
         contextWindow: null,
       },

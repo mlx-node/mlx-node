@@ -2523,7 +2523,8 @@ export class AgentHost {
             claudeCode: this.opts.claudeCode?.() ?? true,
           });
     if (launch.env !== undefined) Object.assign(env, launch.env);
-    // Never `$HOME`: the agent reads its process cwd as a project, and `$HOME/.grok` is grok-build's own home.
+    // Never `$HOME`: the agent reads its process cwd as a project (its `.mcp.json` and its `.claude`, `.agents` and
+    // `.cursor` skills).
     const cwd = this.mode === 'chat' ? this.opts.paths.chatWorkspace : this.opts.paths.workProcess;
     const fingerprint = endpointFingerprint(endpoint);
     let protocolError = false;
