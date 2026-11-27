@@ -88,6 +88,34 @@ export function reloadMountedQueries(): void {
   for (const listener of reloadListeners) listener();
 }
 
+// Each live hook times its own throttle window, so one data event can find one hook due now and a sibling on the same
+// path due a few ms later, after the first GET ended: two GETs. The first hook due starts every waiting sibling.
+const liveWaiting = new Map<string, Set<() => void>>();
+
+function waitLive(path: string, start: () => void): void {
+  let waiting = liveWaiting.get(path);
+  if (waiting === undefined) {
+    waiting = new Set();
+    liveWaiting.set(path, waiting);
+  }
+  waiting.add(start);
+}
+
+function leaveLive(path: string, start: () => void): void {
+  const waiting = liveWaiting.get(path);
+  if (waiting === undefined) return;
+  waiting.delete(start);
+  if (waiting.size === 0) liveWaiting.delete(path);
+}
+
+function startLive(path: string): void {
+  queueMicrotask(() => {
+    const waiting = liveWaiting.get(path);
+    liveWaiting.delete(path);
+    for (const start of waiting ?? []) start();
+  });
+}
+
 function subscribeNothing(): () => void {
   return () => {};
 }
@@ -142,15 +170,19 @@ export function useJson<T>(path: string, options: JsonOptions = {}): AsyncState<
   const throttle = useRef({ lastStart: 0, lastDuration: 0, inFlight: false, pending: false, run: 0 });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tryRefetch = useRef<() => void>(() => {});
+  const start = useRef(() => {
+    throttle.current.pending = false;
+    if (timer.current !== null) clearTimeout(timer.current);
+    timer.current = null;
+    reload();
+  }).current;
   tryRefetch.current = () => {
     const state = throttle.current;
     if (!state.pending || state.inFlight) return;
     const wait = state.lastStart + Math.max(minIntervalMs, 3 * state.lastDuration) - Date.now();
+    waitLive(path, start);
     if (wait <= 0) {
-      state.pending = false;
-      if (timer.current !== null) clearTimeout(timer.current);
-      timer.current = null;
-      reload();
+      startLive(path);
     } else if (timer.current === null) {
       timer.current = setTimeout(() => {
         timer.current = null;
@@ -171,6 +203,7 @@ export function useJson<T>(path: string, options: JsonOptions = {}): AsyncState<
 
   useEffect(
     () => () => {
+      leaveLive(path, start);
       throttle.current.pending = false;
       if (timer.current !== null) clearTimeout(timer.current);
       timer.current = null;
