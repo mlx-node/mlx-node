@@ -25,8 +25,9 @@ import { describe, expect, it, onTestFinished } from 'vite-plus/test';
 
 import { ApiError } from '../src/api/errors.js';
 import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
+import { readPdfCommand, readPdfScript } from '../src/chat/agent/pdf-tool.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
+import { attachmentView, type AttachmentInput, pdfToolId } from '../src/chat/attachment-rule.js';
 import { readWorkIndexSync } from '../src/chat/index-file.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
@@ -1146,6 +1147,123 @@ describe('Chat service — attachments', () => {
       { endpointModels: [SEES, BLIND] },
     );
   }, 20_000);
+
+  describe('a PDF for the tool', () => {
+    const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]);
+    /** Stages `pages` pages through the route's method, as the page sends them. */
+    async function staged(svc: ChatService, pages: number): Promise<string> {
+      const { stage } = await svc.stagePdf({ stage: null, page: 1, pages, data: JPEG });
+      for (let page = 2; page <= pages; page++) await svc.stagePdf({ stage, page, pages, data: JPEG });
+      return stage;
+    }
+    const tool = (stage: string, pages: number): AttachmentInput => ({ kind: 'pdf', name: 'report.pdf', stage, pages });
+    const prompts = (fake: FakeService) =>
+      fake
+        .sent()
+        .filter((m) => m.method === 'session/prompt')
+        .map((m) => m.params as Json);
+
+    // Mutations: the stage not placed on Send; Read it now not the agent's own command; the page folders kept on
+    // delete → red.
+    it('Work: Send moves the stage to the page folder of its id, the note names the id; Read it now starts read-pdf', async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          expect((await svc.state()).pdfTool).toEqual({ chat: false, work: true });
+          const stage = await staged(svc, 3);
+          const item = tool(stage, 3);
+          const id = pdfToolId(stage, 3);
+          const { conversation } = await svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [item] });
+          const page = new Page(svc, conversation.id);
+          // The first turn can end before the page is attached: its sync then shows no turn.
+          const done = () => {
+            const first = page.events[0];
+            return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0);
+          };
+          await until(() => page.events.length > 0 && done() === 1, 5_000);
+          expect(prompts(fake)[0]).toEqual(promptParams(conversation.id, 'read', [item], { mode: 'agent' }));
+          const folder = join(fake.paths.workPdf, id);
+          expect(readdirSync(folder).sort()).toEqual(['meta.json', 'page-001.jpg', 'page-002.jpg', 'page-003.jpg']);
+          expect(JSON.parse(readFileSync(join(folder, 'meta.json'), 'utf8'))).toMatchObject({
+            session: conversation.id,
+            name: 'report.pdf',
+            pages: 3,
+          });
+          expect(existsSync(join(fake.paths.pdfStage, stage))).toBe(false);
+          expect(readFileSync(join(fake.root, 'agent-home', 'workflows', 'read-pdf.rhai'), 'utf8')).toBe(
+            readPdfScript(fake.paths.workPdf),
+          );
+          await svc.prompt(conversation.id, 'and again', [item]);
+          await until(() => done() === 2, 5_000);
+          expect(prompts(fake)[1]).toEqual(promptParams(conversation.id, 'and again', [item], { mode: 'agent' }));
+          await svc.readPdf(conversation.id, id);
+          await until(() => done() === 3, 5_000);
+          const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
+          expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf') });
+          const gone = await apiError(svc.readPdf(conversation.id, pdfToolId('b'.repeat(26), 3)));
+          expect([gone.code, gone.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
+          page.detach();
+          await svc.delete(conversation.id);
+          expect(existsSync(folder)).toBe(false);
+        },
+        { endpointModels: [SEES], mutate: scripted },
+      );
+    }, 30_000);
+
+    it('is refused in Chat, with a stage that is not complete, and on a model that does not see images', async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          const half = (await svc.stagePdf({ stage: null, page: 1, pages: 3, data: JPEG })).stage;
+          const refusedWith = async (input: Parameters<ChatService['create']>[0]) =>
+            refusedAs(await apiError(svc.create(input)));
+          expect(await refusedWith({ mode: 'work', text: 'read', cwd: project, attachments: [tool(half, 3)] })).toEqual(
+            REFUSED,
+          );
+          const whole = await staged(svc, 2);
+          expect(
+            await refusedWith({
+              mode: 'work',
+              text: 'read',
+              cwd: project,
+              modelId: BLIND.name,
+              attachments: [tool(whole, 2)],
+            }),
+          ).toEqual(REFUSED);
+          expect(await refusedWith({ mode: 'chat', text: 'read', attachments: [tool(whole, 2)] })).toEqual(REFUSED);
+          expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+          const late = await apiError(svc.stagePdf({ stage: half, page: 3, pages: 3, data: JPEG }));
+          expect(refusedAs(late)).toEqual(REFUSED);
+          expect(await svc.dropPdfStage(half)).toEqual({});
+          expect(existsSync(join(fake.paths.pdfStage, half))).toBe(false);
+        },
+        { endpointModels: [SEES, BLIND] },
+      );
+    }, 20_000);
+
+    // Mutation: the tool reported on while a file of the person's holds its name → red.
+    it("Work: a file of the person's named like the tool's turns it off, before any agent start", async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          const agents = join(fake.root, 'agent-home', 'agents');
+          mkdirSync(agents, { recursive: true });
+          writeFileSync(join(agents, 'pdf-reader.md'), '---\nname: pdf-reader\n---\nmine\n');
+          expect((await svc.state()).pdfTool).toEqual({ chat: false, work: false });
+          const stage = await staged(svc, 2);
+          const refused = await apiError(
+            svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(stage, 2)] }),
+          );
+          expect(refusedAs(refused)).toEqual(REFUSED);
+          expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+        },
+        { endpointModels: [SEES] },
+      );
+    });
+  });
 
   const FULL = [
     'E_CONFLICT',

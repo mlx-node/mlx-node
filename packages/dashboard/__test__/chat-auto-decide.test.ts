@@ -193,6 +193,43 @@ describe('decideAuto', () => {
     expect(edit({ request: guardedEdit })).toEqual({ allow: true });
   });
 
+  // Mutation: every read-pdf call allowed (the facts not checked) → red.
+  it('a launch of the PDF tool on a PDF of this conversation is allowed; any other workflow still asks', () => {
+    const facts = { id: 'k3f7a2c4-40', session: 's1', name: 'report.pdf', pages: 40, images: true };
+    const raw = (args: Record<string, unknown> = { pdf: 'k3f7a2c4-40', question: 'q' }, name = 'read-pdf') => ({
+      variant: 'Workflow',
+      source: { type: 'name', name },
+      agent_budget: null,
+      args,
+      validate_only: false,
+    });
+    const launch = (over: Partial<AutoInput> = {}, rawInput: unknown = raw()) =>
+      decideAuto({
+        auto: true,
+        watched: true,
+        request: request('workflow', rawInput, { kind: 'other' }),
+        interaction: card('other', { toolName: 'workflow' }),
+        guardHook: GUARD,
+        elsewhere: false,
+        facts: { ...FACTS, scan: null },
+        allowed: 0,
+        pdf: facts,
+        ...over,
+      });
+    expect(launch()).toEqual({ allow: true, pdf: true });
+    expect(launch({ pdf: { ...facts, session: 'other' } })).toEqual(ask('helper-start'));
+    expect(launch({ pdf: { ...facts, images: false } })).toEqual(ask('helper-start'));
+    expect(launch({ pdf: null })).toEqual(ask('helper-start'));
+    expect(launch({}, raw(undefined, 'deep-research'))).toEqual(ask('helper-start'));
+    expect(launch({}, raw({ pdf: 'k3f7a2c4-41' }))).toEqual(ask('helper-start'));
+    expect(launch({}, { ...raw(), agent_budget: 512 })).toEqual(ask('helper-start'));
+    expect(launch({ allowed: AUTO_PER_TURN_MAX })).toEqual(ask('many'));
+    expect(launch({ watched: false })).toEqual(ask('no-window'));
+    expect(launch({ auto: false })).toEqual({ allow: false, why: null });
+    const hooked = request('workflow', raw(), { kind: 'other', hookAsk: { hookName: 'user/wf-hook', reason: null } });
+    expect(launch({ request: hooked })).toEqual(ask('hook'));
+  });
+
   it('row 4: a helper that can work in another folder, and any workflow', () => {
     expect(other('spawn_subagent', { prompt: 'x', cwd: '/elsewhere' })).toEqual(ask('helper-start'));
     expect(other('spawn_subagent', { prompt: 'x', isolation: 'worktree' })).toEqual(ask('helper-start'));

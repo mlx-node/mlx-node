@@ -27,6 +27,8 @@ import {
   forkInput,
   goalInput,
   interactionInput,
+  pdfReadInput,
+  pdfStageInput,
   isSlashText,
   MAX_FEEDBACK_CHARS,
   permissionModeInput,
@@ -35,6 +37,7 @@ import {
   queueSendInput,
   rewindInput,
   rewindPlanInput,
+  stageParam,
 } from '../src/chat/route-input.js';
 import type { AgentWatchAnswer, ConversationEvent, ConversationInfo, Interaction } from '../src/chat/types.js';
 import { createDashboardRuntime, type ChatRuntimeOptions, type DashboardRuntime } from '../src/runtime.js';
@@ -185,6 +188,7 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/conversations/:id/fork',
       'main POST /api/chat/conversations/:id/recap',
       'main POST /api/chat/conversations/:id/goal',
+      'main POST /api/chat/conversations/:id/pdf-read',
       'main POST /api/chat/conversations/:id/runs/:runId/stop',
       'main POST /api/chat/conversations/:id/tasks/:taskId/stop',
       'main POST /api/chat/conversations/:id/subagents/:childId/stop',
@@ -197,6 +201,8 @@ describe('Chat routes — threads', () => {
       'main DELETE /api/chat/conversations/:id/never/:ruleId',
       'main POST /api/chat/conversations/:id/permission-mode',
       'main POST /api/chat/drafts/:draft/permission-mode',
+      'main POST /api/chat/pdf-stage',
+      'main DELETE /api/chat/pdf-stage/:stage',
       'main GET /api/chat/work/hooks',
       'main GET /api/chat/work/git',
       'main POST /api/chat/work/git/switch',
@@ -1073,6 +1079,59 @@ describe('Chat routes — attachments', () => {
   }, 20_000);
 });
 
+describe('the PDF tool routes', () => {
+  const jpeg = (n: number): string => Buffer.from([0xff, 0xd8, 0xff, 0xe0, n, 0]).toString('base64');
+  const refused = { code: 'E_BAD_REQUEST', reason: 'attachment-refused', message: 'The attached files were refused.' };
+
+  it('the stage route takes pages in order into a stage of their own; the delete route drops it; Read it now is 400 in Chat', async () => {
+    start('chat-basic');
+    const first = await call('POST', '/api/chat/pdf-stage', { stage: null, page: 1, pages: 3, data: jpeg(1) });
+    if (!first.ok) throw new Error(first.message);
+    const { stage } = first.body as { stage: string };
+    const dir = join(base, 'chat', 'pdf-stage', stage);
+    expect(existsSync(join(dir, 'page-001.jpg'))).toBe(true);
+    const skip = await call('POST', '/api/chat/pdf-stage', { stage, page: 3, pages: 3, data: jpeg(3) });
+    expect(failureOf(skip)).toEqual(refused);
+    const other = await call('POST', '/api/chat/pdf-stage', {
+      stage: 'b'.repeat(26),
+      page: 2,
+      pages: 3,
+      data: jpeg(2),
+    });
+    expect(failureOf(other)).toEqual(refused);
+    const second = await call('POST', '/api/chat/pdf-stage', { stage, page: 2, pages: 3, data: jpeg(2) });
+    expect(second.ok && second.body).toEqual({ stage });
+    expect(readFileSync(join(dir, 'page-002.jpg'))).toEqual(Buffer.from(jpeg(2), 'base64'));
+    expect(failureOf(await call('DELETE', '/api/chat/pdf-stage/s1')).code).toBe('E_BAD_REQUEST');
+    const dropped = await call('DELETE', `/api/chat/pdf-stage/${stage}`);
+    expect(dropped.ok && dropped.body).toEqual({});
+    expect(existsSync(dir)).toBe(false);
+    const after = await call('POST', '/api/chat/pdf-stage', { stage, page: 3, pages: 3, data: jpeg(3) });
+    expect(failureOf(after)).toEqual(refused);
+    const chat = await created();
+    await settled(chat.id);
+    const inChat = await call('POST', `/api/chat/conversations/${chat.id}/pdf-read`, { pdf: 'k3f7a2c4-40' });
+    expect(failureOf(inChat)).toEqual({
+      code: 'E_BAD_REQUEST',
+      message: 'The PDF tool is for Work conversations only.',
+    });
+  });
+
+  it('Read it now in Work: 404 for a PDF no message of the conversation sent to the tool', async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start('work-always', undefined, { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } });
+    const response = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'hello', cwd: project });
+    if (!response.ok) throw new Error(response.message);
+    const work = (response.body as { conversation: ConversationInfo }).conversation;
+    const unknown = await call('POST', `/api/chat/conversations/${work.id}/pdf-read`, { pdf: 'k3f7a2c4-40' });
+    expect(failureOf(unknown)).toEqual({ code: 'E_NOT_FOUND', message: 'No such PDF.' });
+    const bad = await call('POST', `/api/chat/conversations/${work.id}/pdf-read`, { pdf: 'k3f7a2c4-40', pages: '1' });
+    expect(failureOf(bad).code).toBe('E_BAD_REQUEST');
+  }, 20_000);
+});
+
 describe('the attachment input', () => {
   const PNG_HEAD = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   const png = (bytes: number): string => {
@@ -1226,6 +1285,94 @@ describe('the attachment input', () => {
       ];
       for (const [name, items] of cases) {
         expect([name, ...both(items)]).toEqual([name, 'attachment-refused', 'attachment-refused']);
+      }
+    });
+  });
+
+  describe('a PDF for the tool', () => {
+    const STAGE = 'k3f7a2c4abcdefghijklmnopqr';
+    const tool = (over: Record<string, unknown> = {}) => ({
+      kind: 'pdf',
+      name: 'docs/report#1.pdf',
+      stage: STAGE,
+      pages: 212,
+      ...over,
+    });
+    const jpeg = (bytes: number): string => {
+      const data = new Uint8Array(bytes);
+      data.set([0xff, 0xd8, 0xff, 0xe0]);
+      return Buffer.from(data).toString('base64');
+    };
+    const both = (items: unknown[]) => [reasonOf(() => create(items)), reasonOf(() => prompt(items))];
+
+    // Mutation: two PDFs for the tool in one message taken → red.
+    it('takes a stage id and its page count on both routes, the name cleaned; one per message', () => {
+      const expected = [{ kind: 'pdf', name: 'report_1.pdf', stage: STAGE, pages: 212 }];
+      expect(create([tool()])).toEqual({ mode: 'chat', text: 'look', attachments: expected });
+      expect(prompt([tool()])).toEqual({ text: 'look', attachments: expected });
+      expect(
+        both([tool({ pages: 320 }), { kind: 'pdf', name: 'b.pdf', images: Array<string>(20).fill(jpeg(64)) }]),
+      ).toEqual(['ok', 'ok']);
+      const cases: Array<[string, unknown[]]> = [
+        ['two PDFs for the tool', [tool(), tool({ stage: 'b'.repeat(26) })]],
+        ['a key more', [tool({ images: [] })]],
+        ['no pages', [{ kind: 'pdf', name: 'a.pdf', stage: STAGE }]],
+        ['0 pages', [tool({ pages: 0 })]],
+        ['321 pages', [tool({ pages: 321 })]],
+        ['2.5 pages', [tool({ pages: 2.5 })]],
+        ['pages as text', [tool({ pages: '212' })]],
+        ['a stage of 25 letters', [tool({ stage: STAGE.slice(1) })]],
+        ['a stage with a capital', [tool({ stage: STAGE.toUpperCase() })]],
+        ['a stage with a path', [tool({ stage: `../${STAGE.slice(3)}` })]],
+        ['an empty name', [tool({ name: '' })]],
+      ];
+      for (const [name, items] of cases) {
+        expect([name, ...both(items)]).toEqual([name, 'attachment-refused', 'attachment-refused']);
+      }
+    });
+
+    // Mutations: the page check dropped (a PNG page, a page past its limit taken); page 2 with no stage taken → red.
+    it('a page sent to the stage route is exactly {stage, page, pages, data}: JPEG, padded base64, in its limits', () => {
+      expect(pdfStageInput({ stage: null, page: 1, pages: 3, data: jpeg(64) })).toEqual({
+        stage: null,
+        page: 1,
+        pages: 3,
+        data: Buffer.from(jpeg(64), 'base64'),
+      });
+      expect(pdfStageInput({ stage: STAGE, page: 3, pages: 3, data: jpeg(589_824) }).page).toBe(3);
+      const cases: Array<[string, unknown]> = [
+        ['no stage key', { page: 1, pages: 3, data: jpeg(64) }],
+        ['a key more', { stage: null, page: 1, pages: 3, data: jpeg(64), name: 'a.pdf' }],
+        ['page 2 with no stage', { stage: null, page: 2, pages: 3, data: jpeg(64) }],
+        ['a page past the count', { stage: STAGE, page: 4, pages: 3, data: jpeg(64) }],
+        ['page 0', { stage: STAGE, page: 0, pages: 3, data: jpeg(64) }],
+        ['321 pages', { stage: null, page: 1, pages: 321, data: jpeg(64) }],
+        ['a stage that is not an id', { stage: 's1', page: 2, pages: 3, data: jpeg(64) }],
+        ['a PNG page', { stage: null, page: 1, pages: 3, data: png(64) }],
+        ['a 589,825-byte page', { stage: null, page: 1, pages: 3, data: jpeg(589_825) }],
+        ['an unpadded page', { stage: null, page: 1, pages: 3, data: jpeg(64).replaceAll('=', '') }],
+        ['a page that is not text', { stage: null, page: 1, pages: 3, data: 7 }],
+        ['not an object', [null, 1, 3, jpeg(64)]],
+      ];
+      for (const [name, body] of cases) {
+        expect([name, reasonOf(() => pdfStageInput(body))]).toEqual([name, 'attachment-refused']);
+      }
+    });
+
+    it('the stage of the delete route is a stage id; Read it now takes exactly {pdf} with a PDF id', () => {
+      expect(stageParam(STAGE)).toBe(STAGE);
+      for (const bad of [undefined, '', 's1', STAGE.toUpperCase(), `${STAGE}a`]) {
+        expect([bad, reasonOf(() => stageParam(bad))]).toEqual([bad, 'E_BAD_REQUEST']);
+      }
+      expect(pdfReadInput({ pdf: 'k3f7a2c4-212' })).toEqual({ pdf: 'k3f7a2c4-212' });
+      for (const body of [
+        {},
+        { pdf: 'k3f7a2c4-321' },
+        { pdf: '../x-12' },
+        { pdf: 7 },
+        { pdf: 'k3f7a2c4-12', question: 'q' },
+      ]) {
+        expect([body, reasonOf(() => pdfReadInput(body))]).toEqual([body, 'E_BAD_REQUEST']);
       }
     });
   });

@@ -73,7 +73,14 @@ import {
 } from '../acp/messages.js';
 import { AgentProcess, spawnAgent, type AgentExit, type SpawnAgent } from '../acp/process.js';
 import type { AttachmentInput } from '../attachment-rule.js';
-import { allowedCommands, checkCommand, readCommands, type AgentCommand } from '../commands.js';
+import {
+  allowedCommands,
+  checkCommand,
+  readCommands,
+  withoutAppWorkflow,
+  type AgentCommand,
+  type AppWorkflow,
+} from '../commands.js';
 import {
   ensureChatDirs,
   ensureWorkProcessDir,
@@ -167,11 +174,14 @@ import {
   type NeverOffer,
   type NeverRules,
 } from './never-rules.js';
+import { appReadPdfPaths, installPdfTool, READ_PDF_WORKFLOW } from './pdf-tool.js';
 import {
   decideChatPermission,
   noteAnswer,
+  pdfLaunchRow,
   planAnswer,
   planInteraction,
+  readPdfLaunch,
   readPlanRequest,
   requestTarget,
   accessOf,
@@ -181,6 +191,7 @@ import {
   shownCut,
   turnOutcome,
   workInteraction,
+  type PdfFacts,
   type PermissionAnswer,
   type TurnEndCause,
 } from './permissions.js';
@@ -646,6 +657,8 @@ export interface AgentHostOptions {
   tempRoots?: readonly AllowedRoot[];
   /** Work: the never-allow rules of the Work folders; without them no rule is checked and no card offers one. */
   never?: NeverRules;
+  /** Work: what a `read-pdf` launch's `pdf` is, read for the session that asks; null when it is no PDF of the app. */
+  pdfFacts?: (sessionId: string, pdf: string) => Promise<PdfFacts | null>;
   /** Work: whose files "yours" means in a temp root; default the process uid. */
   uid?: number;
   /** Work: the login name, for the private-folder names of a temp root; default the process user. */
@@ -995,6 +1008,10 @@ export class AgentHost {
    */
   private engineLost = false;
   private failure: ChatFailure | null = null;
+  /** Work: the PDF tool's files were written at the last start (false: a file of the person's holds a name); null before one. */
+  private pdfToolOpen: boolean | null = null;
+  /** Work: the app's `read-pdf`, as the last agent start found it in the agent home; null when that file is not the app's. */
+  private appWorkflow: AppWorkflow | null = null;
   private running: Running | null = null;
   /** A process being stopped: it holds no new work, and the next start waits for its exit. */
   private retiring: Running | null = null;
@@ -1085,6 +1102,11 @@ export class AgentHost {
       tasks,
       engineLost: this.engineLost,
     };
+  }
+
+  /** Work: the PDF tool is there, as the last agent start wrote its files; null before the first start. */
+  pdfTool(): boolean | null {
+    return this.pdfToolOpen;
   }
 
   /** The models of the running process, or null when it is not running. `thinking`: the levels it lists for the model. */
@@ -2113,7 +2135,7 @@ export class AgentHost {
         (result) => {
           const rows = readCommandList(result);
           if (rows !== null && this.running === running && this.sessions.get(session.id) === session) {
-            this.setCommands(session, readCommands(rows));
+            this.setCommands(session, readCommands(withoutAppWorkflow(rows, this.appWorkflow)));
           }
         },
         () => {},
@@ -2480,6 +2502,9 @@ export class AgentHost {
     else {
       await writeWorkGuard(this.opts.paths, workGuardManifest(guardName));
       await ensureWorkProcessDir(this.opts.paths);
+      this.pdfToolOpen = await installPdfTool(this.opts.agentHome, this.opts.paths.workPdf).catch(() => false);
+      const appPaths = await appReadPdfPaths(this.opts.agentHome).catch(() => []);
+      this.appWorkflow = appPaths.length === 0 ? null : { name: READ_PDF_WORKFLOW, paths: appPaths };
     }
     const env =
       this.mode === 'chat'
@@ -4075,7 +4100,7 @@ export class AgentHost {
       // line to carry the answer's token count (`_meta.totalTokens`, `AdvertiseTrigger::UsageMeta`): taking it would
       // leave the context count on the stored estimate, so a line with a count goes on to the reducer.
       const rows = readCommandsUpdate(message.update);
-      if (rows !== null) this.setCommands(session, readCommands(rows));
+      if (rows !== null) this.setCommands(session, readCommands(withoutAppWorkflow(rows, this.appWorkflow)));
       if (typeof message.meta?.totalTokens !== 'number') return;
     }
     if (!message.xai && message.update.sessionUpdate === 'config_option_update') {
@@ -4340,13 +4365,20 @@ export class AgentHost {
     const call = { gone: false };
     this.deciding.set(key, call);
     const { path } = requestTarget(req);
+    const launch = readPdfLaunch(req);
+    const pdfFacts = this.opts.pdfFacts;
     const decide = (): Promise<unknown> =>
-      path === null
-        ? this.openWorkCard(ask, null, seen)
-        : editLanding(agentPath(path, place)).then(
-            (landing) => this.openWorkCard(ask, landing, seen),
+      launch !== null && pdfFacts !== undefined
+        ? pdfFacts(session.id, launch.pdf).then(
+            (facts) => this.openWorkCard({ ...ask, pdf: facts }, null, seen),
             () => this.openWorkCard(ask, null, seen),
-          );
+          )
+        : path === null
+          ? this.openWorkCard(ask, null, seen)
+          : editLanding(agentPath(path, place)).then(
+              (landing) => this.openWorkCard(ask, landing, seen),
+              () => this.openWorkCard(ask, null, seen),
+            );
     const never = this.opts.never;
     const shell = shellCommand(req);
     const decided =
@@ -4474,6 +4506,8 @@ export class AgentHost {
       ...workInteraction(randomUUID(), req, this.cardNeedles(), ask.place, landing, from),
       openedAt: this.now(),
     };
+    const pdf = pdfLaunchRow(req, ask.pdf ?? null);
+    if (pdf !== null) card.pdfRead = { ...pdf, name: shownCut(pdf.name, CARD_NAME_MAX, this.cardNeedles()) };
     const command = requestTarget(req).command;
     const deny = card.options.some((o) => o.optionId === REJECT_ONCE_OPTION_ID && o.kind === 'reject_once');
     const offered =
@@ -4714,6 +4748,7 @@ export class AgentHost {
         elsewhere: ask.elsewhere,
         facts,
         allowed: count.approvals,
+        pdf: ask.pdf ?? null,
       });
     } catch {
       decision = { allow: false, why: 'unread' };
@@ -4731,20 +4766,25 @@ export class AgentHost {
     };
     if (this.modeOf(session.id) !== 'auto') return MOVED;
     if (!decision.allow) return asking(decision.why ?? 'unread', decision.detail);
-    if (interaction.access !== 'bash' && interaction.access !== 'edit') return asking('not-covered');
-    const reach = facts?.reach ?? tempRoots(gate).map((r) => r.top);
-    if (stale || this.folderBusy(session, callSession, req.toolCallId, changes, reach)) return asking('unknown-target');
-    this.callStarted(session, callSession, req.toolCallId, {
-      changes,
-      wide: false,
-      ...(reach.length > 0 ? { reach } : {}),
-    });
+    const launch = decision.pdf === true;
+    if (!launch && interaction.access !== 'bash' && interaction.access !== 'edit') return asking('not-covered');
+    const reach = launch ? [] : (facts?.reach ?? tempRoots(gate).map((r) => r.top));
+    if (!launch) {
+      if (stale || this.folderBusy(session, callSession, req.toolCallId, changes, reach)) {
+        return asking('unknown-target');
+      }
+      this.callStarted(session, callSession, req.toolCallId, {
+        changes,
+        wide: false,
+        ...(reach.length > 0 ? { reach } : {}),
+      });
+    }
     const mine = gens(reach);
     const epoch = count.approvalEpoch;
     count.approvals += 1;
     const giveBack = (): void => {
       if (count.approvalEpoch === epoch && count.approvals > 0) count.approvals -= 1;
-      this.callEnded(session, callSession, req.toolCallId);
+      if (!launch) this.callEnded(session, callSession, req.toolCallId);
     };
     const mark: AllowedMark = {
       kind: 'allowed',
@@ -4772,7 +4812,7 @@ export class AgentHost {
       this.withdraw(session, mark);
       return asking('no-window');
     }
-    if (gens(reach).some((gen, k) => gen !== mine[k])) {
+    if (!launch && gens(reach).some((gen, k) => gen !== mine[k])) {
       giveBack();
       this.withdraw(session, mark);
       return asking('unknown-target');
@@ -5181,6 +5221,8 @@ interface Ask {
   elsewhere: boolean;
   /** The app cannot read the command and the Work folder has never-allow rules: Bypass asks. */
   neverUnread?: true;
+  /** A `read-pdf` launch: what the host read for its `pdf`. */
+  pdf?: PdfFacts | null;
 }
 
 /** Update kinds that mean the agent is working. */
@@ -5204,6 +5246,8 @@ function offersOnce(req: PermissionRequest): boolean {
 
 /** Characters of the asking part on a card. */
 const AUTO_PART_MAX = 60;
+/** Characters of a PDF's name on a card. */
+const CARD_NAME_MAX = 200;
 /** Characters of a monitor's description a wake row may name it by. */
 const WAKE_DESCRIPTION_CHARS = 200;
 

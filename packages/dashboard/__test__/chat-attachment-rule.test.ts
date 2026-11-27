@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vite-plus/test';
 import {
   attachmentUri,
   attachmentView,
+  type AttachmentInput,
   base64Bytes,
   CHAT_PICTURES_MAX_BASE64,
   estimateTokens,
@@ -13,6 +14,7 @@ import {
   IMAGE_TOKENS,
   isBase64,
   isPdfNoteText,
+  isStageId,
   magicMatches,
   MESSAGE_IMAGES_MAX_BASE64,
   NAME_MAX_CHARS,
@@ -22,7 +24,11 @@ import {
   PAGE_MAX_BYTES,
   pageTokens,
   type PageSize,
+  parsePages,
+  pdfIdPages,
   pdfNote,
+  pdfNotes,
+  pdfToolId,
   type PdfDraft,
   type PdfPlanInput,
   pdfPageSize,
@@ -504,5 +510,81 @@ describe('planPdfs', () => {
     expect(plan({ tool: false, pdfs: [pdf(21)] })).toMatchObject({ ways: ['message'], problem: 'room', readTokens: 0 });
     expect(plan({ tool: false, held: 63, pdfs: [pdf(1)] })).toMatchObject({ ways: ['message'], problem: null });
     expect(plan({ tool: false, held: 63, pdfs: [pdf(2)] })).toMatchObject({ problem: 'room' });
+  });
+});
+
+describe('a PDF for the tool', () => {
+  const STAGE = 'k3f7a2c4abcdefghijklmnopqr';
+  const tool = { kind: 'pdf', name: 'docs/report#1.pdf', stage: STAGE, pages: 212 } as const;
+
+  it('is named by its stage: the stage id shape, and the id of its page folder with the page count', () => {
+    expect(isStageId(STAGE)).toBe(true);
+    for (const bad of [
+      '',
+      STAGE.slice(1),
+      `${STAGE}a`,
+      STAGE.toUpperCase(),
+      `${STAGE.slice(0, 25)}0`,
+      `${STAGE.slice(0, 25)}-`,
+    ]) {
+      expect([bad, isStageId(bad)]).toEqual([bad, false]);
+    }
+    expect(pdfToolId(STAGE, 212)).toBe('k3f7a2c4-212');
+    expect(pdfIdPages('k3f9a2c1-212')).toBe(212);
+    expect(pdfIdPages('k3f9a2c1-320')).toBe(320);
+    for (const bad of [
+      'k3f9a2c1-321',
+      'k3f9a2c1-0',
+      'k3f9a2c1-012',
+      'k3f9a2c-12',
+      'K3f9a2c1-12',
+      '../x-12',
+      'k3f9a2c1_12',
+    ]) {
+      expect([bad, pdfIdPages(bad)]).toEqual([bad, null]);
+    }
+  });
+
+  it('is viewed as a tool PDF with its id and no stored base64; its note names the id; it holds no image', () => {
+    const view = attachmentView(tool);
+    expect(view).toEqual({
+      kind: 'pdf',
+      name: 'report_1.pdf',
+      pages: 212,
+      way: 'tool',
+      bytes: 0,
+      chars: 0,
+      id: 'k3f7a2c4-212',
+    });
+    expect(storedPictureChars([view])).toBe(0);
+    expect(heldImages([{ kind: 'user', attachments: [view] }])).toBe(0);
+    const picture = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=' } as const;
+    const pages: AttachmentInput = { kind: 'pdf', name: 'b.pdf', images: ['/9j/4AAQ', '/9j/4AAQ'] };
+    const notes = pdfNotes([tool, picture, pages]);
+    expect(notes[0]).toBe(pdfNote({ name: 'report_1.pdf', pages: 212, way: 'tool', id: 'k3f7a2c4-212' }));
+    expect(notes[1]).toBe(pdfNote({ name: 'b.pdf', pages: 2, way: 'message', from: 2 }));
+    expect(readPdfNote(notes[0]!)).toEqual({ name: 'report_1.pdf', pages: 212, way: 'tool', id: 'k3f7a2c4-212' });
+    expect(estimateTokens('q', [tool], 'qwen3_5')).toBe(Math.ceil((1 + numberedBytes(notes[0]!)) / 3));
+  });
+});
+
+describe('parsePages', () => {
+  // Mutations: no clamp to the total; a page counted twice → red.
+  it('reads the pages arg as the script does: ranges either way round, cut to the PDF, each page once, in order', () => {
+    expect(parsePages('1-12, 15', 40)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15]);
+    expect(parsePages('12-10, 3, 3, 0-1, 99', 40)).toEqual([1, 3, 10, 11, 12]);
+    expect(parsePages('12-1', 5)).toEqual([1, 2, 3, 4, 5]);
+    expect(parsePages('38-45', 40)).toEqual([38, 39, 40]);
+    expect(parsePages('99', 40)).toEqual([]);
+    expect(parsePages('0', 40)).toEqual([]);
+    expect(parsePages('2-4, 3-5', 10)).toEqual([2, 3, 4, 5]);
+    expect(parsePages(' 7 ,, 8 - 9 ', 10)).toEqual([7, 8, 9]);
+  });
+
+  it('skips a part that is not a page or a range', () => {
+    expect(parsePages('abc, 2a, -3, 4-, 1-2-3, 5', 10)).toEqual([5]);
+    expect(parsePages('1234567, 2', 10)).toEqual([2]);
+    expect(parsePages('', 10)).toEqual([]);
+    expect(parsePages('1-320', 320)).toHaveLength(320);
   });
 });

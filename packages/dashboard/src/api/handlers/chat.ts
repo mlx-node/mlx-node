@@ -20,6 +20,8 @@ import {
   modeQuery,
   noBody,
   patchConversationInput,
+  pdfReadInput,
+  pdfStageInput,
   permissionModeInput,
   promptInput,
   queuePatchInput,
@@ -30,6 +32,7 @@ import {
   ruleParam,
   runParam,
   scheduleParam,
+  stageParam,
   subagentMessageInput,
   subagentParam,
   taskParam,
@@ -209,6 +212,34 @@ export function handleChatGoal(ctx: MainApiContext, req: ApiRequest): Promise<un
   return guarded('chat', () => {
     const id = idParam(req.params.id);
     return service(ctx).goal(id, goalInput(requireBody(req)).action);
+  });
+}
+
+/**
+ * `POST /api/chat/pdf-stage {stage, page, pages, data}`: one page of a PDF for the PDF tool, in order; `stage` null
+ * opens a stage with page 1. Answers `{stage}`; `attachment-refused` for a page out of order or past a limit.
+ */
+export function handleChatPdfStage(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => service(ctx).stagePdf(pdfStageInput(requireBody(req))));
+}
+
+/** `DELETE /api/chat/pdf-stage/:stage`: the PDF's chip was removed before Send; its pages go. */
+export function handleChatPdfStageDelete(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => {
+    const stage = stageParam(req.params.stage);
+    noBody(req.body);
+    return service(ctx).dropPdfStage(stage);
+  });
+}
+
+/**
+ * `POST /api/chat/conversations/:id/pdf-read {pdf}`: Read it now (Work). 202 with `{turnId}` once the agent's own
+ * `/workflow read-pdf` started; 404 for a PDF the conversation did not send to the tool, 400 in Chat.
+ */
+export function handleChatPdfRead(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => {
+    const id = idParam(req.params.id);
+    return service(ctx).readPdf(id, pdfReadInput(requireBody(req)).pdf);
   });
 }
 

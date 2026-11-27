@@ -85,7 +85,8 @@ beforeEach(() => {
   mkdirSync(tracesDir, { recursive: true });
   runtimeDir = join(base, 'metrics', 'runtime');
   runtime = createDashboardRuntime({
-    chat: { tempRoots: [] },
+    chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+    agentHome: join(base, 'agent-home'),
     dbPath: ':memory:',
     tracesDir,
     modelsDir: join(base, 'models'),

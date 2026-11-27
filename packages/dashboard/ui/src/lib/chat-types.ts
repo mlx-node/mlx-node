@@ -354,6 +354,11 @@ export interface PermissionInteraction extends AskBase {
   never?: { short: string; exact: string };
   /** Set when the card opened in Bypass: the app cannot read the command and the Work folder has never-allow rules. */
   neverUnread?: true;
+  /**
+   * A `workflow` call that starts the PDF tool on a PDF of this conversation: its name (redacted, at most 200
+   * characters), the pages it reads and its reader agents.
+   */
+  pdfRead?: { name: string; pages: number; readers: number };
 }
 /** The agent asks to leave plan mode; `toolCallId` is the plan tool row. */
 export interface PlanInteraction extends AskBase {

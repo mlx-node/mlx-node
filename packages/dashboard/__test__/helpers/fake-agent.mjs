@@ -506,7 +506,8 @@ const WORK_GATES = [
   'Feedback',
 ];
 // The session's command list as `available_commands` builds it: built-ins whose gate is on, then the scenario's
-// `commands.skills` (`_meta` scope, path, bareName, qualifiedName) and `commands.workflows` (`_meta.workflowSource`).
+// `commands.skills` (`_meta` scope, path, bareName, qualifiedName) and `commands.workflows` (`_meta.workflowSource`;
+// `inHome`: its `workflowPath` is the agent home's `workflows/<name>.rhai`).
 function commandRows(session) {
   const c = session.commands ?? profile(session).commands ?? {};
   const gates = c.gates ?? (session.work ? WORK_GATES : ['AlwaysOn']);
@@ -535,7 +536,10 @@ function commandRows(session) {
       name: flow.name,
       description: `Workflow: ${flow.description ?? ''}`,
       input: { hint: '[--agent-budget N] [--effort LEVEL] [args]' },
-      _meta: { workflowSource: 'user', workflowPath: `/workflows/${flow.name}.md` },
+      _meta: {
+        workflowSource: 'user',
+        workflowPath: flow.inHome === true ? `${grokHome}/workflows/${flow.name}.rhai` : `/workflows/${flow.name}.md`,
+      },
     });
   }
   return rows;

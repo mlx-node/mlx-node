@@ -138,6 +138,8 @@ export interface CommandRow {
   hint: string | null;
   /** `_meta.workflowSource` is set: a workflow row (also on a built-in that a workflow of its name projects). */
   workflow: boolean;
+  /** `_meta.workflowPath`: the file a workflow row runs, or null. */
+  workflowPath: string | null;
   /** `_meta.bareName` or `_meta.scope` is set: a skill row. */
   skill: boolean;
   /** A skill's `_meta.qualifiedName`: the agent runs the skill typed this way too. */
@@ -168,6 +170,26 @@ export function readCommands(rows: readonly CommandRow[]): AgentCommand[] {
       qualifiedName: row.qualifiedName === null ? null : row.qualifiedName.toLowerCase(),
     };
   });
+}
+
+/** A workflow file the app wrote into the agent home: the name its script holds, and the paths the agent may list. */
+export interface AppWorkflow {
+  name: string;
+  paths: readonly string[];
+}
+
+/**
+ * The agent's rows less the app's own workflow: typed as `/name` it would start with no permission card and none of
+ * the app's checks, so it is neither listed nor sent. A row of its name from another file stays; one with no path goes.
+ */
+export function withoutAppWorkflow(rows: readonly CommandRow[], app: AppWorkflow | null): CommandRow[] {
+  if (app === null) return [...rows];
+  return rows.filter(
+    (row) =>
+      !row.workflow ||
+      row.name.toLowerCase() !== app.name ||
+      (row.workflowPath !== null && !app.paths.includes(row.workflowPath)),
+  );
 }
 
 /** A name the page can fill back as typed: printable, no white space, no slash, at most 64 characters. */

@@ -129,6 +129,8 @@ export interface FakeHostOptions {
   onModeWithdrawn?: AgentHostListener['onModeWithdrawn'];
   /** Work: the never-allow rules, and what a rule deny tells the service. */
   never?: AgentHostOptions['never'];
+  /** Work: what the host reads for the `pdf` of a `read-pdf` launch. */
+  pdfFacts?: AgentHostOptions['pdfFacts'];
   onRuleDenied?: AgentHostListener['onRuleDenied'];
   /** Added to the Work environment (`CDPATH`, …). */
   env?: Record<string, string>;
@@ -279,6 +281,7 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     timings: { stopEofMs: 300, stopTermMs: 300, ...options.timings },
     ...(options.permission === undefined ? {} : { permission: options.permission }),
     ...(options.never === undefined ? {} : { never: options.never }),
+    ...(options.pdfFacts === undefined ? {} : { pdfFacts: options.pdfFacts }),
     ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
     ...(options.loginPath === undefined ? {} : { loginPath: options.loginPath }),
     tempRoots: options.tempRoots ?? [],

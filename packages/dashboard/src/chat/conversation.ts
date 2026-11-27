@@ -205,6 +205,17 @@ export class Conversation {
     return out;
   }
 
+  /** The message that sent the PDF `id` to the PDF tool: its text and the PDF's name; null when none did. */
+  toolPdf(id: string): { text: string; name: string } | null {
+    for (const entry of this.base?.view ?? []) {
+      if (entry.kind !== 'user' || entry.attachments === undefined) continue;
+      for (const item of entry.attachments) {
+        if (item.kind === 'pdf' && item.way === 'tool' && item.id === id) return { text: entry.text, name: item.name };
+      }
+    }
+    return null;
+  }
+
   /** The images the current base holds ({@link heldImages}), live ones included. */
   heldImages(): number {
     return heldImages(this.base?.view ?? []);
