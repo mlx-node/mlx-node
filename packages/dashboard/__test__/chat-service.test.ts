@@ -2429,6 +2429,8 @@ describe('Chat service — thinking level', () => {
       await svc.prompt(id, 'queued for the original', [], undefined, 'queue');
       await svc.cancel(id);
       await until(() => page.ends().length === 2, 5_000);
+      // The row's file write is not awaited by the route, so it can land after the turn end.
+      await until(() => (stored(fake, id)?.queue as unknown[] | undefined)?.length === 1, 5_000);
       expect(stored(fake, id)).toMatchObject({ queue: [{ text: 'queued for the original' }], thinking: 'none' });
       const copy = await svc.fork(id);
       expect(stored(fake, copy.id)).toEqual({ queue: [], thinking: 'none' });
