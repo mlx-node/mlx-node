@@ -4,9 +4,6 @@
  * time the agent compacts the conversation is not counted against it.
  */
 
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseUpdates, TranscriptReducer } from '../src/agent-sessions/transcript.js';
@@ -14,7 +11,16 @@ import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js
 import { CHAT_TURN_MAX_MS } from '../src/chat/agent/agent-host.js';
 import { applyOp } from '../src/chat/conversation.js';
 import { openRetry, splitTurns } from '../ui/src/lib/chat-turns.js';
-import { fakeHost, noProviders, until, type FakeHost, type FakeHostOptions, type Json } from './helpers/chat-fake.js';
+import {
+  ended,
+  fakeHost,
+  noProviders,
+  storedWhen,
+  until,
+  type FakeHost,
+  type FakeHostOptions,
+  type Json,
+} from './helpers/chat-fake.js';
 
 const MODEL = 'qwen3.5-4b';
 const DAY_MS = 86_400_000;
@@ -259,10 +265,7 @@ describe('a retry inside a Work turn', () => {
       feed();
       const live = entries.filter((e) => e.kind === 'notice');
       expect(live).toEqual([expect.objectContaining({ cause: 'stalled', attempts: 2, max: 3, outcome: 'recovered' })]);
-      const files = readdirSync(fake.agentHome, { recursive: true, encoding: 'utf8' })
-        .filter((f) => f.endsWith('updates.jsonl'))
-        .map((f) => readFileSync(join(fake.agentHome, f), 'utf8'))
-        .filter((text) => text.includes('retry_state'));
+      const files = await storedWhen(fake.agentHome, (_, text) => text.includes('retry_state'), ended(1));
       expect(files).toHaveLength(1);
       expect(parseUpdates(files[0]!).transcript.filter((e) => e.kind === 'notice')).toEqual(live);
     });

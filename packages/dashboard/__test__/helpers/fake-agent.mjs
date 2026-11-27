@@ -8,7 +8,16 @@
 // request the agent sends (`ask`), and each permission-gated tool it runs (`exec`) with the request that allowed it.
 
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { crc32, deflateSync } from 'node:zlib';
@@ -109,13 +118,20 @@ function storedFork(dir) {
   return { parent_session_id: stored.parent_session_id, forked_at: stored.forked_at, session_kind: 'fork' };
 }
 
+// The agent replaces summary.json by rename (`write_bytes_atomic`); a rewrite in place lets a reader see it empty.
+function writeAtomic(path, text) {
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, path);
+}
+
 function persistSummary(session) {
   if (!scenario.persist || grokHome === '') return;
   const dir = persistDir(session);
   mkdirSync(dir, { recursive: true });
   const fork = session.parentId === undefined ? storedFork(dir) : {};
   const now = new Date().toISOString();
-  writeFileSync(
+  writeAtomic(
     join(dir, 'summary.json'),
     JSON.stringify({
       info: { id: session.id, cwd: session.cwd },
@@ -1381,7 +1397,7 @@ async function fork(id, params) {
     writeFileSync(join(target, 'updates.jsonl'), moved.length === 0 ? '' : `${moved.join('\n')}\n`);
     copied = moved.length;
     const now = new Date().toISOString();
-    writeFileSync(
+    writeAtomic(
       join(target, 'summary.json'),
       JSON.stringify({
         ...summary,
