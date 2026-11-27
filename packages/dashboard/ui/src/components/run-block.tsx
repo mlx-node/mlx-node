@@ -77,9 +77,9 @@ import { Disclosure } from './arc-x/disclosure/disclosure';
 import { KeyValue, type KeyValueItem } from './arc-x/key-value/key-value';
 import { LiveDot } from './arc-x/live-dot/live-dot';
 import { useStaticMotion } from './arc-x/motion/use-static-motion';
+import { NumberValue } from './arc-x/number-value/number-value';
 import { PhaseRail } from './arc-x/phase-rail/phase-rail';
 import { Meter } from './arc-x/split-bar/split-bar';
-import { AnimatedCounter } from './arc/animated-counter/animated-counter';
 import { Button } from './arc/button/button';
 import { ExpandableText } from './arc/expandable-text/expandable-text';
 import { motionTokens } from './arc/motion-tokens';
@@ -160,7 +160,7 @@ function countTitle(template: string, n: number): ReactNode {
   return (
     <>
       {template.slice(0, at)}
-      <AnimatedCounter value={n} />
+      <NumberValue text={formatCount(n)} countUp={false} />
       {template.slice(at + 3)}
     </>
   );

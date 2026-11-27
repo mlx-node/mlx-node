@@ -1762,7 +1762,8 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
     that PDF with no stage). The tool way is offered only when every PDF held has a stage. Without the tool a PDF over 20 pages is refused as before.
   - Run block (`ui/src/lib/pdf-run.ts`, `run-block.tsx`). A run is the PDF tool's when its `workflow` call names
     `read-pdf` and a valid id, or when the prompt that opens its turn is a Read it now command. Its block is named
-    "Reading {name}" ("Reading a PDF" when no note of the conversation names the id; also its end row). Under the step
+    "Reading {name}" ("Reading a PDF" when no note of the conversation names the id; also its end row and its line in
+    the run bar over the composer, `shownRunNames`). Under the step
     line: "Pages {range} · {done} of {total} pages read · {rate} · {time left}" and a `Meter` filled by pages read. A
     group counts once, when one of its readers ended well (a first reader whose group has a second try did not: the
     script tries a group again only when it gave no notes); the rate is the pages of the newest 5 such readers over the

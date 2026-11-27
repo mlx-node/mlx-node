@@ -41,6 +41,9 @@ const MOTION_FILE = join(UI, 'components/arc-x/motion/motion.ts');
 /** The one folder allowed to mount Arc TextShimmer, and the vendored item itself. */
 const SHIMMER_HOME = join(UI, 'components/arc-x/live-label');
 const SHIMMER_ITEM = join(UI, 'components/arc/text-shimmer');
+/** Arc AnimatedCounter draws at the 3xl display size; only NumberValue mounts it, set to the text it sits in. */
+const COUNTER_HOME = join(UI, 'components/arc-x/number-value');
+const COUNTER_ITEM = join(UI, 'components/arc/animated-counter');
 
 function walk(root: string, keep: (path: string) => boolean): string[] {
   if (!existsSync(root)) return [];
@@ -680,6 +683,20 @@ describe('style rules', () => {
     const home = walk(SHIMMER_HOME, isScript).filter((file) => readFileSync(file, 'utf8').includes('arc/text-shimmer'));
     expect(home).toHaveLength(1);
   });
+
+  // Mutation: the run block's "Done (N)" back on AnimatedCounter → its N at the 3xl size → red.
+  it('only arc-x/number-value imports arc/animated-counter', () => {
+    const importers = walk(UI, isScript)
+      .filter((file) => !within(file, COUNTER_HOME) && !within(file, COUNTER_ITEM))
+      .filter((file) => readFileSync(file, 'utf8').includes('arc/animated-counter'))
+      .map((file) => relative(PACKAGE, file));
+    expect(importers).toEqual([]);
+    const home = walk(COUNTER_HOME, isScript).filter((file) =>
+      readFileSync(file, 'utf8').includes('arc/animated-counter'),
+    );
+    expect(home).toHaveLength(1);
+  });
+
   it('every h1 is set in the display font', () => {
     const problems: string[] = [];
     let seen = 0;

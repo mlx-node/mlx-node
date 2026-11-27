@@ -129,7 +129,7 @@ import { scratchShown } from '../lib/paths';
 import { folderName, modeRank, settingsToast, tempFor } from '../lib/permission-text';
 import { pickFolder } from '../lib/pick-folder';
 import { runStripOf } from '../lib/run-strip';
-import { runsAt, stopText } from '../lib/run-view';
+import { runsAt, shownRunNames, stopText } from '../lib/run-view';
 import { sessionUsage } from '../lib/session-usage';
 import { useStickToBottom } from '../lib/stick-to-bottom';
 import { toast } from '../lib/toast';
@@ -314,6 +314,7 @@ function dropSentStages(files: readonly DraftAttachment[], inputs: readonly Atta
 }
 
 const NO_RAISED: ChatHostState['permissionRaised'] = [];
+const NO_RUN_NAMES: ReadonlyMap<string, string> = new Map();
 const STARTING: TurnState = { turnId: '', phase: 'starting', startedAt: 0, wait: null };
 
 const NO_ACTIVITY: Activity = { needs: [], needsRuns: [], plan: null, running: [], scheduled: [] };
@@ -2708,6 +2709,12 @@ export default function Chat(): ReactElement {
       announce(fill(CHAT.status.otherWaits, { mode: otherMode === 'work' ? CHAT.modeWork : CHAT.modeChat }));
   }, [waitingOther, otherMode, announce]);
 
+  const liveRun = (conv?.runs ?? []).some((run) => run.live);
+  const stripNames = useMemo(
+    () => (liveRun && convEntries !== undefined ? shownRunNames(runsAt(convEntries)) : NO_RUN_NAMES),
+    [liveRun, convEntries],
+  );
+
   // The thread.
   let entries: readonly TranscriptEntry[] = conv?.entries ?? [];
   let threadTurn: TurnState | null = turn;
@@ -2733,7 +2740,7 @@ export default function Chat(): ReactElement {
         agentLive: conv?.conversation.hot === true,
       });
   const activeNow = hasActivity(activity);
-  const stripLines = mode === 'work' && !railDocked && !isNew && conv !== null ? runStripOf(activity) : [];
+  const stripLines = mode === 'work' && !railDocked && !isNew && conv !== null ? runStripOf(activity, stripNames) : [];
 
   // An ask of the conversation's own answer waits while the thread is scrolled away from its card.
   const ownRows = activity.needs.filter((row) => ownAsks.some((item) => item.id === row.id));

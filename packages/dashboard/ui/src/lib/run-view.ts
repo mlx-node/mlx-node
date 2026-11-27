@@ -8,7 +8,7 @@ import type { AgentNow } from './agents';
 import { CHAT, fill } from './chat-strings';
 import type { RunBy, RunView } from './chat-types';
 import { formatClock, formatCount, formatDuration } from './format';
-import { type PdfRun, pdfRunOf } from './pdf-run';
+import { type PdfRun, pdfRunName, pdfRunOf } from './pdf-run';
 import type { TranscriptEntry } from './types';
 import { type RunPlace, runPlaces } from './work-tools';
 
@@ -807,6 +807,13 @@ export function runsAt(entries: readonly TranscriptEntry[], previous?: RunsAt): 
   )
     return previous;
   return { runs, blocks, dataOnly, names };
+}
+
+/** The name a run shows where its workflow's name would say nothing: "Reading {file}" for a run of the PDF tool. */
+export function shownRunNames(runs: RunsAt): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+  for (const facts of runs.runs.values()) if (facts.pdf !== null) names.set(facts.runId, pdfRunName(facts.pdf));
+  return names;
 }
 
 /** The PDF ids the conversation's runs of the PDF tool read. */

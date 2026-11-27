@@ -54,6 +54,7 @@ import {
   runsAt,
   runSnapshot,
   runState,
+  shownRunNames,
   startedPdfs,
   stepChips,
   stepOf,
@@ -896,6 +897,14 @@ describe('a run of the PDF tool', () => {
     expect(leftWords(19 * 60_000)).toBe(fill(P.left.minutes, { n: 19 }));
     expect(leftWords(59.6 * 60_000)).toBe(fill(P.left.hours, { n: 1 }));
     expect(leftWords(2 * 3_600_000)).toBe(fill(P.left.hours, { n: 2 }));
+  });
+
+  // Mutation: every run named "Reading" → a deep-research run in the run bar reads as a PDF read.
+  it('a run of the PDF tool shows "Reading {file}" in place of its workflow name; other runs keep theirs', () => {
+    const entries = [note, launch({ pdf: ID, question: 'q' }), pdfRun()];
+    expect([...shownRunNames(runsAt(entries))]).toEqual([[RUN, 'Reading report.pdf']]);
+    const other = [note, launch({ pdf: ID }, 'deep-research'), pdfRun({ name: 'deep-research' })];
+    expect([...shownRunNames(runsAt(other))]).toEqual([]);
   });
 
   // Mutations: Read it now while the turn runs → a second run starts beside the model's own; the fork check dropped →
