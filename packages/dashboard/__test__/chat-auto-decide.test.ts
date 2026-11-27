@@ -193,7 +193,8 @@ describe('decideAuto', () => {
     expect(edit({ request: guardedEdit })).toEqual({ allow: true });
   });
 
-  // Mutation: every read-pdf call allowed (the facts not checked) → red.
+  // Mutations: every read-pdf call allowed (the facts not checked); a launch allowed while a run of the tool goes
+  // on → red.
   it('a launch of the PDF tool on a PDF of this conversation is allowed; any other workflow still asks', () => {
     const facts = { id: 'k3f7a2c4-40', session: 's1', name: 'report.pdf', pages: 40, images: true, tool: true };
     const raw = (args: Record<string, unknown> = { pdf: 'k3f7a2c4-40', question: 'q' }, name = 'read-pdf') => ({
@@ -217,6 +218,9 @@ describe('decideAuto', () => {
         ...over,
       });
     expect(launch()).toEqual({ allow: true, pdf: true });
+    expect(launch({ pdfBusy: false })).toEqual({ allow: true, pdf: true });
+    expect(launch({ pdfBusy: true })).toEqual(ask('pdf-busy'));
+    expect(launch({ pdfBusy: true }, raw(undefined, 'deep-research'))).toEqual(ask('helper-start'));
     expect(launch({ pdf: { ...facts, session: 'other' } })).toEqual(ask('helper-start'));
     expect(launch({ pdf: { ...facts, images: false } })).toEqual(ask('helper-start'));
     expect(launch({ pdf: { ...facts, tool: false } })).toEqual(ask('helper-start'));

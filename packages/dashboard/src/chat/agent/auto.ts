@@ -67,6 +67,8 @@ export interface AutoInput {
   allowed: number;
   /** A `read-pdf` launch: what the host read for its `pdf`; absent for any other request. */
   pdf?: PdfFacts | null;
+  /** A run of the PDF tool of this session is live or waiting. */
+  pdfBusy?: boolean;
 }
 
 /** The part of a request that asks; `part` is raw text the host redacts before the card shows it. */
@@ -165,6 +167,7 @@ function decide(input: AutoInput): AutoDecision {
     hook !== null && input.guardHook !== null && hook.hookName === input.guardHook && hook.reason === null;
   if ((access === 'bash' && !guarded) || (hook !== null && !guarded)) return ask('hook');
   if (pdfLaunchRow(req, input.pdf ?? null) !== null) {
+    if (input.pdfBusy === true) return ask('pdf-busy');
     return input.allowed >= AUTO_PER_TURN_MAX ? ask('many') : { allow: true, pdf: true };
   }
   if (helperStart(req)) return ask('helper-start');

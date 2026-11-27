@@ -335,6 +335,50 @@ describe('Auto', () => {
       }
     }, 30_000);
 
+    // Mutation: the host not wired to the runs of the tool (a launch allowed while one goes on) → red.
+    it('asks (pdf-busy) while a run of the tool of this conversation goes on; once it ended, a launch runs again', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'mlx-pdf-gate-'));
+      const gate = join(dir, 'go');
+      try {
+        await withAuto(
+          [],
+          async (fake, _sw, id) => {
+            expect((await start(fake, id, 'p1').done).outcome).toBe('completed');
+            expect(fake.events.interactions).toEqual([]);
+            expect(fake.host.runs(id).map((r) => [r.runId, r.name, r.live])).toEqual([['wf_1', 'read-pdf', true]]);
+            const busy = start(fake, id, 'p2');
+            const card = await nth(fake, 1);
+            expect([card.toolName, card.autoAsk, card.pdfRead]).toEqual([
+              'workflow',
+              'pdf-busy',
+              { name: 'report.pdf', pages: 40, readers: 10 },
+            ]);
+            fake.host.answer(id, card.id, 'reject-once');
+            await busy.done;
+            writeFileSync(gate, '');
+            await until(() => fake.host.runs(id).every((r) => !r.live && !r.waiting), 5_000);
+            const before = answers(fake).length;
+            expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+            expect(fake.events.interactions).toHaveLength(1);
+            expect(answers(fake).slice(before)).toEqual([ALLOW_ONCE]);
+          },
+          {
+            name: 'work-workflow-run',
+            mutate: (scenario) => {
+              const run = { runId: 'wf_1', name: 'read-pdf', completeOn: gate, ask: false, wake: false };
+              scenario.prompts = [
+                { match: 'p1', steps: [launchStep(), { workflow: run }, ...END] },
+                { match: 'p2', steps: [launchStep(), ...END] },
+              ];
+            },
+            pdfFacts: facts(),
+          },
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     // Mutation: the card without the PDF it reads → red.
     it('in Ask the card opens with the PDF it reads: its name, the pages picked and the readers', async () => {
       await withAuto(

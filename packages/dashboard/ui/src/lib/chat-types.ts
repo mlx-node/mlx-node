@@ -472,6 +472,7 @@ export type AutoAsk =
   | 'not-covered'
   | 'hook'
   | 'helper-start'
+  | 'pdf-busy'
   | 'helper'
   | 'many'
   | 'no-window'

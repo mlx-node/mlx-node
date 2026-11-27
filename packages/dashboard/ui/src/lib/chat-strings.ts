@@ -880,6 +880,7 @@ export const CHAT = {
       'not-covered': 'Auto covers commands and file edits only.',
       hook: "the app's command check did not send it, or another hook asked.",
       'helper-start': 'this starts agents that run on their own. Each of their calls is checked like yours.',
+      'pdf-busy': 'a PDF of this conversation is still being read.',
       helper: 'this agent works in another folder.',
       many: '100 calls ran without asking in this answer.',
       'no-window': 'the window was closed.',

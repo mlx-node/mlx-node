@@ -4752,6 +4752,9 @@ export class AgentHost {
         facts,
         allowed: count.approvals,
         pdf: ask.pdf ?? null,
+        pdfBusy:
+          ask.pdf !== undefined &&
+          this.runs(session.id).some((r) => r.name === READ_PDF_WORKFLOW && (r.live || r.waiting)),
       });
     } catch {
       decision = { allow: false, why: 'unread' };
