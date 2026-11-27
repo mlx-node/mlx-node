@@ -94,7 +94,15 @@ import type { MessageEnd, MessageTarget } from '../lib/agent-message';
 import { agentMarkCounts, neighbourAgent } from '../lib/agent-view';
 import { type AgentAsk, type AgentRow as AgentRowData, agentRowOf, runAgents, subagentRows } from '../lib/agents';
 import { DashboardApiError, getJson, mutate } from '../lib/api';
-import { type DraftAttachment, drawCaption, draftInput, draftTokens, type PdfWatch } from '../lib/chat-attachments';
+import {
+  type DraftAttachment,
+  drawCaption,
+  drawCount,
+  draftInput,
+  draftTokens,
+  drawingNow,
+  type PdfWatch,
+} from '../lib/chat-attachments';
 import { isSlashText, slashRest, type AppCommand as AppCommandName } from '../lib/chat-input';
 import { NO_QUEUE, type ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
@@ -1348,7 +1356,7 @@ export default function Chat(): ReactElement {
         writePending(
           origin,
           id,
-          { id, name, done: 0, total: null, startedAt: now, at: now, thumbnail: null, stop },
+          { id, name, done: 0, total: null, bytes: 0, startedAt: now, at: now, thumbnail: null, stop },
           epoch,
         );
         return stop.signal;
@@ -1360,7 +1368,7 @@ export default function Chat(): ReactElement {
         writePending(
           origin,
           id,
-          { ...item, done: progress.done, total: progress.total, at: Date.now(), thumbnail },
+          { ...item, done: progress.done, total: progress.total, bytes: progress.bytes, at: Date.now(), thumbnail },
           epoch,
         );
       },
@@ -3093,16 +3101,17 @@ export default function Chat(): ReactElement {
     };
   });
   for (const entry of pendingChips) {
+    const ready = entry.total !== null && entry.done === entry.total;
     chips.push({
       id: entry.id,
       kind: 'pdf',
       name: entry.name,
-      bytes: 0,
-      drawing: true,
+      bytes: entry.bytes,
+      ...(ready ? { pages: entry.done, problem: seesPages ? undefined : CHAT.attach.chipModel } : { drawing: true }),
       ...(entry.thumbnail === null ? {} : { thumbnail: entry.thumbnail }),
     });
   }
-  const drawn = pendingChips.find((entry) => entry.total !== null);
+  const drawn = drawingNow(pendingChips);
   const drawNow = useNow(drawn !== undefined);
   const estimate = held.length > 0 ? estimateTokens(draft, held.map(draftTokens), family) : 0;
   const nearFull = windowTokens !== null && (contextUsed ?? 0) + estimate > windowTokens * WINDOW_SHARE;
@@ -3112,8 +3121,8 @@ export default function Chat(): ReactElement {
       onRemove={removeAttachment}
       note={attachNote !== null && attachNote.place === place ? attachNote.text : undefined}
       caption={
-        drawn !== undefined && drawn.total !== null
-          ? { text: drawCaption({ ...drawn, total: drawn.total }, drawNow), tone: 'muted' }
+        drawn !== undefined
+          ? { text: drawCaption(drawn, drawNow), tone: 'muted' }
           : held.length === 0
             ? undefined
             : {
@@ -3122,8 +3131,13 @@ export default function Chat(): ReactElement {
               }
       }
       progress={
-        drawn !== undefined && drawn.total !== null
-          ? { label: fill(CHAT.attach.pdfDrawBar, { name: drawn.name }), done: drawn.done, total: drawn.total }
+        drawn !== undefined
+          ? {
+              label: fill(CHAT.attach.pdfDrawBar, { name: drawn.name }),
+              text: drawCount(drawn.done, drawn.total),
+              done: drawn.done,
+              total: drawn.total,
+            }
           : undefined
       }
     />

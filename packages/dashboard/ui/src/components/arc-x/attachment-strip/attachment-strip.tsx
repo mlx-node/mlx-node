@@ -40,8 +40,8 @@ export interface AttachmentStripProps {
   /** One line under the chips: why the last files were not added. */
   note?: string;
   caption?: { text: string; tone: 'muted' | 'warning' };
-  /** A bar under the chips: the pages of a PDF drawn so far. */
-  progress?: { label: string; done: number; total: number };
+  /** A bar under the chips: the pages of a PDF drawn so far; `text` is its value in words. */
+  progress?: { label: string; text: string; done: number; total: number };
   /** Name of the list. Default `CHAT.attach.list`. */
   label?: string;
 }
@@ -184,7 +184,7 @@ export function AttachmentStrip({
           label={progress.label}
           value={progress.done}
           max={progress.total}
-          formatValue={() => fill(CHAT.attach.pdfDrawCount, { done: progress.done, total: progress.total })}
+          formatValue={() => progress.text}
           size="dense"
           warnAt={2}
           dangerAt={2}

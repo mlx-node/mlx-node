@@ -22,7 +22,9 @@ import {
   type DecodedPicture,
   type DraftAttachment,
   drawCaption,
+  drawCount,
   draftInput,
+  drawingNow,
   type ImageCodec,
   ingestFiles,
   noteName,
@@ -538,10 +540,10 @@ describe('ingestFiles: a PDF is drawn page by page', () => {
       fakePdf([A4, A4]).codec,
     );
     expect(seen.started).toEqual([result.added[0]!.id]);
-    expect(seen.progress.map(({ done, total }) => [done, total])).toEqual([
-      [0, 2],
-      [1, 2],
-      [2, 2],
+    expect(seen.progress.map(({ done, total, bytes }) => [done, total, bytes])).toEqual([
+      [0, 2, 0],
+      [1, 2, 1_000],
+      [2, 2, 2_000],
     ]);
     expect(seen.progress[1]!.thumbnail?.startsWith('data:image/jpeg;base64,/9j/')).toBe(true);
     expect(seen.progress[2]!.thumbnail).toBeUndefined();
@@ -568,6 +570,29 @@ describe('ingestFiles: a PDF is drawn page by page', () => {
     expect(pdf.closed()).toBe(1);
   });
 
+  it('a PDF removed once drawn, while the rest of its pick is read, is not added and frees its place', async () => {
+    const stops: AbortController[] = [];
+    const watch: PdfWatch = {
+      start: () => {
+        const stop = new AbortController();
+        stops.push(stop);
+        return stop.signal;
+      },
+      progress: (_id, progress) => {
+        if (stops.length === 2 && progress.done === 1) stops[0]!.abort();
+      },
+      end: () => undefined,
+    };
+    const result = await ingestFiles(
+      [pdfFile('a.pdf'), pdfFile('b.pdf'), file(['x'], 'x.txt')],
+      { ...CHAT_IMAGES, held: 2, watch },
+      undefined,
+      fakePdf([A4, A4]).codec,
+    );
+    expect(result.added.map((item) => item.name)).toEqual(['b.pdf', 'x.txt']);
+    expect(result.refused).toEqual([]);
+  });
+
   it('a PDF is one of the 4 files, whatever its pages', async () => {
     const texts = ['1', '2', '3'].map((n) => file([n], `${n}.txt`));
     const result = await ingestFiles([pdfFile(), ...texts], CHAT_IMAGES, undefined, fakePdf(Array(12).fill(A4)).codec);
@@ -582,6 +607,7 @@ describe('pending PDFs', () => {
     name: `${id}.pdf`,
     done: 0,
     total: null,
+    bytes: 0,
     thumbnail: null,
     startedAt: 1,
     at: 1,
@@ -618,7 +644,7 @@ describe('pending PDFs', () => {
   });
 });
 
-describe('drawCaption and pageRate', () => {
+describe('drawCaption, drawingNow and pageRate', () => {
   it('pages drawn of all; the time once past 1 s; the rate once 8 pages and 1 s have passed', () => {
     const at = (done: number, ms: number) =>
       drawCaption({ done, total: 20, startedAt: 5_000, at: 5_000 + ms }, 5_000 + ms);
@@ -638,6 +664,21 @@ describe('drawCaption and pageRate', () => {
     expect(drawCaption({ done: 9, total: 20, startedAt: 5_000, at: 5_600 }, 6_200)).toBe(
       `${fill(CHAT.attach.pdfDrawCount, { done: 9, total: 20 })} · 1.2 s`,
     );
+  });
+
+  it('a one-page PDF counts "of 1 page"', () => {
+    expect(drawCount(0, 1)).toBe('0 of 1 page');
+    expect(drawCaption({ done: 1, total: 1, startedAt: 5_000, at: 5_100 }, 5_100)).toBe(
+      fill(CHAT.attach.pdfDrawCountOne, { done: 1 }),
+    );
+    expect(drawCount(1, 2)).toBe(fill(CHAT.attach.pdfDrawCount, { done: 1, total: 2 }));
+  });
+
+  it('the PDF drawing now is the open one with pages left, not one drawn in full or one not open yet', () => {
+    const at = (done: number, total: number | null) => ({ done, total });
+    expect(drawingNow([at(3, 3), at(1, 5)])).toEqual(at(1, 5));
+    expect(drawingNow([at(0, null), at(3, 3)])).toBeUndefined();
+    expect(drawingNow([at(0, 4)])).toEqual(at(0, 4));
   });
 
   it('per second from 1 a second, else per minute; whole numbers from 10', () => {

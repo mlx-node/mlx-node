@@ -17,13 +17,14 @@ const drafts = new Map<string, string>();
 const attachments = new Map<string, readonly DraftAttachment[]>();
 
 /**
- * A PDF whose read runs: its chip shows from the start. `total` is null until the file is open; `thumbnail` is page 1
- * once drawn. `stop` cancels the read when the chip is removed.
+ * A PDF whose read runs: its chip shows from the start. `total` is null until the file is open; `bytes` are the JPEG
+ * bytes of the pages drawn so far; `thumbnail` is page 1 once drawn. `stop` cancels the read when the chip is removed.
  */
 export interface PendingPdf extends Omit<PdfDrawing, 'total'> {
   id: string;
   name: string;
   total: number | null;
+  bytes: number;
   thumbnail: string | null;
   stop: AbortController;
 }

@@ -156,6 +156,7 @@ export const CHAT = {
     /** The chip while its pages are drawn, the caption beside it and the bar's name. */
     pdfDrawing: 'Drawing pages',
     pdfDrawCount: '{done} of {total} pages',
+    pdfDrawCountOne: '{done} of 1 page',
     pdfDrawTime: '{n} s',
     pdfDrawBar: 'Drawing pages of {name}',
     /** Said once to a screen reader when a PDF is ready. */

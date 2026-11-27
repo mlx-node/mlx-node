@@ -7,7 +7,7 @@
 
 import { copyFileSync, createReadStream, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import type { Plugin } from 'vite-plus';
 
@@ -70,7 +70,8 @@ export function pdfjsAssets(): Plugin {
   return {
     name: 'mlx-node-pdfjs-assets',
     configResolved(config) {
-      outDir = config.build.outDir;
+      // Vite names the folder relative to the root, which is not the shell's folder when the root is passed.
+      outDir = resolve(config.root, config.build.outDir);
     },
     configureServer(server) {
       server.middlewares.use((request, response, next) => {

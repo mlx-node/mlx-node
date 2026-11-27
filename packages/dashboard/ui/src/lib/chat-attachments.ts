@@ -60,10 +60,14 @@ export interface ImageCodec {
   decode(file: Blob): Promise<DecodedPicture>;
 }
 
-/** How far a PDF's read is: pages drawn of its pages; the data URL of page 1 once it is drawn. */
+/**
+ * How far a PDF's read is: pages drawn of its pages, the JPEG bytes of those pages, and the data URL of page 1 once it
+ * is drawn.
+ */
 export interface PdfProgress {
   done: number;
   total: number;
+  bytes: number;
   thumbnail?: string;
 }
 
@@ -309,7 +313,7 @@ async function readPdf(
     if (total > PDF_MESSAGE_PAGES) {
       return failed({ ok: false, sentence: fill(e.pdfTooLong, { name: noteName(name), n: total }) });
     }
-    watch?.progress(id, { done: 0, total });
+    watch?.progress(id, { done: 0, total, bytes: 0 });
     const images: string[] = [];
     const sizes: PageSize[] = [];
     let bytes = 0;
@@ -324,7 +328,9 @@ async function readPdf(
       chars += page.data.length;
       watch?.progress(
         id,
-        n === 1 ? { done: n, total, thumbnail: `data:image/jpeg;base64,${page.data}` } : { done: n, total },
+        n === 1
+          ? { done: n, total, bytes, thumbnail: `data:image/jpeg;base64,${page.data}` }
+          : { done: n, total, bytes },
       );
       await nextTask();
       if (signal.aborted) return failed(CANCELLED);
@@ -343,7 +349,8 @@ function isPdf(file: File, type: string): boolean {
 /**
  * Reads files into drafts, in order, until `held` plus the added ones reach {@link ATTACH_MAX}; the rest get one
  * sentence with their count. A PDF counts as one file. PNG, JPEG and WebP take the picture path; a PDF is drawn page
- * by page for a model that sees images, in either mode; anything else is judged as text by its bytes.
+ * by page for a model that sees images, in either mode; anything else is judged as text by its bytes. A PDF whose
+ * chip is removed after its pages are drawn, while later files of the same pick are still read, is not added.
  */
 export async function ingestFiles(
   files: readonly File[],
@@ -354,8 +361,23 @@ export async function ingestFiles(
   const e = CHAT.attach.errors;
   const added: DraftAttachment[] = [];
   const refused: string[] = [];
+  const stops = new Map<string, AbortSignal>();
+  const outer = options.watch;
+  const watch: PdfWatch | undefined =
+    outer === undefined
+      ? undefined
+      : {
+          start: (id, name) => {
+            const signal = outer.start(id, name);
+            stops.set(id, signal);
+            return signal;
+          },
+          progress: (id, progress) => outer.progress(id, progress),
+          end: (id) => outer.end(id),
+        };
+  const kept = (): DraftAttachment[] => added.filter((item) => stops.get(item.id)?.aborted !== true);
   for (let i = 0; i < files.length; i += 1) {
-    if (options.held + added.length >= ATTACH_MAX) {
+    if (options.held + kept().length >= ATTACH_MAX) {
       refused.push(fill(e.tooMany, { n: files.length - i }));
       break;
     }
@@ -367,7 +389,7 @@ export async function ingestFiles(
       if (!options.seesPages) read = refuse(e.pdfModel, name);
       else {
         try {
-          read = await readPdf(file, name, pdfCodec, options.watch);
+          read = await readPdf(file, name, pdfCodec, watch);
         } catch {
           read = refuse(e.pdfDamaged, name);
         }
@@ -385,7 +407,7 @@ export async function ingestFiles(
     if (read.ok) added.push(read.value);
     else if (read.sentence !== null) refused.push(read.sentence);
   }
-  return { added, refused };
+  return { added: kept(), refused };
 }
 
 /** The place's attachments, read and written by one queued ingest. */
@@ -447,12 +469,27 @@ export function pageRate(perSecond: number): string {
 const DRAW_CLOCK_MS = 1_000;
 const DRAW_RATE_PAGES = 8;
 
+/** Pages drawn of a PDF's pages, "1 page" for a one-page PDF. */
+export function drawCount(done: number, total: number): string {
+  return total === 1 ? fill(CHAT.attach.pdfDrawCountOne, { done }) : fill(CHAT.attach.pdfDrawCount, { done, total });
+}
+
+/**
+ * Of the PDFs whose reads run, the one being drawn now: open, with pages left. A PDF drawn in full stays among them
+ * until the rest of its pick is read, and is not the one drawing.
+ */
+export function drawingNow<T extends { done: number; total: number | null }>(
+  pending: readonly T[],
+): (T & { total: number }) | undefined {
+  return pending.find((entry): entry is T & { total: number } => entry.total !== null && entry.done < entry.total);
+}
+
 /**
  * The caption while a PDF draws: pages done of its pages, then the time and the rate when they mean something. The
  * time runs on `now` between pages; the rate is the pages drawn over the time they took.
  */
 export function drawCaption(drawing: PdfDrawing, now: number): string {
-  const parts = [fill(CHAT.attach.pdfDrawCount, { done: drawing.done, total: drawing.total })];
+  const parts = [drawCount(drawing.done, drawing.total)];
   const elapsed = Math.max(now, drawing.at) - drawing.startedAt;
   if (elapsed >= DRAW_CLOCK_MS) {
     parts.push(fill(CHAT.attach.pdfDrawTime, { n: (elapsed / 1_000).toFixed(1) }));
