@@ -151,7 +151,10 @@ function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonl
   const childId = draft?.attempts.at(-1) ?? rostered[0]!.agentId;
   const entry = draft?.entries.get(childId);
   const first = draft === null ? undefined : draft.entries.get(draft.attempts[0]!);
-  const roster = rostered.find((row) => row.agentId === childId) ?? null;
+  const roster =
+    rostered.find((row) => row.agentId === childId) ??
+    rostered.find((row) => draft !== null && !draft.entries.has(row.agentId)) ??
+    null;
   const named = roster ?? rostered[0] ?? null;
   const description = first?.description ?? '';
   const ended = roster !== null && ROSTER_ENDS.has(roster.state);
@@ -252,6 +255,18 @@ export function runAgents(
       const rows = rostered.get(key);
       if (rows === undefined) rostered.set(key, [agent]);
       else rows.push(agent);
+    }
+    for (const [key, agents] of rostered) {
+      if (typeof key !== 'string') continue;
+      const draft = list.find(
+        (d) =>
+          !rostered.has(d) &&
+          d.entries.get(d.attempts.at(-1)!)!.endTs !== undefined &&
+          d.entries.get(d.attempts[0]!)!.description === agents[0]!.label,
+      );
+      if (draft === undefined) continue;
+      rostered.delete(key);
+      rostered.set(draft, agents);
     }
     const rows: AgentRow[] = list.map((draft) => rowOf(draft, run, rostered.get(draft) ?? []));
     list.forEach((draft, n) => labelOf.set(draft, rows[n]!.label));

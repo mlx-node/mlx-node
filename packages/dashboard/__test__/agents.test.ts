@@ -301,6 +301,27 @@ describe('runAgents: the rows of a run', () => {
     expect(tokenWords(rows[0]!)).toBe(fill(CHAT.agent.facts.tokensUsed, { n: '56' }));
   });
 
+  // Mutation: skip the move of a roster row that has no spawn line → track:process is listed twice and the run sums 86 tokens.
+  // Mutation: drop rowOf's find of a roster row that is none of the draft's attempts → the row reads done from its finish line.
+  it('a retry that ended before its spawn line puts its roster row on the agent it retried: one row, billed once', () => {
+    const states = (['failed', 'cancelled'] as const).map((state) => {
+      const entries = read([
+        ...START.slice(0, 3),
+        finished(T0 + 187_923, child(0), 25_262, 187_923, 'completed', billed(43)),
+        revision(T0 + 190_000, 9, {
+          status: 'failed',
+          agents: roster([[RETRY, 'track:process', state, 43, 187_923]]),
+        }),
+      ]);
+      const rows = runAgents(entries).get(RUN)!;
+      expect(rows.map((row) => [row.childId, row.attempts, row.tokens])).toEqual([
+        [child(0), [child(0)], { n: 43, kind: 'used' }],
+      ]);
+      return agentState(rows[0]!, STORED).state;
+    });
+    expect(states).toEqual(['failed', 'stopped']);
+  });
+
   // Mutation: sum the attempts that have a figure → 13 tokens used, though the first attempt's use is unknown.
   it('a row built from its entries has no token figure when an attempt has no billed tokens, never a context', () => {
     const rows = runAgents(
