@@ -136,7 +136,8 @@ describe('Work: the run card on the fake agent', () => {
         const start = page.open().find((i) => i.toolName === 'workflow')!;
         await fake.service.answer(conversation.id, start.id, { optionId: 'allow-once' });
 
-        await until(() => page.open().some((i) => i.from !== undefined), 8_000);
+        // The helper asks while the typed answer may still run; it is answered once that answer has ended.
+        await until(() => page.open().some((i) => i.from !== undefined) && page.state?.turn === null, 8_000);
         const ask = page.open().find((i) => i.from !== undefined)!;
         expect(ask.from).toEqual({ label: 'researcher-0', run: 'deep-research', cwd: null });
         let html = draw(page.state!);

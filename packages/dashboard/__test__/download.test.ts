@@ -2471,6 +2471,9 @@ describe('DownloadManager', () => {
     };
     await waitFor(() => events1.some((event) => event.type === 'cancelled'));
     expect(idDuringCancel).not.toBe(id1);
+    // The second `start` runs a real job detached: without this the `afterEach` `rmSync` races its writes under
+    // `modelsDir` to an intermittent ENOTEMPTY.
+    await manager.shutdown();
   });
 
   it('refuses to overwrite an unowned dir that races in between the ownership check and the swap', async () => {
