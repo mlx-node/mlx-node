@@ -30,7 +30,7 @@ export interface AgentRow {
   /** The roster row of its newest attempt, and the time of the update that carried it. */
   roster: RosterRow | null;
   rosterTs: number | null;
-  /** The attempt its first spawn resumed, when that spawn is no retry of it: `continues {label}`. */
+  /** The child its first spawn resumed: `continues {label}`. */
   continues: { childId: string; label: string } | null;
   /** The roster's total use once it ended (`used`), else the newest attempt's context at its end. */
   tokens: { n: number; kind: 'used' | 'context' } | null;
@@ -90,37 +90,12 @@ interface Draft {
 }
 
 /**
- * B is A's next attempt: the same run (set) and label, A ended before B started, no spawn took A's place yet, and the
- * run's roster (`listed`) does not name both: a retry takes its first attempt's roster row. A script's
- * `agent({resume_from})` with A's label is its own row once the roster names it, or after A's retry; so is a resumed
- * Task subagent.
+ * B is A's next attempt only when B's spawn names A's newest attempt as `retry_of` (the run's contract retry). Any
+ * other spawn is its own row: a script's `agent({resume_from})`, also with A's label, and a resumed Task subagent.
  */
-function retries(
-  a: SubagentEntry,
-  b: SubagentEntry,
-  taken: ReadonlySet<string>,
-  listed: ReadonlyMap<string, ReadonlySet<string>>,
-): boolean {
-  const roster = b.run === undefined ? undefined : listed.get(b.run);
-  return (
-    b.run !== undefined &&
-    b.run === a.run &&
-    b.description === a.description &&
-    a.endTs !== undefined &&
-    a.endTs <= b.ts &&
-    !taken.has(a.childId) &&
-    !(roster?.has(a.childId) === true && roster.has(b.childId))
-  );
-}
-
 function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Map<string, Draft> } {
   const drafts: Draft[] = [];
   const owner = new Map<string, Draft>();
-  const taken = new Set<string>();
-  const listed = new Map<string, ReadonlySet<string>>();
-  for (const entry of entries) {
-    if (entry.kind === 'workflow') listed.set(entry.runId, new Set(entry.agents.map((agent) => agent.agentId)));
-  }
   entries.forEach((entry, i) => {
     if (entry.kind !== 'subagent') return;
     const known = owner.get(entry.childId);
@@ -129,18 +104,21 @@ function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Ma
       known.entries.set(entry.childId, entry);
       return;
     }
-    const from = entry.resumedFrom ?? null;
-    const prior = from === null ? undefined : owner.get(from);
-    const priorEntry = from === null ? undefined : prior?.entries.get(from);
-    if (prior !== undefined && priorEntry !== undefined && from !== null && retries(priorEntry, entry, taken, listed)) {
-      taken.add(from);
+    const retryOf = entry.retryOf;
+    const prior = retryOf === undefined ? undefined : owner.get(retryOf);
+    if (prior !== undefined && prior.attempts.at(-1) === retryOf) {
       prior.attempts.push(entry.childId);
       prior.at.push(i);
       prior.entries.set(entry.childId, entry);
       owner.set(entry.childId, prior);
       return;
     }
-    const draft: Draft = { attempts: [entry.childId], at: [i], entries: new Map([[entry.childId, entry]]), from };
+    const draft: Draft = {
+      attempts: [entry.childId],
+      at: [i],
+      entries: new Map([[entry.childId, entry]]),
+      from: entry.resumedFrom ?? null,
+    };
     drafts.push(draft);
     owner.set(entry.childId, draft);
   });

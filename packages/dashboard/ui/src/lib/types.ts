@@ -702,8 +702,10 @@ export type TranscriptEntry = (
       noSpawn?: true;
       /** `workflow_run_id`: the run that started it, whether or not the run's `workflow` entry is in the transcript. */
       run?: string;
-      /** `resumed_from`: the child session of the attempt this one retries. */
+      /** `resumed_from`: the child session it resumed, by a contract retry, a script `resume_from` or a Task `resume_from`. */
       resumedFrom?: string;
+      /** `retry_of`: the attempt this contract retry follows. */
+      retryOf?: string;
       /** `subagent_spawned.model`: the model it runs on. */
       model?: string;
     }

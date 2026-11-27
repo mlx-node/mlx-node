@@ -1647,7 +1647,7 @@ async function runGate(run, path, ms) {
 // the agent's watcher does after a slow drain); `pauseDrainOn` holds the helper ends of a typed `/workflow pause`
 // (`pauseDrain`). A `status` other than `complete` ends the run so (a paused one sends
 // `pause_message` and no wake, as the agent sends none for a pause). `retry: true`: the helper's first attempt ends
-// at once and the run retries it as its output contract does (a new child, `resumed_from` the first, the same label;
+// at once and the run retries it as its output contract does (a new child, `resumed_from` and `retry_of` the first, the same label;
 // the roster names the newest attempt). `retry: 'on-cancel'`: the first attempt runs until a cancel of it comes; then
 // it ends `completed`, its retry spawns, and the cancel is answered `already_finished`, as when the cancel reaches the
 // agent in the 47 ms between the first attempt's end and its retry's spawn. `_x.ai/subagent/cancel` of the helper
@@ -1697,7 +1697,7 @@ function startWorkflow(session, w, n) {
     durationMs: 0,
   };
   run.agents.push(agent);
-  const spawnOne = (a, resumedFrom) => {
+  const spawnOne = (a, retryOf) => {
     update(
       session,
       'subagent_spawned',
@@ -1708,7 +1708,7 @@ function startWorkflow(session, w, n) {
         subagent_type: 'general-purpose',
         description: a.label,
         workflow_run_id: run.id,
-        ...(resumedFrom === null ? {} : { resumed_from: resumedFrom, effective_context_source: 'resumed' }),
+        ...(retryOf === null ? {} : { resumed_from: retryOf, retry_of: retryOf, effective_context_source: 'resumed' }),
       },
       true,
     );
@@ -1722,7 +1722,7 @@ function startWorkflow(session, w, n) {
     });
     session.lastHelper = a.child;
   };
-  const spawn = (resumedFrom) => spawnOne(agent, resumedFrom);
+  const spawn = (retryOf) => spawnOne(agent, retryOf);
   spawn(null);
   const more = (w.more ?? []).map((m, k) => {
     const id = m.childSessionId ?? `${childId}-${k + 2}`;

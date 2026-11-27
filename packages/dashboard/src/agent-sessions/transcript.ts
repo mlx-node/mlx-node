@@ -2192,6 +2192,8 @@ export class TranscriptReducer {
         if (run !== null && run !== '') entry.run = run;
         const resumedFrom = str(update.resumed_from);
         if (resumedFrom !== null && resumedFrom !== '') entry.resumedFrom = resumedFrom;
+        const retryOf = str(update.retry_of);
+        if (retryOf !== null && retryOf !== '') entry.retryOf = retryOf;
         const model = str(update.model);
         if (model !== null && model !== '') entry.model = model;
         this.subagents.set(childId, entry);
