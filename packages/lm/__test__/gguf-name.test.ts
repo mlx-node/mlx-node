@@ -6,6 +6,7 @@ import {
   isGgufCompanionName,
   isQwen35XlGgufName,
   parseGgufFileName,
+  pickGgufProjector,
 } from '../src/gguf-name.js';
 
 describe('parseGgufFileName', () => {
@@ -138,5 +139,54 @@ describe('isBonsaiPq2GgufName', () => {
     expect(isBonsaiPq2GgufName('Ternary-Bonsai-2-27B-PQ2_0.gguf')).toBe(true);
     expect(isBonsaiPq2GgufName('ternary-bonsai-2-27b-pq2_0.gguf.part')).toBe(false);
     expect(isBonsaiPq2GgufName('x-ternary-bonsai-2-27b-pq2_0.gguf')).toBe(false);
+  });
+});
+
+describe('pickGgufProjector', () => {
+  const pick = (architecture: string, names: readonly string[], weight = 'M-UD-Q4_K_XL.gguf') =>
+    pickGgufProjector(architecture, weight, [weight, ...names])?.name;
+
+  it('takes BF16, then F16, then F32 beside a Qwen3.5 weight', () => {
+    expect(pick('qwen35', ['mmproj-F32.gguf', 'mmproj-F16.gguf', 'mmproj-BF16.gguf'])).toBe('mmproj-BF16.gguf');
+    expect(pick('qwen35', ['mmproj-F32.gguf', 'mmproj-F16.gguf'])).toBe('mmproj-F16.gguf');
+  });
+
+  it('takes F32 before F16 beside an Inkling2 weight', () => {
+    for (const architecture of ['inkling2', 'inkling2_loop']) {
+      expect(pick(architecture, ['mmproj-F16.gguf', 'mmproj-F32.gguf']), architecture).toBe('mmproj-F32.gguf');
+    }
+  });
+
+  it('takes mmproj-<weight> first beside a Gemma4 weight', () => {
+    const weight = 'gemma-4-26B-A4B-it-Q4_0.gguf';
+    expect(pick('gemma4', ['mmproj-BF16.gguf', `mmproj-${weight}`], weight)).toBe(`mmproj-${weight}`);
+  });
+
+  it('takes no projector that names none of the precisions', () => {
+    expect(pickGgufProjector('qwen35', 'M-UD-Q4_K_XL.gguf', ['mmproj-model-Q8_0.gguf'])).toEqual({
+      name: undefined,
+      tied: [],
+    });
+  });
+
+  it('takes a lone projector with no precision word beside an Inkling2 weight, and ranks it last', () => {
+    expect(pick('inkling2', ['mmproj-model.gguf'])).toBe('mmproj-model.gguf');
+    expect(pick('inkling2', ['mmproj-model.gguf', 'mmproj-Q8_0.gguf'])).toBe('mmproj-Q8_0.gguf');
+    expect(pickGgufProjector('inkling2', 'M.gguf', ['mmproj-b.gguf', 'mmproj-a.gguf'])).toEqual({
+      name: undefined,
+      tied: ['mmproj-a.gguf', 'mmproj-b.gguf'],
+    });
+  });
+
+  it('takes none of two projectors of one precision, and names both', () => {
+    expect(
+      pickGgufProjector('qwen35', 'M.gguf', ['mmproj-b-BF16.gguf', 'mmproj-a-bf16.gguf', 'mmproj-F16.gguf']),
+    ).toEqual({ name: undefined, tied: ['mmproj-a-bf16.gguf', 'mmproj-b-BF16.gguf'] });
+  });
+
+  it('answers nothing for an architecture whose loader takes no projector', () => {
+    for (const architecture of ['qwen35moe', 'clef', 'qwen4exp', 'hy_v4_flash', 'deepseek41', 'muse-glimmer']) {
+      expect(pickGgufProjector(architecture, 'M.gguf', ['mmproj-BF16.gguf']), architecture).toBeUndefined();
+    }
   });
 });

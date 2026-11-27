@@ -62,6 +62,7 @@ import {
   isSideEntry,
   loadFor,
   loadVariant,
+  messagePages,
   modelHeadline,
   openRetry,
   pendingRow,
@@ -1744,6 +1745,8 @@ function PendingRow(props: {
   work: boolean;
   /** Start of this wait (epoch ms): the clock counts from it; null shows no clock. */
   since: number | null;
+  /** The PDF pages the turn's message carries. */
+  pages: number;
   modelSize: ChatThreadProps['modelSize'];
   onStatus: ChatThreadProps['onStatus'];
 }): ReactElement {
@@ -1762,6 +1765,7 @@ function PendingRow(props: {
     full: fullLimit(answers, props.model, props.turn?.startedAt ?? null),
     continuing: props.continuing,
     work: props.work,
+    pages: props.pages,
     engine: engineWait({
       requests: props.host?.requests ?? [],
       session: props.conversationId,
@@ -2562,6 +2566,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
                   quiet={quiet}
                   work={working}
                   since={waitSince}
+                  pages={messagePages(last)}
                   modelSize={props.modelSize}
                   onStatus={props.onStatus}
                 />

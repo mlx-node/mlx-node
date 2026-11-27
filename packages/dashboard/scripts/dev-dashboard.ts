@@ -45,6 +45,9 @@
  * the files it carried.
  * A retry, a picture and a hook row of a running answer show before its next call, else at its end, as on disk; the
  * words "retry" and "picture" play them. While a fork or a recap runs, Enter queues and the round button has no Stop.
+ * Files: qwen3.5-4b and qwen3.5-9b see images, so they take pictures in Chat and PDFs (up to 20 pages, drawn into page
+ * images in the composer) in both modes; every other model refuses both. With `MLX_DEV_FLIGHT=chat`, a Work message
+ * with a PDF and the word "pdfwait" waits 40 s before any work, so its wait line names the pages it reads.
  * Pictures in tool results: the Work words "picture" and "readpdf" read a picture and three pages of a 12-page PDF; the
  * read row reads "1 picture · …" or "3 of 12 pages · …" and opens to tiles read from disk, and a tile opens the viewer
  * (← →, − + 0, Esc). The live Work session's 2nd answer reads a screenshot and a PDF the same way.

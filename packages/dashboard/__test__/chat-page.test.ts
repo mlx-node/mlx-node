@@ -3850,6 +3850,7 @@ describe('Chat page: conversation actions', () => {
       contextTokens: 262144,
       sizeBytes: gb * 1024 ** 3,
       images: false,
+      family: null,
     });
     const models = [hostModel('qwen3.5-4b', 32768), build(XL, 'UD-Q4_K_XL', 17.6), build(M, 'UD-Q4_K_M', 16.5)];
     await open('/chat?c=p-quant', (text) => text.includes('Hi there'), {
@@ -4132,7 +4133,7 @@ describe('Chat page: files and pictures', () => {
       host: host({ inference: 'starting' }),
     });
     pick(new File(['%PDF-1.7'], 'report.pdf', { type: 'application/pdf' }));
-    const sentence = fill(CHAT.attach.errors.pdf, { name: 'report.pdf' });
+    const sentence = fill(CHAT.attach.errors.pdfModel, { name: 'report.pdf' });
     await waitFor(() => allByRole(form(), 'status').some((node) => node.textContent === sentence));
     expect(shown(form())).toContain(CHAT.blockers['inference-starting']);
     type('Now text');

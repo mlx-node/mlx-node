@@ -156,23 +156,27 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
         // `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` is deliberately NOT globbed: nothing
         // in the runtime pairs a GGUF MTP sidecar (`mtp_sidecar_candidates` is
         // safetensors-only), so it would be 1.28 GB of dead weight per install.
+        // The vision tower is `mmproj-BF16.gguf`, the projector the loader pairs
+        // from the folder (BF16 before F16); without it the model is text-only.
         id: 'UD-Q4_K_XL',
         hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-        globs: ['*UD-Q4_K_XL*', 'config.json'],
+        globs: ['*UD-Q4_K_XL*', 'config.json', 'mmproj-BF16.gguf'],
         assetsRepo: 'Qwen/Qwen3.8-27B',
-        sizeGb: 17.7,
+        sizeGb: 18.6,
         source: 'Unsloth GGUF',
+        included: 'Vision included',
       },
       {
         // The repo has no plain Q4_K_M file; this glob takes only
         // `Qwen3.8-27B-UD-Q4_K_M.gguf`.
         id: 'UD-Q4_K_M',
         hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-        globs: ['*UD-Q4_K_M*', 'config.json'],
+        globs: ['*UD-Q4_K_M*', 'config.json', 'mmproj-BF16.gguf'],
         assetsRepo: 'Qwen/Qwen3.8-27B',
-        sizeGb: 16.6,
+        sizeGb: 17.5,
         source: 'Unsloth GGUF',
         note: '1.1 GB smaller',
+        included: 'Vision included',
         folderSuffix: 'ud-q4_k_m',
       },
     ],
@@ -270,10 +274,12 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
       {
         // Shard 2 is the Engram table, read by row from SSD; the routed experts
         // stream from SSD too, so the weights may exceed RAM. The loader reads the
-        // embedded GGUF tokenizer, never the sidecar files.
+        // embedded GGUF tokenizer, never the sidecar files. `*Q4_K_M*` would also
+        // take the two `Q4_K_M_MTP_Q8_0*` split sets, 306 GB of other builds. The
+        // load is text-only, so the repo's mmproj is not taken.
         id: 'Q4_K_M',
         hfRepo: 'AngelSlim/Hy4-flash-GGUF',
-        globs: ['*Q4_K_M*'],
+        globs: ['Hy4-flash-Q4_K_M-*'],
         assetsRepo: 'tencent/Hy4-flash',
         sizeGb: 168.3,
         source: 'AngelSlim GGUF',

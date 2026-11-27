@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -1330,6 +1331,45 @@ describe('catalogWithState — two builds of one repository', () => {
       blocker: null,
       localRevision: null,
     });
+  });
+
+  it('an install whose marker lacks the projector the catalog names reads lacksNamedFile, and only an install', () => {
+    expect(XL.globs).toContain('mmproj-BF16.gguf');
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ installed: true, lacksNamedFile: true });
+
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', 'mmproj-BF16.gguf'), ggufHeader('clip'));
+    writeCompletion('qwen3.8-27b-gguf', REPO, ['config.json', XL_FILE, 'mmproj-BF16.gguf']);
+    expect(buildItem('qwen3.8-27b-gguf').installed).toBe(true);
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
+
+    writeGgufInstall('qwen3.8-27b-gguf-ud-q4_k_m', M_FILE);
+    const marker = join(modelsDir, 'qwen3.8-27b-gguf-ud-q4_k_m', DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(marker, JSON.stringify({ ...JSON.parse(readFileSync(marker, 'utf8')), scope: 'partial' }));
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m')).toMatchObject({ present: true, installed: false });
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m').lacksNamedFile).toBeUndefined();
+  });
+
+  it('an install that holds the named projector on disk, though its marker omits it, does not read lacksNamedFile', () => {
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', 'mmproj-BF16.gguf'), ggufHeader('clip'));
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ installed: true });
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
+  });
+
+  it('an install whose marker lists another build weight does not read lacksNamedFile: an Update would delete it', () => {
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', M_FILE), ggufHeader('qwen35'));
+    writeCompletion('qwen3.8-27b-gguf', REPO, ['config.json', XL_FILE, M_FILE]);
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ id: 'UD-Q4_K_XL', installed: true });
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
+  });
+
+  it('an install with another build weight in the folder but not the marker does not read lacksNamedFile', () => {
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', M_FILE), ggufHeader('qwen35'));
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ id: 'UD-Q4_K_XL', installed: true });
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
   });
 
   it('a renamed install of one build makes only that build present', () => {

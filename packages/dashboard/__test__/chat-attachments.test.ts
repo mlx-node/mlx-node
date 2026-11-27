@@ -6,29 +6,52 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import {
   ATTACH_MAX,
+  CHAT_PICTURES_MAX_BASE64,
   FILE_NUMBERED_MAX_BYTES,
   IMAGE_MAX_BYTES,
   IMAGE_SOURCE_MAX_BYTES,
   type ImageMediaType,
   magicMatches,
   numberedBytes,
+  PAGE_MAX_BYTES,
+  type PageSize,
+  PDF_SOURCE_MAX_BYTES,
 } from '../src/chat/attachment-rule.js';
 import {
   attachQueue,
   type DecodedPicture,
   type DraftAttachment,
+  drawCaption,
+  drawCount,
   draftInput,
+  drawingNow,
   type ImageCodec,
   ingestFiles,
   noteName,
+  pageRate,
+  type PdfProgress,
+  type PdfWatch,
 } from '../ui/src/lib/chat-attachments.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { normalizeMime } from '../ui/src/lib/file-read.js';
+import { type PdfCodec, type PdfOpenFailure, PdfOpenError } from '../ui/src/lib/pdf-pages.js';
+import { type AttachFacts, attachProblem } from '../ui/src/pages/chat/blockers.js';
+import {
+  drawingCount,
+  forgetPlace,
+  placeEpoch,
+  type PendingPdf,
+  readPending,
+  stopPending,
+  writeAttachments,
+  writePending,
+} from '../ui/src/pages/chat/drafts.js';
 
 const e = CHAT.attach.errors;
-const CHAT_IMAGES = { mode: 'chat', seesImages: true, held: 0 } as const;
-const CHAT_TEXT = { mode: 'chat', seesImages: false, held: 0 } as const;
-const WORK = { mode: 'work', seesImages: false, held: 0 } as const;
+const CHAT_IMAGES = { mode: 'chat', seesImages: true, seesPages: true, held: 0 } as const;
+const CHAT_TEXT = { mode: 'chat', seesImages: false, seesPages: false, held: 0 } as const;
+const WORK = { mode: 'work', seesImages: false, seesPages: false, held: 0 } as const;
+const WORK_PAGES = { mode: 'work', seesImages: false, seesPages: true, held: 0 } as const;
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const JPEG_MAGIC = [0xff, 0xd8, 0xff];
@@ -86,6 +109,96 @@ function fakeCodec(
   };
   return { codec, calls, decoded, closed: () => closed };
 }
+
+/** A page of a fake PDF: its size in points, and the JPEG bytes each quality gives (1,000 by default). */
+interface FakePage {
+  width: number;
+  height: number;
+  bytesAt?: (quality: number) => number;
+  /** The draw throws. */
+  broken?: boolean;
+}
+
+const A4: FakePage = { width: 595.28, height: 841.89 };
+
+/** A codec whose every file opens as `pages`, or fails to open with `fails`. */
+function fakePdf(
+  pages: readonly FakePage[],
+  options: { fails?: PdfOpenFailure } = {},
+): {
+  codec: PdfCodec;
+  opened: () => number;
+  draws: Array<{ n: number; width: number; height: number }>;
+  encodes: Array<{ n: number; quality: number }>;
+  closed: () => number;
+} {
+  let opened = 0;
+  let closed = 0;
+  const draws: Array<{ n: number; width: number; height: number }> = [];
+  const encodes: Array<{ n: number; quality: number }> = [];
+  const codec: PdfCodec = {
+    open: async () => {
+      opened += 1;
+      if (options.fails !== undefined) throw new PdfOpenError(options.fails);
+      return {
+        pages: pages.length,
+        page: async (n) => {
+          const page = pages[n - 1]!;
+          return {
+            width: page.width,
+            height: page.height,
+            draw: async (width, height) => {
+              if (page.broken === true) throw new Error('bad operator');
+              draws.push({ n, width, height });
+              return {
+                encode: async (quality) => {
+                  encodes.push({ n, quality });
+                  const size = page.bytesAt?.(quality) ?? 1_000;
+                  return new Blob([bytesOf(JPEG_MAGIC, `PAGE${n}`, size)], { type: 'image/jpeg' });
+                },
+                close: () => undefined,
+              };
+            },
+            close: () => undefined,
+          };
+        },
+        close: async () => {
+          closed += 1;
+        },
+      };
+    },
+  };
+  return { codec, opened: () => opened, draws, encodes, closed: () => closed };
+}
+
+/** A watch that records what the composer is told. */
+function recordWatch(onProgress?: (progress: PdfProgress, stop: AbortController) => void): {
+  watch: PdfWatch;
+  started: string[];
+  progress: PdfProgress[];
+  ended: string[];
+} {
+  const started: string[] = [];
+  const progress: PdfProgress[] = [];
+  const ended: string[] = [];
+  const stops = new Map<string, AbortController>();
+  const watch: PdfWatch = {
+    start: (id) => {
+      started.push(id);
+      const stop = new AbortController();
+      stops.set(id, stop);
+      return stop.signal;
+    },
+    progress: (id, value) => {
+      progress.push(value);
+      onProgress?.(value, stops.get(id)!);
+    },
+    end: (id) => ended.push(id),
+  };
+  return { watch, started, progress, ended };
+}
+
+const pdfFile = (name = 'paper.pdf', type = 'application/pdf'): File => file(['%PDF-1.7 body'], name, type);
 
 function decodedData(draft: DraftAttachment): string {
   if (draft.kind !== 'image') throw new Error('not a picture');
@@ -152,7 +265,7 @@ describe('ingestFiles: content decides what is text', () => {
     expect((await ingestFiles([fits], CHAT_TEXT)).added).toHaveLength(1);
   });
 
-  it('bad UTF-8, a blank file, a PDF and HEIC bytes each get their sentence', async () => {
+  it('bad UTF-8, a blank file, a damaged PDF and HEIC bytes each get their sentence', async () => {
     const heic = bytesOf([0x00, 0x00, 0x00, 0x18], 'ftypheic');
     const result = await ingestFiles(
       [
@@ -162,12 +275,14 @@ describe('ingestFiles: content decides what is text', () => {
         file([heic], 'photo.heic', 'image/heic'),
       ],
       CHAT_IMAGES,
+      undefined,
+      fakePdf([], { fails: 'damaged' }).codec,
     );
     expect(result.added).toEqual([]);
     expect(result.refused).toEqual([
       fill(e.notText, { name: 'bad.txt' }),
       fill(e.empty, { name: 'blank.txt' }),
-      fill(e.pdf, { name: 'paper.pdf' }),
+      fill(e.pdfDamaged, { name: 'paper.pdf' }),
       fill(e.notText, { name: 'photo.heic' }),
     ]);
   });
@@ -213,7 +328,7 @@ describe('ingestFiles: count and image gate', () => {
       CHAT_TEXT,
     );
     expect(result.added).toHaveLength(4);
-    expect(result.refused).toEqual([fill(e.pdf, { name: 'a.pdf' })]);
+    expect(result.refused).toEqual([fill(e.pdfModel, { name: 'a.pdf' })]);
   });
 
   it('a picture with images off: the model sentence in Chat, the Work sentence in Work, never decoded', async () => {
@@ -330,6 +445,336 @@ describe('ingestFiles: every picture is drawn again', () => {
   });
 });
 
+describe('ingestFiles: a PDF is drawn page by page', () => {
+  it('a .pdf name typed text/plain takes the PDF path, never the text path', async () => {
+    const pdf = fakePdf([A4, A4]);
+    const result = await ingestFiles([pdfFile('notes.pdf', 'text/plain')], CHAT_IMAGES, undefined, pdf.codec);
+    expect(result.refused).toEqual([]);
+    expect(result.added.map((item) => item.kind)).toEqual(['pdf']);
+    expect(pdf.opened()).toBe(1);
+  });
+
+  it('a model without images refuses the PDF in Chat and in Work, unopened; an image model takes it in Work', async () => {
+    const pdf = fakePdf([A4]);
+    expect((await ingestFiles([pdfFile()], CHAT_TEXT, undefined, pdf.codec)).refused).toEqual([
+      fill(e.pdfModel, { name: 'paper.pdf' }),
+    ]);
+    expect((await ingestFiles([pdfFile()], WORK, undefined, pdf.codec)).refused).toEqual([
+      fill(e.pdfModel, { name: 'paper.pdf' }),
+    ]);
+    expect(pdf.opened()).toBe(0);
+    const work = await ingestFiles([pdfFile()], WORK_PAGES, undefined, pdf.codec);
+    expect(work.refused).toEqual([]);
+    expect(work.added.map((item) => item.kind)).toEqual(['pdf']);
+  });
+
+  it('each page drawn at the page rule and sent as JPEG; the draft holds the pages, their sizes and bytes', async () => {
+    const pdf = fakePdf([A4, { width: 612, height: 792 }, { width: 960, height: 540 }]);
+    const result = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, pdf.codec);
+    expect(pdf.draws).toEqual([
+      { n: 1, width: 861, height: 1_217 },
+      { n: 2, width: 900, height: 1_164 },
+      { n: 3, width: 1_280, height: 720 },
+    ]);
+    expect(pdf.encodes.map((call) => call.quality)).toEqual([0.85, 0.85, 0.85]);
+    const draft = result.added[0]!;
+    if (draft.kind !== 'pdf') throw new Error('not a PDF');
+    expect(draft.sizes).toEqual(pdf.draws.map(({ width, height }) => ({ width, height })));
+    expect(draft.images).toHaveLength(3);
+    expect(draft.images.every((page) => magicMatches('image/jpeg', page))).toBe(true);
+    expect(atob(draft.images[1]!)).toContain('PAGE2');
+    expect([draft.bytes, draft.chars]).toEqual([3_000, draft.images.join('').length]);
+    expect(draftInput(draft)).toEqual({ kind: 'pdf', name: 'paper.pdf', images: draft.images });
+    expect(pdf.closed()).toBe(1);
+  });
+
+  it('a page over the byte cap at 0.85 falls to 0.7; a page over it at every quality refuses the PDF by page', async () => {
+    const fitsAt = (fit: number) => (quality: number) => (quality <= fit ? PAGE_MAX_BYTES : PAGE_MAX_BYTES + 1);
+    const ladder = fakePdf([A4, { ...A4, bytesAt: fitsAt(0.7) }]);
+    const made = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, ladder.codec);
+    expect(made.refused).toEqual([]);
+    expect(ladder.encodes).toEqual([
+      { n: 1, quality: 0.85 },
+      { n: 2, quality: 0.85 },
+      { n: 2, quality: 0.7 },
+    ]);
+    const never = fakePdf([A4, A4, { ...A4, bytesAt: () => PAGE_MAX_BYTES + 1 }]);
+    const refused = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, never.codec);
+    expect(refused.added).toEqual([]);
+    expect(refused.refused).toEqual([fill(e.pdfPage, { name: 'paper.pdf', n: 3 })]);
+    expect(never.encodes.filter((call) => call.n === 3).map((call) => call.quality)).toEqual([0.85, 0.7, 0.5]);
+    expect(never.closed()).toBe(1);
+  });
+
+  it('a page that does not draw, or draws under 8 px a side, refuses the PDF with its number', async () => {
+    const broken = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, fakePdf([A4, { ...A4, broken: true }]).codec);
+    expect(broken.refused).toEqual([fill(e.pdfPage, { name: 'paper.pdf', n: 2 })]);
+    const sliver = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, fakePdf([{ width: 0.5, height: 300 }]).codec);
+    expect(sliver.refused).toEqual([fill(e.pdfPage, { name: 'paper.pdf', n: 1 })]);
+  });
+
+  it('locked, damaged, empty, over 50 MB and over 20 pages: one sentence each, nothing drawn', async () => {
+    const at = async (codec: PdfCodec, source: File = pdfFile()) =>
+      (await ingestFiles([source], CHAT_IMAGES, undefined, codec)).refused;
+    expect(await at(fakePdf([], { fails: 'locked' }).codec)).toEqual([fill(e.pdfLocked, { name: 'paper.pdf' })]);
+    expect(await at(fakePdf([], { fails: 'damaged' }).codec)).toEqual([fill(e.pdfDamaged, { name: 'paper.pdf' })]);
+    expect(await at(fakePdf([]).codec)).toEqual([fill(e.pdfEmpty, { name: 'paper.pdf' })]);
+    const big = fakePdf([A4]);
+    expect(await at(big.codec, sized(pdfFile(), PDF_SOURCE_MAX_BYTES + 1))).toEqual([
+      fill(e.pdfTooLarge, { name: 'paper.pdf' }),
+    ]);
+    expect(big.opened()).toBe(0);
+    for (const count of [21, 321]) {
+      const long = fakePdf(Array.from({ length: count }, () => A4));
+      expect(await at(long.codec)).toEqual([fill(e.pdfTooLong, { name: 'paper.pdf', n: count })]);
+      expect(long.draws).toEqual([]);
+    }
+    const twenty = await ingestFiles([pdfFile()], CHAT_IMAGES, undefined, fakePdf(Array(20).fill(A4)).codec);
+    expect(twenty.added).toHaveLength(1);
+  });
+
+  it('the watch: the chip starts before the open, counts every page, gets page 1, and ends only on a refusal', async () => {
+    const seen = recordWatch();
+    const result = await ingestFiles(
+      [pdfFile()],
+      { ...CHAT_IMAGES, watch: seen.watch },
+      undefined,
+      fakePdf([A4, A4]).codec,
+    );
+    expect(seen.started).toEqual([result.added[0]!.id]);
+    expect(seen.progress.map(({ done, total, bytes }) => [done, total, bytes])).toEqual([
+      [0, 2, 0],
+      [1, 2, 1_000],
+      [2, 2, 2_000],
+    ]);
+    expect(seen.progress[1]!.thumbnail?.startsWith('data:image/jpeg;base64,/9j/')).toBe(true);
+    expect(seen.progress[2]!.thumbnail).toBeUndefined();
+    expect(seen.ended).toEqual([]);
+    const locked = recordWatch();
+    await ingestFiles(
+      [pdfFile()],
+      { ...CHAT_IMAGES, watch: locked.watch },
+      undefined,
+      fakePdf([], { fails: 'locked' }).codec,
+    );
+    expect(locked.ended).toEqual(locked.started);
+  });
+
+  it('removing the chip after page 3 stops the read: nothing added, nothing said, no page 4', async () => {
+    const pdf = fakePdf(Array(6).fill(A4));
+    const seen = recordWatch((progress, stop) => {
+      if (progress.done === 3) stop.abort();
+    });
+    const result = await ingestFiles([pdfFile()], { ...CHAT_IMAGES, watch: seen.watch }, undefined, pdf.codec);
+    expect(result).toEqual({ added: [], refused: [] });
+    expect(pdf.draws.map((call) => call.n)).toEqual([1, 2, 3]);
+    expect(seen.ended).toEqual(seen.started);
+    expect(pdf.closed()).toBe(1);
+  });
+
+  it('a PDF removed once drawn, while the rest of its pick is read, is not added and frees its place', async () => {
+    const stops: AbortController[] = [];
+    const watch: PdfWatch = {
+      start: () => {
+        const stop = new AbortController();
+        stops.push(stop);
+        return stop.signal;
+      },
+      progress: (_id, progress) => {
+        if (stops.length === 2 && progress.done === 1) stops[0]!.abort();
+      },
+      end: () => undefined,
+    };
+    const result = await ingestFiles(
+      [pdfFile('a.pdf'), pdfFile('b.pdf'), file(['x'], 'x.txt')],
+      { ...CHAT_IMAGES, held: 2, watch },
+      undefined,
+      fakePdf([A4, A4]).codec,
+    );
+    expect(result.added.map((item) => item.name)).toEqual(['b.pdf', 'x.txt']);
+    expect(result.refused).toEqual([]);
+  });
+
+  it('a PDF is one of the 4 files, whatever its pages', async () => {
+    const texts = ['1', '2', '3'].map((n) => file([n], `${n}.txt`));
+    const result = await ingestFiles([pdfFile(), ...texts], CHAT_IMAGES, undefined, fakePdf(Array(12).fill(A4)).codec);
+    expect(result.refused).toEqual([]);
+    expect(result.added.map((item) => item.kind)).toEqual(['pdf', 'file', 'file', 'file']);
+  });
+});
+
+describe('pending PDFs', () => {
+  const entry = (id: string): PendingPdf => ({
+    id,
+    name: `${id}.pdf`,
+    done: 0,
+    total: null,
+    bytes: 0,
+    thumbnail: null,
+    startedAt: 1,
+    at: 1,
+    stop: new AbortController(),
+  });
+
+  it('removing a chip stops its read and drops it; an id with no read is false', () => {
+    const a = entry('a');
+    const b = entry('b');
+    writePending('pending-1', 'a', a);
+    writePending('pending-1', 'b', b);
+    writePending('pending-1', 'a', { ...a, done: 2, total: 5 });
+    expect(readPending('pending-1').map((item) => [item.id, item.done])).toEqual([
+      ['a', 2],
+      ['b', 0],
+    ]);
+    expect(stopPending('pending-1', 'a')).toBe(true);
+    expect(a.stop.signal.aborted).toBe(true);
+    expect(b.stop.signal.aborted).toBe(false);
+    expect(readPending('pending-1').map((item) => item.id)).toEqual(['b']);
+    expect(stopPending('pending-1', 'a')).toBe(false);
+    forgetPlace('pending-1');
+  });
+
+  it('a forgotten place stops every read in it, and a read that started before keeps no chip there', () => {
+    const a = entry('a');
+    writePending('pending-2', 'a', a);
+    const epoch = placeEpoch('pending-2');
+    forgetPlace('pending-2');
+    expect(a.stop.signal.aborted).toBe(true);
+    expect(readPending('pending-2')).toEqual([]);
+    writePending('pending-2', 'a', { ...a, done: 1, total: 3 }, epoch);
+    expect(readPending('pending-2')).toEqual([]);
+  });
+
+  // Mutations: the count always 0 (Send ignores the store); the attached files not left out (Send stays off) → red.
+  it('a PDF not yet among the attached files holds Send, from any mount; once attached or stopped it does not', () => {
+    writePending('pending-3', 'a', entry('a'));
+    writePending('pending-3', 'b', entry('b'));
+    expect(drawingCount('pending-3')).toBe(2);
+    expect(attachProblem({ ...FACTS, files: [], reading: drawingCount('pending-3') })).toBe(CHAT.attach.reading);
+    writeAttachments('pending-3', [{ ...pdfDraft('a.pdf', 2), id: 'a' }]);
+    expect(drawingCount('pending-3')).toBe(1);
+    expect(stopPending('pending-3', 'b')).toBe(true);
+    expect(drawingCount('pending-3')).toBe(0);
+    expect(attachProblem({ ...FACTS, files: [], reading: drawingCount('pending-3') })).toBeNull();
+    forgetPlace('pending-3');
+  });
+});
+
+describe('drawCaption, drawingNow and pageRate', () => {
+  it('pages drawn of all; the time once past 1 s; the rate once 8 pages and 1 s have passed', () => {
+    const at = (done: number, ms: number) =>
+      drawCaption({ done, total: 20, startedAt: 5_000, at: 5_000 + ms }, 5_000 + ms);
+    expect(at(5, 900)).toBe(fill(CHAT.attach.pdfDrawCount, { done: 5, total: 20 }));
+    expect(at(5, 1_100)).toBe(`${fill(CHAT.attach.pdfDrawCount, { done: 5, total: 20 })} · 1.1 s`);
+    expect(at(8, 2_000)).toBe(`${fill(CHAT.attach.pdfDrawCount, { done: 8, total: 20 })} · 2.0 s · 4.0 pages/s`);
+    expect(at(12, 800)).toBe(fill(CHAT.attach.pdfDrawCount, { done: 12, total: 20 }));
+  });
+
+  it('the time runs between pages; the rate stays the pages drawn over their time', () => {
+    const drawing = { done: 8, total: 20, startedAt: 5_000, at: 7_000 };
+    const count = fill(CHAT.attach.pdfDrawCount, { done: 8, total: 20 });
+    expect(drawCaption(drawing, 9_500)).toBe(`${count} · 4.5 s · 4.0 pages/s`);
+    expect(drawCaption({ done: 0, total: 20, startedAt: 5_000, at: 5_000 }, 7_300)).toBe(
+      `${fill(CHAT.attach.pdfDrawCount, { done: 0, total: 20 })} · 2.3 s`,
+    );
+    expect(drawCaption({ done: 9, total: 20, startedAt: 5_000, at: 5_600 }, 6_200)).toBe(
+      `${fill(CHAT.attach.pdfDrawCount, { done: 9, total: 20 })} · 1.2 s`,
+    );
+  });
+
+  it('a one-page PDF counts "of 1 page"', () => {
+    expect(drawCount(0, 1)).toBe('0 of 1 page');
+    expect(drawCaption({ done: 1, total: 1, startedAt: 5_000, at: 5_100 }, 5_100)).toBe(
+      fill(CHAT.attach.pdfDrawCountOne, { done: 1 }),
+    );
+    expect(drawCount(1, 2)).toBe(fill(CHAT.attach.pdfDrawCount, { done: 1, total: 2 }));
+  });
+
+  it('the PDF drawing now is the open one with pages left, not one drawn in full or one not open yet', () => {
+    const at = (done: number, total: number | null) => ({ done, total });
+    expect(drawingNow([at(3, 3), at(1, 5)])).toEqual(at(1, 5));
+    expect(drawingNow([at(0, null), at(3, 3)])).toBeUndefined();
+    expect(drawingNow([at(0, 4)])).toEqual(at(0, 4));
+  });
+
+  it('per second from 1 a second, else per minute; whole numbers from 10', () => {
+    expect(pageRate(34.2)).toBe('34 pages/s');
+    expect(pageRate(1)).toBe('1.0 pages/s');
+    expect(pageRate(9.4 / 60)).toBe('9.4 pages/min');
+    expect(pageRate(0.5)).toBe('30 pages/min');
+  });
+});
+
+/** A PDF draft of `pages` A4 pages, each `chars` of base64. */
+function pdfDraft(name: string, pages: number, chars = 200_000, size: PageSize = { width: 861, height: 1_217 }) {
+  return {
+    id: `pdf-${name}`,
+    kind: 'pdf' as const,
+    name,
+    bytes: (pages * chars * 3) / 4,
+    chars: pages * chars,
+    images: Array<string>(pages).fill('/9j/AAAA'),
+    sizes: Array<PageSize>(pages).fill(size),
+  };
+}
+
+const PICTURE_DRAFT: DraftAttachment = {
+  id: 'pic',
+  kind: 'image',
+  name: 'p.png',
+  mediaType: 'image/png',
+  bytes: 3_000_000,
+  dataUrl: `data:image/png;base64,${'A'.repeat(4_000_000)}`,
+};
+
+const FACTS: AttachFacts = {
+  mode: 'chat',
+  seesImages: true,
+  seesPages: true,
+  text: 'What is on these pages?',
+  files: [],
+  windowTokens: null,
+  family: 'qwen3_5',
+  contextUsed: null,
+  reading: 0,
+  heldPictures: 0,
+  heldImages: 0,
+  pdfTool: false,
+};
+
+describe('attachProblem with PDFs', () => {
+  it('first match wins: reading, then the model, then two PDFs for the tool, then the picture room', () => {
+    const one = pdfDraft('a.pdf', 5);
+    expect(attachProblem({ ...FACTS, files: [one] })).toBeNull();
+    expect(attachProblem({ ...FACTS, files: [one], seesPages: false, reading: 1 })).toBe(CHAT.attach.reading);
+    expect(attachProblem({ ...FACTS, files: [one], seesPages: false, heldImages: 60 })).toBe(
+      CHAT.attach.blockedPdfModel,
+    );
+    const tool = { ...FACTS, pdfTool: true, heldImages: 60 };
+    expect(attachProblem({ ...tool, files: [one, pdfDraft('b.pdf', 5)] })).toBe(CHAT.attach.blockedPdfOne);
+    expect(attachProblem({ ...tool, files: [one] })).toBeNull();
+    const full = { ...FACTS, heldPictures: CHAT_PICTURES_MAX_BASE64 - 1_000_000 };
+    expect(attachProblem({ ...full, files: [PICTURE_DRAFT] })).toBe(CHAT.sendErrors['pictures-full'][0]);
+  });
+
+  it('a Work PDF on an image model passes while a Work picture is still refused', () => {
+    const work = { ...FACTS, mode: 'work' as const, seesImages: false };
+    expect(attachProblem({ ...work, files: [pdfDraft('a.pdf', 3)] })).toBeNull();
+    expect(attachProblem({ ...work, files: [pdfDraft('a.pdf', 3), PICTURE_DRAFT] })).toBe(CHAT.attach.blockedWork);
+  });
+
+  it('with no tool in this mode, pages that do not fit the message keep Send off', () => {
+    expect(attachProblem({ ...FACTS, files: [pdfDraft('a.pdf', 12), pdfDraft('b.pdf', 9)] })).toBe(
+      CHAT.attach.blockedPdfRoom,
+    );
+    expect(attachProblem({ ...FACTS, files: [pdfDraft('a.pdf', 12), pdfDraft('b.pdf', 8)] })).toBeNull();
+    expect(attachProblem({ ...FACTS, files: [pdfDraft('a.pdf', 5)], heldImages: 60 })).toBe(CHAT.attach.blockedPdfRoom);
+    expect(attachProblem({ ...FACTS, files: [pdfDraft('a.pdf', 5)], windowTokens: 6_000, contextUsed: 1_000 })).toBe(
+      CHAT.attach.blockedPdfRoom,
+    );
+  });
+});
+
 describe('attachQueue', () => {
   it('two ingests started together add at most 4 in total', async () => {
     const queue = attachQueue();
@@ -337,8 +782,8 @@ describe('attachQueue', () => {
     const target = { read: () => store, write: (items: DraftAttachment[]) => (store = items) };
     const batch = (tag: string): File[] => ['1', '2', '3'].map((n) => file([`${tag} ${n}`], `${tag}${n}.txt`));
     const [first, second] = await Promise.all([
-      queue(batch('a'), { mode: 'chat', seesImages: false }, target),
-      queue(batch('b'), { mode: 'chat', seesImages: false }, target),
+      queue(batch('a'), { mode: 'chat', seesImages: false, seesPages: false }, target),
+      queue(batch('b'), { mode: 'chat', seesImages: false, seesPages: false }, target),
     ]);
     expect(store.map((item) => item.name)).toEqual(['a1.txt', 'a2.txt', 'a3.txt', 'b1.txt']);
     expect(first.refused).toEqual([]);
@@ -401,7 +846,7 @@ describe('attachQueue', () => {
       },
       write: (items: DraftAttachment[]) => (store = items),
     };
-    const options = { mode: 'chat', seesImages: false } as const;
+    const options = { mode: 'chat', seesImages: false, seesPages: false } as const;
     const [failed, next] = await Promise.allSettled([
       queue([file(['x'], 'x.txt')], options, target),
       queue([file(['y'], 'y.txt')], options, target),
@@ -429,5 +874,9 @@ describe('draftInput', () => {
         dataUrl: 'data:image/png;base64,iVBORw0KGgo=',
       }),
     ).toEqual({ kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=' });
+  });
+
+  it('a PDF sends its name and its pages only: the route takes exact keys, and the sizes stay in the page', () => {
+    expect(draftInput(pdfDraft('r.pdf', 2))).toEqual({ kind: 'pdf', name: 'r.pdf', images: ['/9j/AAAA', '/9j/AAAA'] });
   });
 });

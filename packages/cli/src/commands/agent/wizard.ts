@@ -90,7 +90,7 @@ function shellQuote(arg: string): string {
   return `'${arg.replaceAll("'", String.raw`'\''`)}'`;
 }
 
-/** One line of the build question: `UD-Q4_K_M (~16.6 GB) — Unsloth GGUF · 1.1 GB smaller`. */
+/** One line of the build question: `UD-Q4_K_M (~17.5 GB) — Unsloth GGUF · 1.1 GB smaller`. */
 function buildChoiceName(build: CatalogBuild): string {
   const facts = build.note === undefined ? build.source : `${build.source} · ${build.note}`;
   return `${build.id} (~${build.sizeGb} GB) — ${facts}`;

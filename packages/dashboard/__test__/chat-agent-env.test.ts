@@ -27,6 +27,7 @@ import {
   loadSessionParams,
   NO_WEB,
   isWorkGuardHook,
+  PDF_RULES,
   promptParams,
   skillBody,
   WORK_GUARD_PREFIX,
@@ -541,6 +542,18 @@ describe('session contract', () => {
     expect(
       CHAT_PROMPT_HEAD.startsWith("You are the Chat assistant of Portato. You run on a local model on the user's Mac."),
     ).toBe(true);
+  });
+
+  // Mutation: the PDF lines left out of either mode's rules → red.
+  it('both modes tell the model how a PDF reaches it, in the main rules and not in the subagent rules', () => {
+    expect(PDF_RULES.split('\n')).toEqual([
+      'PDF files. A PDF the user attaches reaches you as page images. Each PDF has a note among the attached files.',
+      '- way: message. The pages are images of that message. Read them yourself.',
+    ]);
+    expect(CHAT_PROMPT_HEAD.endsWith(`\n${PDF_RULES}`)).toBe(true);
+    const pdf = WORK_RULES.indexOf(`\n${PDF_RULES}\n`);
+    expect(pdf).toBeGreaterThan(0);
+    expect(pdf).toBeLessThan(WORK_RULES.indexOf('\nSubagents.'));
   });
 
   it('builds a clean isolated Chat environment on Windows without SHELL or leaked parent vars', () => {

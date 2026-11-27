@@ -425,6 +425,17 @@ export interface PendingInput {
   work?: boolean;
   /** What the engine does about this conversation now ({@link engineWait}); null when nothing is known. */
   engine?: EngineWait | null;
+  /** The PDF pages the turn's message carries ({@link messagePages}): the prompt read names them. */
+  pages?: number;
+}
+
+/** The PDF pages a turn's message carries in itself: the pages of each PDF that went in the message. */
+export function messagePages(turn: ThreadTurn | undefined): number {
+  const first = turn?.entries[0];
+  if (first?.kind !== 'user' || first.attachments === undefined) return 0;
+  let pages = 0;
+  for (const item of first.attachments) if (item.kind === 'pdf' && item.way === 'message') pages += item.pages;
+  return pages;
 }
 
 /**
@@ -522,6 +533,18 @@ export function pendingRow(input: PendingInput): PendingRow {
     if (engine.phase === 'queued' || engine.phase === 'slot') return queued() ?? label(CHAT.pendingQueued);
     if (engine.phase === 'prepare' || engine.phase === 'prefill') {
       const counts = readCounts(engine.phase, engine.done, engine.total);
+      // The pages are named only for the read of their own message: once the turn has worked, they are history.
+      const pages = input.work === true ? 0 : (input.pages ?? 0);
+      if (pages > 0) {
+        const one = pages === 1;
+        const n = formatCount(pages);
+        if (counts === null)
+          return label(one ? CHAT.pendingReadingPage : fill(CHAT.pendingReadingPages, { n }), 'think');
+        // `fill` keeps the `{done}` and `{total}` it is not given for `readText`.
+        const of = fill(one ? CHAT.pendingReadingPageOf : CHAT.pendingReadingPagesOf, { n });
+        const all = fill(one ? CHAT.pendingReadingPageTotal : CHAT.pendingReadingPagesTotal, { n });
+        return reading(readText(counts, of, all), counts, 'think');
+      }
       return counts === null
         ? label(CHAT.pendingReading, 'think')
         : reading(readText(counts, CHAT.pendingReadingOf, CHAT.pendingReadingTotal), counts, 'think');

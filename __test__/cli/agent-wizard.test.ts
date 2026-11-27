@@ -117,7 +117,7 @@ describe('runFirstRunWizard', () => {
       'Hy4-flash',
     ]);
     expect(question.choices.map((c) => c.name)).toEqual([
-      'Qwen3.8-27B (~17.7 GB) — Best tool use — recommended default',
+      'Qwen3.8-27B (~18.6 GB) — Best tool use — recommended default',
       'Inkling-2-Mini (~18.7 GB) — Looped MoE with vision and DFlash2 draft, 1M context',
       'Qwen3.8-Flash-Next (~111.3 GB) — 125B MoE, 512 experts streamed from SSD',
       'Hy4-flash (~168.3 GB) — 512-expert MoE streamed from SSD, 256K context',
@@ -149,8 +149,8 @@ describe('runFirstRunWizard', () => {
 
     expect(selectCalls.map((call) => call.message)).toEqual(['Model to download', 'Build of Qwen3.8-27B']);
     expect(selectCalls[1]!.choices).toEqual([
-      { name: 'UD-Q4_K_XL (~17.7 GB) — Unsloth GGUF', value: 'UD-Q4_K_XL' },
-      { name: 'UD-Q4_K_M (~16.6 GB) — Unsloth GGUF · 1.1 GB smaller', value: 'UD-Q4_K_M' },
+      { name: 'UD-Q4_K_XL (~18.6 GB) — Unsloth GGUF', value: 'UD-Q4_K_XL' },
+      { name: 'UD-Q4_K_M (~17.5 GB) — Unsloth GGUF · 1.1 GB smaller', value: 'UD-Q4_K_M' },
     ]);
     expect(folder).toBe('qwen3.8-27b-gguf');
     expect(calls).toEqual([
@@ -161,6 +161,8 @@ describe('runFirstRunWizard', () => {
         '*UD-Q4_K_XL*',
         '-g',
         'config.json',
+        '-g',
+        'mmproj-BF16.gguf',
         '--assets-repo',
         'Qwen/Qwen3.8-27B',
         '--complete',
@@ -186,6 +188,8 @@ describe('runFirstRunWizard', () => {
         '*UD-Q4_K_M*',
         '-g',
         'config.json',
+        '-g',
+        'mmproj-BF16.gguf',
         '--assets-repo',
         'Qwen/Qwen3.8-27B',
         '--complete',
@@ -288,7 +292,7 @@ describe('runFirstRunWizard', () => {
         '-m',
         'AngelSlim/Hy4-flash-GGUF',
         '-g',
-        '*Q4_K_M*',
+        'Hy4-flash-Q4_K_M-*',
         '--assets-repo',
         'tencent/Hy4-flash',
         '--complete',

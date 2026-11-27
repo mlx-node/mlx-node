@@ -137,6 +137,7 @@ import {
   globToRegex,
   type LocatedRecord,
   matchesAnyGlob,
+  missingNamedFile,
   modelsChildPath,
   modelsDirUnavailable,
   readCompletion,
@@ -365,13 +366,10 @@ function hasModelPayload(files: ListFileEntry[], selection: Selection): boolean 
 function assertModelPayload(repoName: string, files: ListFileEntry[], selection: Selection): void {
   if (selection.ggufFamily !== undefined) {
     // A glob with no `*` is the name of a file the build needs.
-    const missing = selection.globs?.find((glob) => {
-      const name = [globToRegex(glob)];
-      return (
-        !glob.includes('*') &&
-        !files.some((file) => matchesAnyGlob(basename(file.path), name) || matchesAnyGlob(file.path, name))
-      );
-    });
+    const missing = missingNamedFile(
+      selection.globs,
+      files.map((file) => file.path),
+    );
     if (missing !== undefined) throw new Error(`The Hub has no file "${missing}" for this build.`);
   }
   if (hasModelPayload(files, selection)) return;

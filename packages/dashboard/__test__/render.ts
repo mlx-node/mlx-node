@@ -91,7 +91,7 @@ export function stubError(code: ApiErrorCode, message: string, reason?: string):
 /** What a Chat host stream answers first when a test sets nothing: an engine and an agent that are ready. */
 /** A host state model that is its own base, with no size on disk. */
 export function hostModel(id: string, contextTokens: number | null): ChatHostState['models'][number] {
-  return { id, base: id, variant: 'MLX', format: 'mlx', contextTokens, sizeBytes: null, images: false };
+  return { id, base: id, variant: 'MLX', format: 'mlx', contextTokens, sizeBytes: null, images: false, family: null };
 }
 
 export const READY_CHAT_HOST: ChatHostState = {
@@ -139,6 +139,7 @@ export const READY_CHAT_HOST: ChatHostState = {
   tempRoot: null,
   tempTop: null,
   scratchRoot: '/Users/me/Portato',
+  pdfTool: { chat: false, work: false },
   appEnds: [],
 };
 

@@ -5,15 +5,20 @@
  */
 
 import {
+  type AttachmentInput,
+  attachmentView,
   CHAT_PICTURES_MAX_BASE64,
   estimateTokens,
   MESSAGE_FILES_MAX_BYTES,
+  numberedBytes,
+  pdfNotes,
+  planPdfs,
   storedPictureChars,
   type UserAttachment,
   utf8Bytes,
   WINDOW_SHARE,
 } from '../../../../src/chat/attachment-rule.js';
-import { type DraftAttachment, draftInput } from '../../lib/chat-attachments';
+import { type DraftAttachment, draftInput, draftTokens } from '../../lib/chat-attachments';
 import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatFailure, ChatFailureCode, ChatHostState, ChatMode } from '../../lib/chat-types';
 import { scratchShown } from '../../lib/paths';
@@ -280,14 +285,24 @@ export interface AttachFacts {
   mode: ChatMode;
   /** Chat and the model row has images = true. */
   seesImages: boolean;
+  /** The model row has images = true, in either mode. */
+  seesPages: boolean;
   text: string;
   files: readonly DraftAttachment[];
   /** The model's context window in tokens; null while no agent listed the model. */
   windowTokens: number | null;
+  /** The model row's family; null when the endpoint names none. */
+  family: string | null;
+  /** The conversation's context in tokens; null when not known. */
+  contextUsed: number | null;
   /** Files of this place still being read. */
   reading: number;
-  /** Stored base64 of the pictures the conversation already holds ({@link heldPictureChars}). */
+  /** Stored base64 of the pictures and pages the conversation already holds ({@link heldPictureChars}). */
   heldPictures: number;
+  /** The images the conversation already holds (`heldImages`). */
+  heldImages: number;
+  /** The PDF tool is there in this mode. */
+  pdfTool: boolean;
 }
 
 export function heldPictureChars(entries: readonly TranscriptEntry[]): number {
@@ -306,16 +321,39 @@ export function attachProblem(facts: AttachFacts): string | null {
   if (facts.reading > 0) return a.reading;
   if (facts.files.length === 0) return null;
   const pictures = facts.files.some((file) => file.kind === 'image');
+  const pdfs = facts.files.flatMap((file) => (file.kind === 'pdf' ? [file] : []));
   if (pictures && facts.mode === 'work') return a.blockedWork;
   if (pictures && !facts.seesImages) return a.blockedModel;
-  if (pictures && facts.heldPictures + storedPictureChars(facts.files) > CHAT_PICTURES_MAX_BASE64) {
+  if (pdfs.length > 0 && !facts.seesPages) return a.blockedPdfModel;
+  const others: AttachmentInput[] = [];
+  for (const file of facts.files) if (file.kind !== 'pdf') others.push(draftInput(file));
+  if (pdfs.length > 0) {
+    const plan = planPdfs({
+      text: facts.text,
+      attachments: others,
+      pdfs,
+      family: facts.family,
+      window: facts.windowTokens,
+      contextUsed: facts.contextUsed,
+      held: facts.heldImages,
+      stored: facts.heldPictures,
+      tool: facts.pdfTool,
+    });
+    if (plan.problem === 'one') return a.blockedPdfOne;
+    if (plan.problem === 'room') return a.blockedPdfRoom;
+  }
+  if (pictures && facts.heldPictures + storedPictureChars(others.map(attachmentView)) > CHAT_PICTURES_MAX_BASE64) {
     return CHAT.sendErrors['pictures-full'][0];
   }
   let bytes = utf8Bytes(facts.text);
   for (const file of facts.files) if (file.kind === 'file') bytes += file.numbered;
+  for (const note of pdfNotes(facts.files.map(draftInput))) bytes += numberedBytes(note);
   if (bytes > MESSAGE_FILES_MAX_BYTES) return a.blockedLong;
   const window = facts.windowTokens;
-  if (window !== null && estimateTokens(facts.text, facts.files.map(draftInput)) > window * WINDOW_SHARE) {
+  if (
+    window !== null &&
+    estimateTokens(facts.text, facts.files.map(draftTokens), facts.family) > window * WINDOW_SHARE
+  ) {
     return a.blockedWindow;
   }
   return null;

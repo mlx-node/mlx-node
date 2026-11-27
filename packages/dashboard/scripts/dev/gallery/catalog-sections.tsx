@@ -53,16 +53,18 @@ function build(
 const QWEN_XL = build({
   id: 'UD-Q4_K_XL',
   hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-  sizeGb: 17.7,
+  sizeGb: 18.6,
   source: 'Unsloth GGUF',
+  included: 'Vision included',
   slug: 'qwen3.8-27b-gguf',
 });
 const QWEN_M = build({
   id: 'UD-Q4_K_M',
   hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-  sizeGb: 16.6,
+  sizeGb: 17.5,
   source: 'Unsloth GGUF',
   note: '1.1 GB smaller',
+  included: 'Vision included',
   slug: 'qwen3.8-27b-gguf-ud-q4_k_m',
 });
 const DRAFT: NonNullable<CatalogItem['draft']> = {
@@ -340,7 +342,7 @@ const LOCATED_SHARED = { from: LMSTUDIO, mode: 'shared', filesAvailable: true } 
 const LOCATED_LINKED = { from: EXTERNAL, mode: 'linked', filesAvailable: true } as const;
 const LOCATED_AWAY = { from: EXTERNAL, mode: 'linked', filesAvailable: false } as const;
 
-const QWEN_M_RUNNING = running(16.6 * 1e9, 7.4 * 1e9, 84 * MB);
+const QWEN_M_RUNNING = running(17.5 * 1e9, 7.4 * 1e9, 84 * MB);
 const FLASH_NEXT_RUNNING = running(111.3 * 1e9, 13.4 * 1e9, 48.2 * MB, {
   fileCount: 4,
   seconds: 12,
@@ -396,9 +398,9 @@ const CASES: readonly Case[] = [
         type: 'progress',
         id: 'gallery',
         file: 'Qwen3.8-27B-UD-Q4_K_M.gguf',
-        receivedBytes: 16.6e9,
-        jobReceivedBytes: 16.6e9,
-        totalBytes: 16.6e9,
+        receivedBytes: 17.5e9,
+        jobReceivedBytes: 17.5e9,
+        totalBytes: 17.5e9,
         fileIndex: 0,
         fileCount: 1,
       },

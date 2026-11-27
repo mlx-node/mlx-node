@@ -77,6 +77,8 @@ describe('runFirstRunWizard', () => {
         '*UD-Q4_K_XL*',
         '-g',
         'config.json',
+        '-g',
+        'mmproj-BF16.gguf',
         '--assets-repo',
         'Qwen/Qwen3.8-27B',
         '--complete',

@@ -121,7 +121,7 @@ function entryMatches(entry: TranscriptEntry, needle: string): boolean {
   const has = (value: string | undefined): boolean => value !== undefined && value.toLowerCase().includes(needle);
   switch (entry.kind) {
     case 'user':
-      return has(entry.text) || (entry.attachments?.some((item) => item.kind === 'file' && has(item.name)) ?? false);
+      return has(entry.text) || (entry.attachments?.some((item) => item.kind !== 'image' && has(item.name)) ?? false);
     case 'assistant':
     case 'thinking':
       return has(entry.text);

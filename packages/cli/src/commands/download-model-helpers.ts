@@ -4,7 +4,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 import type { ListFileEntry } from '@huggingface/hub';
 import { MODEL_FAMILY_DATA, type ModelFamilyData } from '@mlx-node/lm/family-data';
 import { readGgufArchitecture } from '@mlx-node/lm/model-detection';
-import { isGgufCompanionName, parseGgufFileName } from '@mlx-node/lm/model-discovery';
+import {
+  ggufSplitPart,
+  isGgufCompanionName,
+  isGgufProjectorName,
+  parseGgufFileName,
+  pickGgufProjector,
+} from '@mlx-node/lm/model-discovery';
 import { ttsComponents } from '@mlx-node/tts/catalog';
 
 /** Attempts per file before a download gives up. */
@@ -118,6 +124,87 @@ export function globToRegex(pattern: string): RegExp {
 /** Check if a filename matches any of the glob patterns */
 export function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
   return patterns.some((re) => re.test(filename));
+}
+
+export interface GgufProjectorPlan {
+  /** Repo paths the selection gains, each with the weight it serves. */
+  readonly add: readonly { readonly path: string; readonly weight: string }[];
+  /**
+   * Weights whose loader takes a projector and get none, with the names tied at the best precision, and the projector
+   * names in the folder when none of them names a precision the loader ranks.
+   */
+  readonly without: readonly {
+    readonly weight: string;
+    readonly tied: readonly string[];
+    readonly unranked: readonly string[];
+  }[];
+}
+
+/**
+ * The vision projector each GGUF target's loader pairs from its own repo folder ({@link pickGgufProjector}), added to
+ * the selection unless the selection already holds a projector in that folder. `architectures[i]` is the header
+ * architecture of `targets[i]`.
+ */
+export function planGgufProjectors(
+  targets: readonly (readonly string[])[],
+  architectures: readonly string[],
+  repoPaths: readonly string[],
+  selectedPaths: readonly string[],
+): GgufProjectorPlan {
+  const add: { path: string; weight: string }[] = [];
+  const without: { weight: string; tied: readonly string[]; unranked: readonly string[] }[] = [];
+  const taken = new Set<string>();
+  for (const [index, target] of targets.entries()) {
+    const weight = target[0];
+    const folder = dirname(weight);
+    const inFolder = (path: string): boolean => dirname(path) === folder;
+    if (selectedPaths.some((path) => inFolder(path) && isGgufProjectorName(basename(path)))) continue;
+    const siblings = repoPaths.filter(inFolder);
+    const choice = pickGgufProjector(
+      architectures[index],
+      basename(weight),
+      siblings.map((path) => basename(path)),
+    );
+    if (choice === undefined) continue;
+    const path = siblings.find((sibling) => basename(sibling) === choice.name);
+    if (path === undefined) {
+      const unranked =
+        choice.tied.length > 0
+          ? []
+          : siblings.map((sibling) => basename(sibling)).filter((name) => isGgufProjectorName(name));
+      without.push({ weight, tied: choice.tied, unranked });
+    } else if (!taken.has(path)) {
+      taken.add(path);
+      add.push({ path, weight });
+    }
+  }
+  return { add, without };
+}
+
+/**
+ * Whether a glob run over a folder that holds every glob-matched file still lacks a vision projector the run would add
+ * ({@link planGgufProjectors}), judged by the header architecture of each selected weight already on disk. A weight
+ * whose header cannot be read asks for none: its load fails before any projector.
+ */
+export async function globSetLacksProjector(
+  outputDir: string,
+  localFiles: readonly string[],
+  remotePaths: readonly string[],
+  globPatterns: readonly string[],
+): Promise<boolean> {
+  const globs = globPatterns.map(globToRegex);
+  const selected = remotePaths.filter((path) => matchesAnyGlob(basename(path), globs) || matchesAnyGlob(path, globs));
+  const local = new Set(localFiles);
+  for (const weight of selected) {
+    const name = basename(weight);
+    if (!name.toLowerCase().endsWith('.gguf') || isGgufCompanionName(name)) continue;
+    if ((ggufSplitPart(name)?.part ?? 1) !== 1) continue;
+    const architecture = await readGgufArchitecture(join(outputDir, weight)).catch(() => undefined);
+    if (architecture === undefined) continue;
+    const { add } = planGgufProjectors([[weight]], [architecture], remotePaths, selected);
+    if (add.some(({ path }) => !local.has(basename(path)))) return true;
+  }
+  return false;
 }
 
 /** Root-default selection plus nested files already claimed by a prior marker. */

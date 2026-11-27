@@ -45,6 +45,12 @@
   object-fit: cover;
 }
 
+/* A PDF page is white in both themes: its edge keeps it apart from the chip on the light theme. */
+.thumb[data-page] {
+  box-sizing: border-box;
+  border: 1px solid var(--border-subtle);
+}
+
 .icon {
   flex: none;
   color: var(--text-secondary);
@@ -84,6 +90,11 @@
 
 .caption[data-tone='warning'] {
   color: var(--warning);
+}
+
+.progress {
+  width: 100%;
+  min-width: 0;
 }
 
 .note {

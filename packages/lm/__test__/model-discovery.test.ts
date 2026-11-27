@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -838,6 +840,66 @@ describe('discoverLocalChatModels', () => {
     ]);
   });
 
+  const inkling2Projector = (): Buffer => minimalGguf('clip', { 'clip.vision.projector_type': 'inkling2v' });
+
+  /** The `supportsImages` of the one Inkling-2-Mini-UD-Q4_K_M row in a folder holding `projectors`. */
+  const inkling2Images = async (name: string, projectors: Record<string, Buffer>): Promise<boolean> => {
+    const dir = join(tmp, name);
+    const repo = join(dir, 'inkling-2-mini-gguf');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, 'Inkling-2-Mini-UD-Q4_K_M.gguf'), minimalGguf('inkling2'));
+    for (const [file, bytes] of Object.entries(projectors)) writeFileSync(join(repo, file), bytes);
+    const rows = await discoverLocalChatModels(dir);
+    expect(rows).toEqual([expect.objectContaining({ name: 'Inkling-2-Mini-UD-Q4_K_M', modelType: 'inkling2' })]);
+    return rows[0].supportsImages;
+  };
+
+  it('lists an Inkling2 GGUF with a sibling inkling2v mmproj as taking images', async () => {
+    expect(await inkling2Images('inkling2-gguf-images', { 'mmproj-BF16.gguf': inkling2Projector() })).toBe(true);
+    expect(await inkling2Images('inkling2-gguf-unranked', { 'mmproj-model.gguf': inkling2Projector() })).toBe(true);
+  });
+
+  it('lists an Inkling2 GGUF beside only another family projector as text-only', async () => {
+    const qwen = minimalGguf('clip', { 'clip.projector_type': 'qwen3vl_merger' });
+    expect(await inkling2Images('inkling2-gguf-foreign-mmproj', { 'mmproj-BF16.gguf': qwen })).toBe(false);
+    expect(
+      await inkling2Images('inkling2-gguf-foreign-and-own', {
+        'mmproj-BF16.gguf': qwen,
+        'mmproj-Inkling-2-Mini-F16.gguf': inkling2Projector(),
+      }),
+    ).toBe(true);
+  });
+
+  it('lists an Inkling2 GGUF beside two inkling2v projectors of one precision as text-only, unless one is named for it', async () => {
+    const tie = { 'mmproj-BF16.gguf': inkling2Projector(), 'mmproj-Inkling-2-Mini-BF16.gguf': inkling2Projector() };
+    expect(await inkling2Images('inkling2-gguf-tie', tie)).toBe(false);
+    expect(
+      await inkling2Images('inkling2-gguf-tie-exact', {
+        ...tie,
+        'mmproj-Inkling-2-Mini-UD-Q4_K_M.gguf': inkling2Projector(),
+      }),
+    ).toBe(true);
+  });
+
+  it('lists an Inkling2 GGUF without a sibling mmproj as text-only even when config.json declares vision', async () => {
+    const dir = join(tmp, 'inkling2-gguf-no-mmproj');
+    const repo = join(dir, 'inkling-2-mini-gguf');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, 'Inkling-2-Mini-UD-Q4_K_M.gguf'), minimalGguf('inkling2'));
+    writeFileSync(
+      join(repo, 'config.json'),
+      JSON.stringify({
+        model_type: 'inkling2_loop',
+        text_config: { model_type: 'inkling2_loop_text', model_max_length: 1048576 },
+        vision_config: { model_type: 'inkling2_vision', hidden_size: 1024 },
+      }),
+    );
+
+    await expect(discoverLocalChatModels(dir)).resolves.toEqual([
+      expect.objectContaining({ name: 'Inkling-2-Mini-UD-Q4_K_M', modelType: 'inkling2', supportsImages: false }),
+    ]);
+  });
+
   it('discovers the real ~/.mlx-node/models/inkling-2-mini-gguf checkpoint as inkling2 when present', async () => {
     const modelsRoot = join(homedir(), '.mlx-node', 'models');
     const repo = join(modelsRoot, 'inkling-2-mini-gguf');
@@ -856,6 +918,7 @@ describe('discoverLocalChatModels', () => {
           modelType: 'inkling2',
           contextWindow: 1048576,
           format: 'gguf',
+          supportsImages: existsSync(join(repo, 'mmproj-BF16.gguf')),
         }),
       ]),
     );

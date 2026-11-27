@@ -87,8 +87,8 @@ describe('AttachmentStrip', () => {
   });
 
   it('the note is a status line, also with no chips; nothing at all with neither', () => {
-    const container = strip({ items: [], note: fill(CHAT.attach.errors.pdf, { name: 'a.pdf' }) });
-    expect(byRole(container, 'status')?.textContent).toBe(fill(CHAT.attach.errors.pdf, { name: 'a.pdf' }));
+    const container = strip({ items: [], note: fill(CHAT.attach.errors.pdfLocked, { name: 'a.pdf' }) });
+    expect(byRole(container, 'status')?.textContent).toBe(fill(CHAT.attach.errors.pdfLocked, { name: 'a.pdf' }));
     expect(byRole(container, 'list')).toBeNull();
     rerender(createElement(AttachmentStrip, { items: [] }));
     expect(container.innerHTML).toBe('');

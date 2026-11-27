@@ -137,7 +137,7 @@ function Files({ item }: { item: QueuedMessage }): ReactElement | null {
     <span className={styles.files}>
       {item.files.map((file, i) => {
         const Icon = file.kind === 'image' ? ImageIcon : FileText;
-        const name = file.kind === 'file' ? file.name : CHAT.attach.image;
+        const name = file.kind === 'image' ? CHAT.attach.image : file.name;
         return (
           <span key={i} className={styles.file}>
             <Icon size={12} strokeWidth={1.75} aria-hidden="true" />

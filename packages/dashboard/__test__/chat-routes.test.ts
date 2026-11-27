@@ -17,7 +17,7 @@ import type { ApiResponse } from '../src/api/errors.js';
 import { ROUTES } from '../src/api/routes.js';
 import { isRuleId } from '../src/chat/agent/never-rules.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import type { AttachmentInput } from '../src/chat/attachment-rule.js';
+import { numberedBytes, pdfNote, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import { applyOp } from '../src/chat/conversation.js';
 import { MemorySecretStore } from '../src/chat/providers/secrets.js';
 import { REDACTED } from '../src/chat/redact.js';
@@ -1156,6 +1156,78 @@ describe('the attachment input', () => {
     }
     expect(reasonOf(() => create('a.txt'))).toBe('E_BAD_REQUEST');
     expect(reasonOf(() => prompt({ 0: file('a') }))).toBe('E_BAD_REQUEST');
+  });
+
+  describe('PDF pages', () => {
+    const JPEG_HEAD = [0xff, 0xd8, 0xff, 0xe0];
+    const jpeg = (bytes: number): string => {
+      const data = new Uint8Array(bytes);
+      data.set(JPEG_HEAD);
+      return Buffer.from(data).toString('base64');
+    };
+    const pdf = (pages: number, bytes = 64, name = 'a.pdf') => ({
+      kind: 'pdf',
+      name,
+      images: Array.from({ length: pages }, () => jpeg(bytes)),
+    });
+    const both = (items: unknown[], text?: string) => [
+      reasonOf(() => create(items, text)),
+      reasonOf(() => prompt(items, text)),
+    ];
+
+    it('takes a PDF as JPEG pages on both routes, the name cleaned to its base, up to the page and message limits', () => {
+      const items = [pdf(2, 64, '../docs/a#1.pdf')];
+      const expected = [{ kind: 'pdf', name: 'a_1.pdf', images: [jpeg(64), jpeg(64)] }];
+      expect(create(items)).toEqual({ mode: 'chat', text: 'look', attachments: expected });
+      expect(prompt(items)).toEqual({ text: 'look', attachments: expected });
+      expect(both([pdf(20)])).toEqual(['ok', 'ok']);
+      expect(both([pdf(12), pdf(8)])).toEqual(['ok', 'ok']);
+      expect(both([pdf(1, 589_824)])).toEqual(['ok', 'ok']);
+      const pictures = [image(png(1_000_000)), image(png(1_000_000)), image(png(1_000_000))];
+      expect(both([...pictures, pdf(2, 589_824)])).toEqual(['ok', 'ok']);
+      expect(both([file('hello\nPortato PDF note 1\n')])).toEqual(['ok', 'ok']);
+    });
+
+    it('counts each note in the bytes the message text and its files may fill', () => {
+      const note = numberedBytes(pdfNote({ name: 'a.pdf', pages: 1, way: 'message', from: 1 }));
+      const files = [numbered(20_000), numbered(20_000), numbered(20_000)];
+      const room = 90_000 - 60_000 - note;
+      expect(both([...files, pdf(1)], 'y'.repeat(room))).toEqual(['ok', 'ok']);
+      expect(both([...files, pdf(1)], 'y'.repeat(room + 1))).toEqual(['attachment-refused', 'attachment-refused']);
+    });
+
+    // Mutations: the JPEG first-bytes check of a page dropped; a page that is not padded base64 without whitespace
+    // taken; a text file that starts with the note's line taken → red.
+    it('refuses a PDF past a limit, and a text file that starts like a note, as attachment-refused', () => {
+      const cases: Array<[string, unknown[]]> = [
+        ['an unknown key', [{ ...pdf(1), pages: 1 }]],
+        ['a stage the host does not hold', [{ kind: 'pdf', name: 'a.pdf', stage: 's1', pages: 3 }]],
+        ['no images', [{ kind: 'pdf', name: 'a.pdf' }]],
+        ['images not a list', [{ kind: 'pdf', name: 'a.pdf', images: jpeg(64) }]],
+        ['no pages', [pdf(0)]],
+        ['21 images', [pdf(21)]],
+        ['21 pages in two PDFs', [pdf(12), pdf(9)]],
+        ['a PNG page', [{ kind: 'pdf', name: 'a.pdf', images: [jpeg(64), png(64)] }]],
+        ['a page that is not text', [{ kind: 'pdf', name: 'a.pdf', images: [7] }]],
+        ['a page that is not base64', [{ kind: 'pdf', name: 'a.pdf', images: ['/9j/4AA!'] }]],
+        ['a 589,825-byte page', [pdf(1, 589_825)]],
+        ['a page over the base64 length', [{ kind: 'pdf', name: 'a.pdf', images: [`${jpeg(589_824)}AAAA`] }]],
+        ['a page with whitespace', [{ kind: 'pdf', name: 'a.pdf', images: [jpeg(64) + ' '.repeat(1000)] }]],
+        ['an unpadded page', [{ kind: 'pdf', name: 'a.pdf', images: [jpeg(64).replaceAll('=', '')] }]],
+        ['an empty name', [pdf(1, 64, '')]],
+        ['a name of 256 characters', [pdf(1, 64, 'n'.repeat(256))]],
+        [
+          'over 6 MiB of pictures and pages',
+          [image(png(1_000_000)), image(png(1_000_000)), image(png(1_000_000)), pdf(4, 589_824)],
+        ],
+        ['a text file that starts with the note line', [file('Portato PDF note 1\nname: a.pdf\n')]],
+        ['the same with CRLF', [file('Portato PDF note 1\r\nname: a.pdf\r\n')]],
+        ['the note line alone', [file('Portato PDF note 1')]],
+      ];
+      for (const [name, items] of cases) {
+        expect([name, ...both(items)]).toEqual([name, 'attachment-refused', 'attachment-refused']);
+      }
+    });
   });
 
   it('accepts wrapped, unpadded, and URL-safe base64 images on both routes', () => {

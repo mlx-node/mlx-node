@@ -3185,8 +3185,8 @@ export class AgentHost {
     if (!('process' in ready)) return ready;
     if (turn.recorded !== null) return unsent({ outcome: causeOutcome(turn.recorded) });
     const running = ready;
-    // An agent that does not take embedded resources would drop the file text.
-    if (running.embeddedContext !== true && attachments.some((a) => a.kind === 'file')) {
+    // An agent that does not take embedded resources would drop the file text and the PDF notes.
+    if (running.embeddedContext !== true && attachments.some((a) => a.kind === 'file' || a.kind === 'pdf')) {
       return unsent({ failure: 'agent-incompatible' });
     }
     if (this.mode === 'chat') {

@@ -124,7 +124,28 @@ of every selected target GGUF (a few 8 MiB reads per part) and runs the same
 header check a load runs (Splash `gguf_target` + `model-check`): the file and
 split rules, and for qwen35 / qwen35moe (Qwen3.5 / 3.6 / 3.8) the import plan. A refusal names the
 target and downloads nothing. A split GGUF is one target, so a selection must
-hold every part of it. With `--assets-repo`:
+hold every part of it.
+
+A selected GGUF weight whose loader takes a vision projector (header
+architecture `qwen35` for Qwen3.5 / 3.6 / 3.8 dense and Clairic, `gemma4`,
+`inkling2`) also brings the one `mmproj-*.gguf` in its own repo folder that the
+loader pairs with it. Gemma 4 and Inkling 2 take `mmproj-<weight file name>`
+first; otherwise the name's precision ranks it: BF16, F16, F32 for `qwen35` and
+`gemma4`, BF16, F32, F16, Q8 for `inkling2`. Beside a `qwen35` or `gemma4` weight
+a name with none of these is never taken (a Q8_0 projector fails that load); beside
+an `inkling2` weight it ranks last, as its loader ranks it. Nothing is added
+when the globs already select a projector in that folder. The plan lists it as
+`vision projector for <weight>`. A repo with none prints `No vision projector
+beside <weight> in <repo>: it loads text-only.`; projectors that name no ranked
+precision print `No vision projector beside <weight> names a precision its loader
+takes (<names>): it loads text-only.`; two at the best precision print
+`No single vision projector to take beside <weight> (<names>). Name one with -g.`
+Other architectures (`qwen35moe`, `qwen4exp`, `hy_v4_flash`, `clef`,
+`muse-glimmer`, `deepseek41`) get none. The projector is never a weight, so a
+selection of only a projector still writes no marker. To add the projector to
+an install that lacks it, run the same command again: present weights are
+skipped, and a glob run whose matched files are all on disk still fetches the
+projector when the header of a weight there says its loader takes one. With `--assets-repo`:
 
 ```bash
 mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \
@@ -987,13 +1008,13 @@ Each build installs to its own folder under the models directory. The catalog (`
 
 | Model                 | Build      | HuggingFace repo                  | Folder                          | Size      | Globs (`-g`)                                                              |
 | --------------------- | ---------- | --------------------------------- | ------------------------------- | --------- | ------------------------------------------------------------------------- |
-| Qwen3.8-27B (default) | UD-Q4_K_XL | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf`              | ~17.7 GB  | `*UD-Q4_K_XL*`, `config.json`                                             |
-| Qwen3.8-27B           | UD-Q4_K_M  | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf-ud-q4_k_m`    | ~16.6 GB  | `*UD-Q4_K_M*`, `config.json`                                              |
+| Qwen3.8-27B (default) | UD-Q4_K_XL | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf`              | ~18.6 GB  | `*UD-Q4_K_XL*`, `config.json`, `mmproj-BF16.gguf`                         |
+| Qwen3.8-27B           | UD-Q4_K_M  | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf-ud-q4_k_m`    | ~17.5 GB  | `*UD-Q4_K_M*`, `config.json`, `mmproj-BF16.gguf`                          |
 | Inkling-2-Mini        | UD-Q4_K_XL | `unsloth/Inkling-2-Mini-GGUF`     | `inkling-2-mini-gguf`           | ~18.7 GB  | `*UD-Q4_K_XL.gguf`, `mmproj-BF16.gguf`, `dspark-Inkling-2-Mini-Q8_0.gguf` |
 | Inkling-2-Mini        | UD-Q4_K_M  | `unsloth/Inkling-2-Mini-GGUF`     | `inkling-2-mini-gguf-ud-q4_k_m` | ~17.7 GB  | `*UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `dspark-Inkling-2-Mini-Q8_0.gguf`  |
 | Inkling-2-Mini        | Original   | `thinkingmachines/Inkling-2-Mini` | `inkling-2-mini`                | ~20.2 GB  | none (default filter)                                                     |
 | Qwen3.8-Flash-Next    | UD-Q4_K_XL | `unsloth/Qwen3.8-Flash-Next-GGUF` | `qwen3.8-flash-next-gguf`       | ~111.3 GB | `*UD-Q4_K_XL*`                                                            |
-| Hy4-flash             | Q4_K_M     | `AngelSlim/Hy4-flash-GGUF`        | `hy4-flash-gguf`                | ~168.3 GB | `*Q4_K_M*`                                                                |
+| Hy4-flash             | Q4_K_M     | `AngelSlim/Hy4-flash-GGUF`        | `hy4-flash-gguf`                | ~168.3 GB | `Hy4-flash-Q4_K_M-*`                                                      |
 
 For each build the wizard runs `mlx download model -m <repo>`, one `-g` per glob,
 `--assets-repo <repo>` when the build has one, `--complete`, and
@@ -1003,7 +1024,9 @@ builds), `Qwen/Qwen3.8-Flash-Next` and `tencent/Hy4-flash`, so the tokenizer
 sidecars land in the model folder.
 
 The Qwen3.8-27B repo has no plain `Q4_K_M` file; `*UD-Q4_K_M*` takes only
-`Qwen3.8-27B-UD-Q4_K_M.gguf`. The Inkling-2-Mini weight globs end in `.gguf`,
+`Qwen3.8-27B-UD-Q4_K_M.gguf`. Both Qwen3.8-27B builds take `mmproj-BF16.gguf`,
+the vision tower the loader pairs from the model folder (without it the model
+is text-only). The Inkling-2-Mini weight globs end in `.gguf`,
 because `*UD-Q4_K_XL*` also matches
 `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB copy
 (the same holds for UD-Q4_K_M); both GGUF builds also take `mmproj-BF16.gguf`
@@ -1012,7 +1035,10 @@ folder. Inkling-2-Mini Original is the safetensors release (experts NVFP4 and
 MXFP8, the rest BF16, its DSpark draft in `mtp.safetensors`): no glob, so the
 downloader's default filter applies, and no assets repo, because the repo has
 its own `tokenizer.json`. Qwen3.8-Flash-Next's four shards keep their repo
-folder and land in `<folder>/UD-Q4_K_XL/`; its GGUF load is text-only.
+folder and land in `<folder>/UD-Q4_K_XL/`; its GGUF load is text-only. The
+Hy4-flash glob names its two shards: `*Q4_K_M*` would also take the two
+`Q4_K_M_MTP_Q8_0*` split sets, 306 GB of other builds. Hy4-flash is text-only,
+so neither takes the repo's mmproj.
 Qwen3.8-Flash-Next and Hy4-flash are offered only on a machine with at least
 96 GiB of RAM. The same repo serves every platform: no build sets a CUDA repo.
 

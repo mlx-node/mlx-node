@@ -49,6 +49,8 @@ export interface MeterProps {
   unknownLabel?: string;
   /** The measured quantity is still moving (a prefill in progress): the fill carries the `shine` loop. */
   busy?: boolean;
+  /** `progress`: a task's steps done of its steps, a `progressbar` whose value is `value` of `max`. Default `meter`. */
+  kind?: 'meter' | 'progress';
   className?: string;
 }
 
@@ -193,6 +195,7 @@ export function Meter(props: MeterProps): ReactElement {
   const ratio = known ? (props.value ?? 0) / (props.max ?? 1) : null;
   const pct = ratio === null ? 0 : percentInt(ratio);
   const tone = ratio === null ? 'accent' : toneOf(ratio, props.warnAt ?? 0.8, props.dangerAt ?? 0.95);
+  const progress = props.kind === 'progress';
   const valueText =
     ratio === null
       ? (props.unknownLabel ?? 'unknown')
@@ -203,11 +206,11 @@ export function Meter(props: MeterProps): ReactElement {
     <div ref={ref} className={cn(styles.meterRoot, props.className)} data-entrance={entrance}>
       <div
         className={styles.meter}
-        role="meter"
+        role={progress ? 'progressbar' : 'meter'}
         aria-label={props.label}
         aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={pct}
+        aria-valuemax={progress && known ? (props.max ?? 0) : 100}
+        aria-valuenow={progress && known ? (props.value ?? 0) : pct}
         aria-valuetext={valueText}
         data-size={props.size ?? 'thin'}
         data-tone={tone}

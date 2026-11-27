@@ -1,6 +1,7 @@
 import { totalmem } from 'node:os';
 
 import { familyDataFor } from '@mlx-node/lm/family-data';
+import { isGgufCompanionName, isGgufProjectorName, pickGgufProjector } from '@mlx-node/lm/model-discovery';
 import { ggufNames, ggufVariant } from '@mlx-node/lm/model-variant';
 import { describe, expect, it } from 'vite-plus/test';
 
@@ -276,25 +277,36 @@ const FLASH_NEXT_REPO_FILES: RepoFiles = [
   ['mtp-Qwen3.8-Flash-Next-Q8_0.gguf', 4137429120],
 ];
 
-/** `AngelSlim/Hy4-flash-GGUF` files on Hugging Face (2026-11-19, main ecd803c859a3). */
+/** `AngelSlim/Hy4-flash-GGUF` files on Hugging Face (2026-11-27, main c50d4dd30be4). */
 const HY4_REPO_FILES: RepoFiles = [
-  ['.gitattributes', 2753],
+  ['.gitattributes', 3228],
   ['Hy4-flash-IQ2_AH-00001-of-00002.gguf', 71635656768],
   ['Hy4-flash-IQ2_AH-00002-of-00002.gguf', 63360616128],
   ['Hy4-flash-Q3_K-00001-of-00002.gguf', 92010389504],
   ['Hy4-flash-Q3_K-00002-of-00002.gguf', 63360616128],
   ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 104986517504],
   ['Hy4-flash-Q4_K_M-00002-of-00002.gguf', 63360616128],
+  ['Hy4-flash-Q4_K_M_MTP_Q8_0-00001-of-00002.gguf', 101480367104],
+  ['Hy4-flash-Q4_K_M_MTP_Q8_0-00002-of-00002.gguf', 63360616128],
+  ['Hy4-flash-Q4_K_M_MTP_Q8_0_Prune25-00001-of-00002.gguf', 78078488544],
+  ['Hy4-flash-Q4_K_M_MTP_Q8_0_Prune25-00002-of-00002.gguf', 63360616128],
   ['Hy4-flash-SPARK-4Bit-Fast.gguf', 159611554144],
   ['Hy4-flash-SPARK-4Bit.gguf', 162509777248],
   ['LICENSE', 13942],
-  ['README.md', 4868],
-  ['README_CN.md', 4612],
-  ['README_MAC-Metal.md', 10447],
-  ['README_SPARK-4Bit.md', 13234],
+  ['README.md', 7331],
+  ['README_CN.md', 7071],
+  ['README_MAC-Metal.md', 13421],
+  ['README_MAC-Metal.zh-CN.md', 6142],
+  ['README_SPARK-4Bit.md', 15667],
+  ['README_strata.md', 9126],
+  ['README_strata.zh-CN.md', 10397],
+  ['README_strata_MAC-Metal.md', 6579],
+  ['angelslim-hy4flash-edge-light.gif', 8441732],
+  ['hy4-flash-gguf-benchmark.png', 345363],
+  ['hy4-flash_dfly_Q8_0.gguf', 903685664],
   ['mmproj-Hy4-flash-bf16.gguf', 1044397440],
-  ['patch/hy4-flash-mac-minimal.patch', 303694],
-  ['patch/hy4-flash-spark.patch', 315266],
+  ['patch/hy4-flash-mac-minimal.patch', 626090],
+  ['patch/hy4-flash-spark.patch', 1419366],
 ];
 
 /** `ggml-org/Clef-Flash-GGUF` files on Hugging Face (2026-11-12, main c3d92545). */
@@ -424,8 +436,8 @@ describe('builds', () => {
       [
         'Qwen3.8-27B',
         [
-          ['UD-Q4_K_XL', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 17.7, 'Unsloth GGUF'],
-          ['UD-Q4_K_M', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 16.6, 'Unsloth GGUF'],
+          ['UD-Q4_K_XL', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 18.6, 'Unsloth GGUF'],
+          ['UD-Q4_K_M', 'unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B', 17.5, 'Unsloth GGUF'],
         ],
       ],
       [
@@ -495,8 +507,8 @@ describe('builds', () => {
 describe('the files each build installs', () => {
   it('selects the real files of every published build, and its size is their byte sum', () => {
     const expected: ReadonlyArray<readonly [string, string, readonly string[], number]> = [
-      ['Qwen3.8-27B', 'UD-Q4_K_XL', ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'config.json'], 17_659_411_024],
-      ['Qwen3.8-27B', 'UD-Q4_K_M', ['Qwen3.8-27B-UD-Q4_K_M.gguf', 'config.json'], 16_564_263_504],
+      ['Qwen3.8-27B', 'UD-Q4_K_XL', ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'config.json', 'mmproj-BF16.gguf'], 18_590_557_456],
+      ['Qwen3.8-27B', 'UD-Q4_K_M', ['Qwen3.8-27B-UD-Q4_K_M.gguf', 'config.json', 'mmproj-BF16.gguf'], 17_495_409_936],
       [
         'Inkling-2-Mini',
         'UD-Q4_K_XL',
@@ -583,7 +595,9 @@ describe('the files each build installs', () => {
 
   it('the Qwen UD-Q4_K_M glob takes one weight and not the XL file', () => {
     const selected = selectedFiles(buildOf('Qwen3.8-27B', 'UD-Q4_K_M'), QWEN_REPO_FILES);
-    expect(selected.filter((path) => path.endsWith('.gguf'))).toEqual(['Qwen3.8-27B-UD-Q4_K_M.gguf']);
+    expect(selected.filter((path) => path.endsWith('.gguf') && !isGgufCompanionName(path))).toEqual([
+      'Qwen3.8-27B-UD-Q4_K_M.gguf',
+    ]);
     expect(selected).not.toContain('Qwen3.8-27B-UD-Q4_K_XL.gguf');
   });
 
@@ -594,6 +608,33 @@ describe('the files each build installs', () => {
     expect(selected).toHaveLength(3);
     expect(selected).not.toContain('Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file');
     expect(selected).not.toContain('Inkling-2-Mini-UD-Q4_K_XL.gguf');
+  });
+
+  it('a GGUF build takes the one projector its loader pairs, and a build whose loader takes none takes none', () => {
+    const projectorFamilies: string[] = [];
+    for (const { entry, build } of ALL_BUILDS) {
+      const listing = REPO_FILES.get(build.hfRepo);
+      if (listing === undefined || entry.ggufFamily === undefined || build.globs === undefined) continue;
+      const architecture = familyDataFor(entry.ggufFamily)?.ggufArchitectures?.[0];
+      expect(architecture, entry.label).toBeDefined();
+      const selected = selectedFiles(build, listing);
+      const weight = selected.find((path) => path.endsWith('.gguf') && !isGgufCompanionName(path.split('/').pop()!))!;
+      const folder = weight.includes('/') ? weight.slice(0, weight.lastIndexOf('/') + 1) : '';
+      const names = listing
+        .map(([path]) => path)
+        .filter((path) => path.startsWith(folder) && !path.slice(folder.length).includes('/'))
+        .map((path) => path.slice(folder.length));
+      const picked = pickGgufProjector(architecture!, weight.slice(folder.length), names)?.name;
+      if (picked !== undefined) projectorFamilies.push(`${entry.label} ${build.id}`);
+      const projectors = selected.filter((path) => isGgufProjectorName(path.split('/').pop()!));
+      expect(projectors, `${entry.label} ${build.id}`).toEqual(picked === undefined ? [] : [`${folder}${picked}`]);
+    }
+    expect(projectorFamilies).toEqual([
+      'Qwen3.8-27B UD-Q4_K_XL',
+      'Qwen3.8-27B UD-Q4_K_M',
+      'Inkling-2-Mini UD-Q4_K_XL',
+      'Inkling-2-Mini UD-Q4_K_M',
+    ]);
   });
 
   it('Inkling Original takes the default filter: no globs, no sidecar repo, and not the tiktoken file', () => {
@@ -634,7 +675,7 @@ describe('download targets', () => {
     expect(target?.kind).toBe('build');
     if (target?.kind !== 'build') return;
     expect(target.build).toBe(buildOf('Qwen3.8-27B', 'UD-Q4_K_M'));
-    expect(target.globs).toEqual(['*UD-Q4_K_M*', 'config.json']);
+    expect(target.globs).toEqual(['*UD-Q4_K_M*', 'config.json', 'mmproj-BF16.gguf']);
     expect(target.assetsRepo).toBe('Qwen/Qwen3.8-27B');
     const original = catalogTargetForSlug('inkling-2-mini', 'darwin');
     expect(original?.kind === 'build' && original.globs === undefined && original.assetsRepo === undefined).toBe(true);

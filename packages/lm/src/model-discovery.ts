@@ -14,7 +14,14 @@ import {
   type LaunchPreset,
   type ModelType,
 } from './family-data.js';
-import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGgufFileName } from './gguf-name.js';
+import {
+  isBonsaiPq2GgufName,
+  isGgufCompanionName,
+  isGgufProjectorName,
+  isQwen35XlGgufName,
+  parseGgufFileName,
+  pickGgufProjector,
+} from './gguf-name.js';
 import {
   detectModelType,
   ggufArchitectureModelType,
@@ -32,7 +39,15 @@ import {
   type ModelVariantName,
 } from './model-variant.js';
 
-export { ggufSplitPartNames, isGgufCompanionName, parseGgufFileName, type GgufFileName } from './gguf-name.js';
+export {
+  ggufSplitPartNames,
+  isGgufCompanionName,
+  isGgufProjectorName,
+  parseGgufFileName,
+  pickGgufProjector,
+  type GgufFileName,
+  type GgufProjectorChoice,
+} from './gguf-name.js';
 export type { ModelFormat } from './model-variant.js';
 
 /** Native-free inventory shared by the agent, setup UI, and inference host. */
@@ -238,6 +253,30 @@ async function hasSiblingMmprojGguf(dir: string): Promise<boolean> {
   }
 }
 
+/**
+ * Whether an Inkling2 GGUF load of `weightPath` pairs a vision projector from `dir`, by the loader's rule
+ * (`inkling2_native_mmproj`): only a readable `mmproj-*.gguf` whose header states `clip.vision.projector_type`
+ * `inkling2v` counts, and two at the best precision with no `mmproj-<weight file name>` leave the load text-only.
+ */
+async function inkling2PairsProjector(dir: string, weightPath: string): Promise<boolean> {
+  try {
+    const weightName = basename(await realpath(weightPath));
+    const projectors: string[] = [];
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (!isGgufProjectorName(entry.name) || (await resolveDirentKind(dir, entry)) !== 'file') continue;
+      try {
+        const metadata = await readGgufDiscoveryMetadata(join(dir, entry.name));
+        if (metadata.architecture === 'clip' && metadata.projectorType === 'inkling2v') projectors.push(entry.name);
+      } catch {
+        continue;
+      }
+    }
+    return pickGgufProjector('inkling2', weightName, projectors)?.name !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 async function readDiscoveryMetadata(
   modelPath: string,
   modelType: ModelType,
@@ -409,13 +448,15 @@ export async function discoverLocalChatModels(
       return;
     }
 
-    // A Qwen3.5 or Gemma4 GGUF load takes its vision tower only from a sibling mmproj, and a Qwen3.5 MoE GGUF load
-    // never takes one (native_gguf_preflight). Qwen3.5 ignores config.json; Gemma4 looks for the projector only when
-    // config.json declares a vision tower (gemma4_native_preflight).
+    // A Qwen3.5, Inkling2 or Gemma4 GGUF load takes its vision tower only from a sibling mmproj, and a Qwen3.5 MoE
+    // GGUF load never takes one (native_gguf_preflight). Qwen3.5 and Inkling2 ignore config.json; Gemma4 looks for the
+    // projector only when config.json declares a vision tower (gemma4_native_preflight).
     let supportsImages: boolean;
     if (modelType === 'clef') supportsImages = false;
     else if (format === 'gguf' && modelType === 'qwen3_5_moe') supportsImages = false;
     else if (format === 'gguf' && modelType === 'qwen3_5') supportsImages = await hasSiblingMmprojGguf(metadataRoot);
+    else if (format === 'gguf' && modelType === 'inkling2')
+      supportsImages = await inkling2PairsProjector(metadataRoot, path);
     else if (format === 'gguf' && modelType === 'gemma4')
       supportsImages = metadata.supportsImages && (await hasSiblingMmprojGguf(metadataRoot));
     else

@@ -31,8 +31,10 @@ import {
   isPathOccupied,
   type LocatedState,
   locatedState,
+  missingNamedFile,
   readCompletion,
   summarizeForeignEntry,
+  updateDropsWeight,
 } from './models.js';
 
 /** What is in the way of a blocked install: what the cleanup confirmation shows and its request echoes back. */
@@ -120,6 +122,12 @@ export interface CatalogBuildItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /**
+   * Set when {@link installed} and neither the marker nor the folder holds a file named by a glob of the build with no
+   * `*`: an install made before the catalog named that file. Only for a build of its own repository, and never when
+   * the marker or the folder holds a weight of another build, which an Update would delete.
+   */
+  lacksNamedFile?: true;
   /**
    * Set when Locate made `<slug>` from files the user already had: the folder they are in, whether the models folder
    * shares them on disk or links to them, and whether they can be reached now. A folder whose files cannot be reached
@@ -261,6 +269,15 @@ function heldByOther(
   return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
 }
 
+/** The entry names of `dir`; none when it cannot be read. */
+function namesIn(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 /** The state of one build's install folder, by the rules on {@link CatalogBuildItem}. */
 function buildWithState(
   modelsDir: string,
@@ -304,6 +321,12 @@ function buildWithState(
   // Read from the build's own folder ONLY — see `localRevision` for why a
   // provenance-matched renamed dir deliberately reports null.
   const completion = installed ? readCompletion(dir) : undefined;
+  const held = completion === undefined ? [] : [...completion.files, ...namesIn(dir)];
+  const lacksNamedFile =
+    completion !== undefined &&
+    hfRepo === build.hfRepo &&
+    missingNamedFile(build.globs, held) !== undefined &&
+    !updateDropsWeight(build.globs, held);
   const located = locatedState(dir, configless);
   return {
     id: build.id,
@@ -322,6 +345,7 @@ function buildWithState(
     localRevision: completion?.revision ?? null,
     localAssetsRepo: completion?.assetsRepo ?? null,
     localAssetsRevision: completion?.assetsRevision ?? null,
+    ...(lacksNamedFile ? { lacksNamedFile: true } : {}),
     located:
       located === null ? null : { from: located.from, mode: located.mode, filesAvailable: located.filesAvailable },
     listed: isListedFolder(dir),

@@ -1131,7 +1131,8 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         pool: null,
         stateNamespace: null,
         experts: null,
-        images: false,
+        // Null so the host reads the harness endpoint's row, which says which of these models see images.
+        images: null,
       })),
       ...(live.engineStates === true ? engineStateModels(live, now) : []),
     ],
