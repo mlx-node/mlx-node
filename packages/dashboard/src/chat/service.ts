@@ -1279,10 +1279,11 @@ export class ChatService {
     const text = readPdfCommand(pdf, sent.text, sent.name, by);
     await this.checkSlash(conversation, text);
     const cwd = await this.sendChecks(conversation, [], true);
-    // Checked in the tick that starts the turn: a run that started during the awaits counts.
+    // Checked in the tick that starts the turn: a run that started, or a move down to Ask, during the awaits counts.
     if (this.hosts.work.runs(id).some((r) => r.name === READ_PDF_WORKFLOW && (r.live || r.waiting))) {
       throw chatRouteError('conversation-busy');
     }
+    if (by === 'app' && this.modeOf(id) === 'ask') throw chatRouteError('conversation-busy');
     return { turnId: this.startTurn(conversation, text, cwd).turnId };
   }
 

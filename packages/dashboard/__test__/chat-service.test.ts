@@ -1263,9 +1263,10 @@ describe('Chat service — attachments', () => {
     }, 20_000);
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
-    // Mutations: the host start left out; the family check dropped; a start in Ask; a start in a fork; a start after the
-    // model's call of the PDF, after any call of the tool, or after a deny; the start sent as the person's; Read it now
-    // while a run of the tool goes on; Read it now during the host's start not answered with its turn → red.
+    // Mutations: the host start left out; the family check dropped; a start in Ask; a start after a move down to Ask
+    // during its checks; a start in a fork; a start after the model's call of the PDF, after any call of the tool, or
+    // after a deny; the start sent as the person's; Read it now while a run of the tool goes on; Read it now during the
+    // host's start not answered with its turn → red.
     it('Work Auto and Bypass: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
       const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
       const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
@@ -1331,6 +1332,27 @@ describe('Chat service — attachments', () => {
           await until(() => texts(auto.id).length === 2, 10_000);
           expect(texts(auto.id)).toEqual(['pdfnot', readPdfCommand(auto.pdf, 'pdfnot', 'report.pdf', 'app')]);
 
+          const facts = svc as unknown as { pdfFacts: (sessionId: string, pdf: string) => Promise<unknown> };
+          const realFacts = facts.pdfFacts.bind(svc);
+          let watched: { id: string; pdf: string } | null = null;
+          let lowered = false;
+          facts.pdfFacts = async (sessionId, pdf) => {
+            if (!lowered && watched?.id === sessionId && watched.pdf === pdf) {
+              lowered = true;
+              expect(await svc.setPermissionMode(sessionId, 'ask', false)).toEqual({ mode: 'ask' });
+            }
+            return realFacts(sessionId, pdf);
+          };
+          const movedDown = await send('pdfnot', GEMMA.name, 'bypass');
+          watched = movedDown;
+          await quiet(movedDown);
+          facts.pdfFacts = realFacts;
+          expect(lowered).toBe(true);
+          expect(texts(movedDown.id)).toEqual(['pdfnot']);
+          await svc.readPdf(movedDown.id, movedDown.pdf);
+          await until(() => texts(movedDown.id).length === 2, 10_000);
+          expect(texts(movedDown.id)).toEqual(['pdfnot', readPdfCommand(movedDown.pdf, 'pdfnot', 'report.pdf', 'you')]);
+
           const asked = await send('pdfnot', GEMMA.name, 'ask');
           await quiet(asked);
           expect(texts(asked.id)).toEqual(['pdfnot']);
@@ -1368,7 +1390,7 @@ describe('Chat service — attachments', () => {
           await answered(wrongDenied, 'reject-once');
           expect(wrongDenied.page.ends()[0]).toMatchObject({ outcome: 'denied' });
           expect(texts(wrongDenied.id)).toEqual(['pdfwrong']);
-          for (const p of [skipped, auto, asked, other, own, called, wrong, wrongDenied]) p.page.detach();
+          for (const p of [skipped, auto, movedDown, asked, other, own, called, wrong, wrongDenied]) p.page.detach();
         },
         { endpointModels: [GEMMA, INKLING] },
       );
