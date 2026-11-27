@@ -1,11 +1,11 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NapiCli } from '@napi-rs/cli';
 
-import { resolvePublishedTargets } from './publish-targets.js';
+import { listPublishedPlatformDirs, resolvePublishedTargets } from './publish-targets.js';
 
 // CI's publish job runs this in place of a bare `napi artifacts`. It is the
 // same `collectArtifacts` API the CLI calls — every guard it has (unexpected
@@ -30,21 +30,7 @@ if (!Array.isArray(manifest.napi?.targets) || !manifest.napi.targets.every((t) =
 }
 
 const npmDir = join(packageRoot, 'npm');
-const platformPackageDirs: string[] = [];
-for (const entry of await readdir(npmDir, { withFileTypes: true })) {
-  if (!entry.isDirectory()) continue;
-  try {
-    await readFile(join(npmDir, entry.name, 'package.json'), 'utf-8');
-  } catch {
-    // A from-source build on a desktop-only target (e.g. `win32-arm64-msvc`)
-    // creates `npm/<triple>/` to land its addon in (see copyNativeAddon in
-    // build.ts) without ever writing a manifest there. Only a directory with
-    // a package.json (such as `darwin-arm64` or `linux-arm64-gnu`) is a
-    // publishable platform package.
-    continue;
-  }
-  platformPackageDirs.push(entry.name);
-}
+const platformPackageDirs = listPublishedPlatformDirs(npmDir);
 
 const targets = resolvePublishedTargets({
   packageName: manifest.name,
