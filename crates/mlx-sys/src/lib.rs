@@ -5645,6 +5645,21 @@ pub const GGUF_PLANES_TEST_METALLIB: &std::ffi::CStr = match std::ffi::CStr::fro
 /// TEST-ONLY: points the planes' test kernels at
 /// [`GGUF_PLANES_TEST_METALLIB`], for every thread of this process.
 pub fn gguf_planes_use_test_library() {
+    // Match `mlx.metallib` / `paged_attn.metallib`: prefer a test metallib
+    // colocated beside the running test binary (for artifact-sharded CI runs
+    // where `OUT_DIR` does not exist), falling back to the build-time path.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let colocated = dir.join("gguf_planes_test.metallib");
+        if colocated.is_file()
+            && let Ok(cstr) = std::ffi::CString::new(colocated.as_os_str().as_encoded_bytes())
+        {
+            // SAFETY: `cstr` is a valid NUL-terminated path; the bridge copies it.
+            unsafe { mlx_test_gguf_planes_test_library(cstr.as_ptr()) };
+            return;
+        }
+    }
     // SAFETY: a NUL-terminated path; the bridge copies it.
     unsafe { mlx_test_gguf_planes_test_library(GGUF_PLANES_TEST_METALLIB.as_ptr()) }
 }

@@ -26,14 +26,14 @@ concurrency:
 
 # Job graph (PR / push):
 #
-#   lint-ts (ubuntu) ──────────────────────────────────────────┐
-#   ts-test-pure (ubuntu) ─────────────────────────────────────┤
-#   clippy  (macos) ───────────────────────────────────────────┤
-#   rust-lib (macos) ──────────────────────────────────────────┤
-#   rust-int (macos; int + other crates + all --doc) ──────────┼─▶ publish (ubuntu, main only)
-#   build (macos) ─┬─▶ ts-test (macos; darwin-ts + addon) ─────┤
-#                  └─▶ model-test ×N (macos; main / label) ────┤
-#   build-linux-arm64 (ubuntu-22.04-arm) ──────────────────────┘
+#   lint-ts (ubuntu) ──────────────────────────────────────────────────┐
+#   ts-test-pure (ubuntu) ─────────────────────────────────────────────┤
+#   clippy  (macos) ───────────────────────────────────────────────────┤
+#   rust-lib-build (macos) ─▶ rust-lib-test ×4 (macos) ────────────────┤
+#   rust-int (macos; int + other crates + all --doc) ──────────────────┼─▶ publish (ubuntu, main only)
+#   build (macos) ─┬─▶ ts-test (macos; darwin-ts + addon) ─────────────┤
+#                  └─▶ model-test ×N (macos; main / label) ────────────┤
+#   build-linux-arm64 (ubuntu-22.04-arm) ──────────────────────────────┘
 #   done (ubuntu, always) ◀── every job above; the one required status
 #
 # The Rust test legs and `ts-test-pure` do NOT wait for `build`: they need no
@@ -510,15 +510,14 @@ jobs:
         # them.
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  # mlx-core's unit tests (`--lib`, ~6.5k tests, serial under RUST_TEST_THREADS=1).
-  # Runs as a single job so `mlx-core --lib` (858k LOC) is compiled only once;
-  # its doc-tests run in `rust-int` instead, reusing the non-test `mlx-core`
-  # rlib already compiled there (saving ~6.5 min of duplicate compilation).
-  # No native addon, no model checkpoint, no Node: the only fixture any
-  # non-ignored Rust test reads is a tokenizer.json (see
-  # crates/mlx-core/tests/common/mod.rs::find_tokenizer_dir), fetched below.
-  rust-lib:
-    name: cargo test (mlx-core lib)
+  # Compile mlx-core's `--lib` unit test binary ONCE (~858k LOC), then fan out
+  # its ~6.5k serial tests (`RUST_TEST_THREADS=1`) across 4 parallel macOS
+  # runners in `rust-lib-test-1..4`. Compiling once avoids burning ~17 min of
+  # duplicate rustc work per shard while cutting the `rust-lib` critical path
+  # from ~35 min down to ~22 min (below `build + ts-test`). Its doc-tests run
+  # in `rust-int`, reusing the non-test `mlx-core` rlib already built there.
+  rust-lib-build:
+    name: cargo build (mlx-core lib tests)
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
@@ -558,48 +557,134 @@ jobs:
           echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           chmod 600 ~/.netrc
 
-      # tokenizer.json is what `find_tokenizer_dir` keys on; tokenizer_config.json
-      # carries the chat template that the synthetic MoE/MTP session test
-      # (crates/mlx-core/tests/common/mod.rs) copies next to it — without it
-      # that test fails on a missing template instead of skipping.
-      - name: Fetch Qwen3 tokenizer files
-        env:
-          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+      # Compile `--no-run` and stage the standalone test executable alongside
+      # its exact-build metallibs (`mlx.metallib`, `paged_attn.metallib`, and
+      # `gguf_planes_test.metallib`). All three resolve colocated beside the
+      # running binary via dladdr / current_exe(), so shard runners need no
+      # `target/`, `.mlx-prebuilt/`, or Rust toolchain.
+      - name: Build mlx-core --lib test binary and stage metallibs
         run: |
           set -euo pipefail
-          dir=.cache/models/qwen3-0.6b
-          mkdir -p "$dir"
-          for f in tokenizer.json tokenizer_config.json; do
-            url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
-            # Public repo; the token only lifts anonymous rate limits when set.
-            if [ -n "${HUGGINGFACE_TOKEN:-}" ]; then
-              curl -fsSL --retry 3 -H "Authorization: Bearer $HUGGINGFACE_TOKEN" -o "$dir/$f" "$url"
-            else
-              curl -fsSL --retry 3 -o "$dir/$f" "$url"
-            fi
-            test -s "$dir/$f"
-          done
+          cargo test --locked -p mlx-core --lib --no-run \
+            --message-format=json-render-diagnostics > /tmp/cargo-rust-lib.json
 
-      - name: cargo test --lib (mlx-core)
-        run: cargo test --locked -p mlx-core --lib
-        env:
-          RUST_BACKTRACE: 1
-          # This leg runs on a Metal runner, so a test that self-skips because
-          # it found no GPU has not passed — it reported a green it never
-          # earned. `metal_device_absent` withdraws the skip licence when this
-          # is set, turning that case into a failure instead.
-          #
-          # The `model-test` leg sets the same var, but only around its `--lib`
-          # filter step, which names a few tests. Every OTHER Metal-gated test in
-          # the crate runs here or in `rust-int` — including the ladder-retention
-          # pair, which became skippable when arming the ladder started requiring
-          # a paged adapter. Scoping this to the leg rather than to a name list
-          # means a test that grows a Metal dependency later is covered on the
-          # day it does, without anyone remembering to add it.
-          MLX_TEST_REQUIRE_METAL: '1'
+          bins=()
+          while IFS= read -r path; do
+            [ -n "$path" ] && bins+=("$path")
+          done < <(jq -r '
+            select(
+              .reason == "compiler-artifact"
+              and .target.name == "mlx_core"
+              and .profile.test == true
+              and .executable != null
+            ) | .executable
+          ' /tmp/cargo-rust-lib.json)
+          if [ "${#bins[@]}" -ne 1 ] || [ ! -x "${bins[0]}" ]; then
+            echo "::error::Expected exactly 1 executable mlx_core --lib test binary, found ${#bins[@]}: ${bins[*]:-<none>}"
+            exit 1
+          fi
+          bin="${bins[0]}"
+
+          sys_outs=()
+          while IFS= read -r dir; do
+            [ -n "$dir" ] && sys_outs+=("$dir")
+          done < <(jq -r '
+            select(
+              .reason == "build-script-executed"
+              and (.package_id | test("/mlx-sys[#@]"))
+            ) | .out_dir
+          ' /tmp/cargo-rust-lib.json | sort -u)
+          if [ "${#sys_outs[@]}" -ne 1 ] || [ ! -d "${sys_outs[0]}" ]; then
+            echo "::error::Expected exactly 1 mlx-sys build-script out_dir, found ${#sys_outs[@]}: ${sys_outs[*]:-<none>}"
+            exit 1
+          fi
+          sys_out="${sys_outs[0]}"
+
+          bundle="$RUNNER_TEMP/mlx-core-lib-test"
+          rm -rf "$bundle"
+          mkdir -p "$bundle"
+          cp "$bin" "$bundle/mlx_core_test"
+          cp "$sys_out/paged_attn.metallib" "$bundle/paged_attn.metallib"
+          cp "$sys_out/gguf_planes_test.metallib" "$bundle/gguf_planes_test.metallib"
+          if [ -f "$sys_out/lib/mlx.metallib" ]; then
+            cp "$sys_out/lib/mlx.metallib" "$bundle/mlx.metallib"
+          elif [ -f "$sys_out/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib" ]; then
+            cp "$sys_out/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib" "$bundle/mlx.metallib"
+          else
+            echo "::error::mlx.metallib not found under $sys_out"
+            exit 1
+          fi
+          # Record the build checkout root so `rust-lib-test` fails loudly if a
+          # shard runner ever receives a different workspace path (unit tests
+          # read checked-in fixtures via compile-time `env!("CARGO_MANIFEST_DIR")`).
+          printf '%s\n' "$GITHUB_WORKSPACE" > "$bundle/build-workspace.txt"
+
+          for f in mlx_core_test mlx.metallib paged_attn.metallib gguf_planes_test.metallib build-workspace.txt; do
+            test -s "$bundle/$f"
+          done
+          ls -lh "$bundle/"
+          rm -f /tmp/cargo-rust-lib.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-core-lib-test
+          path: ${{ runner.temp }}/mlx-core-lib-test/
+          compression-level: 1
+          # Match GitHub's 30-day failed-job rerun window so a single failed
+          # shard stays retryable without rebuilding `rust-lib-build`.
+          retention-days: 30
+          if-no-files-found: error
+
+  # Executes mlx-core's `--lib` unit tests in 4 parallel shards using the
+  # precompiled binary from `rust-lib-build` via `_rust-lib-shard.yml`.
+  # Distinct non-matrix job IDs guarantee that a cancelled or missing shard can
+  # never be hidden by GitHub's matrix result aggregator in `done` / `publish`.
+  rust-lib-test-1:
+    name: cargo test (mlx-core lib 1/4)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 1
+      shard-count: 4
+
+  rust-lib-test-2:
+    name: cargo test (mlx-core lib 2/4)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 2
+      shard-count: 4
+
+  rust-lib-test-3:
+    name: cargo test (mlx-core lib 3/4)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 3
+      shard-count: 4
+
+  rust-lib-test-4:
+    name: cargo test (mlx-core lib 4/4)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 4
+      shard-count: 4
 
   # Everything plain `cargo test` runs EXCEPT mlx-core's `--lib` (covered by
-  # `rust-lib`) and the 51 `e2e-tests`-gated real-model/bench integration
+  # `rust-lib-build` + `rust-lib-test-1..4`) and the 51 `e2e-tests`-gated real-model/bench integration
   # binaries (covered by `model-test` and clippy `--all-features`): every
   # ungated integration target across all crates, the unit tests of all other
   # crates (excluding `mlx-sys`, which has 0 unit tests), and ALL workspace
@@ -1214,7 +1299,11 @@ jobs:
       - build
       - build-linux-arm64
       - clippy
-      - rust-lib
+      - rust-lib-build
+      - rust-lib-test-1
+      - rust-lib-test-2
+      - rust-lib-test-3
+      - rust-lib-test-4
       - rust-int
       - ts-test-pure
       - ts-test
@@ -1225,7 +1314,11 @@ jobs:
           ${{ contains(needs.*.result, 'failure') ||
               contains(needs.*.result, 'cancelled') ||
               needs.build-linux-arm64.result != 'success' ||
-              needs.rust-lib.result != 'success' ||
+              needs.rust-lib-build.result != 'success' ||
+              needs.rust-lib-test-1.result != 'success' ||
+              needs.rust-lib-test-2.result != 'success' ||
+              needs.rust-lib-test-3.result != 'success' ||
+              needs.rust-lib-test-4.result != 'success' ||
               needs.ts-test-pure.result != 'success' ||
               !contains(needs.*.result, 'success') }}
 
@@ -1241,7 +1334,11 @@ jobs:
       - build-linux-arm64
       - lint-ts
       - clippy
-      - rust-lib
+      - rust-lib-build
+      - rust-lib-test-1
+      - rust-lib-test-2
+      - rust-lib-test-3
+      - rust-lib-test-4
       - rust-int
       - ts-test-pure
       - ts-test
@@ -1257,7 +1354,11 @@ jobs:
       needs.build-linux-arm64.result == 'success' &&
       needs.lint-ts.result == 'success' &&
       needs.clippy.result == 'success' &&
-      needs.rust-lib.result == 'success' &&
+      needs.rust-lib-build.result == 'success' &&
+      needs.rust-lib-test-1.result == 'success' &&
+      needs.rust-lib-test-2.result == 'success' &&
+      needs.rust-lib-test-3.result == 'success' &&
+      needs.rust-lib-test-4.result == 'success' &&
       needs.rust-int.result == 'success' &&
       needs.ts-test-pure.result == 'success' &&
       needs.ts-test.result == 'success' &&
