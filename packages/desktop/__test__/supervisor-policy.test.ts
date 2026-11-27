@@ -48,10 +48,17 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function harness(): { supervisor: Supervisor; children: FakeChild[]; events: SupervisorEvent[] } {
+function harness(): {
+  supervisor: Supervisor;
+  children: FakeChild[];
+  events: SupervisorEvent[];
+  nextSpawn: () => Promise<void>;
+} {
   const children: FakeChild[] = [];
+  const spawnWaiters: Array<() => void> = [];
   const transport: ChildTransport = (_spec, events) => {
     children.push({ events, spawnedAtMs: Date.now() });
+    for (const resolve of spawnWaiters.splice(0)) resolve();
     return {
       pid: 40_000 + children.length,
       stdout: null,
@@ -71,10 +78,10 @@ function harness(): { supervisor: Supervisor; children: FakeChild[]; events: Sup
   supervisor = created;
   const events: SupervisorEvent[] = [];
   created.on((event) => events.push(event));
-  return { supervisor: created, children, events };
+  const nextSpawn = (): Promise<void> => new Promise<void>((resolve) => spawnWaiters.push(resolve));
+  return { supervisor: created, children, events, nextSpawn };
 }
 
-/** Lets real fs I/O (the trace watcher's last scan) complete between fake ticks. */
 async function until(predicate: () => boolean, label: string): Promise<void> {
   for (let i = 0; i < 500; i += 1) {
     if (predicate()) return;
@@ -113,8 +120,17 @@ async function shortFailures(
     await serve(child);
     const exitAt = Date.now();
     const before = children.length;
+    // The verdict waits on a real fs stat (the trace watcher's last scan): no count of turns bounds it.
+    const verdict = new Promise<void>((resolve) => {
+      const off = sup.on((event) => {
+        if (event.type !== 'crashed') return;
+        off();
+        resolve();
+      });
+    });
     child.events.onExit({ code: 1, signal: null });
-    await until(() => sup.snapshot().lastExit?.atMs === exitAt, 'the exit verdict');
+    await verdict;
+    expect(sup.snapshot().lastExit?.atMs).toBe(exitAt);
     if (sup.snapshot().state === 'failed') break;
     await advanceUntil(() => children.length > before, 'the relaunch');
     gaps.push((children.at(-1)?.spawnedAtMs ?? 0) - exitAt);
@@ -201,7 +217,7 @@ describe('restart timing (Splash RestartPolicy.after, real numbers)', () => {
   });
 
   it('a user start or restart starts the count anew', async () => {
-    const { supervisor: sup, children } = harness();
+    const { supervisor: sup, children, nextSpawn } = harness();
     sup.start().catch(() => {});
     const serve = async (child: FakeChild): Promise<void> => {
       await becomeReady(sup, child);
@@ -209,8 +225,11 @@ describe('restart timing (Splash RestartPolicy.after, real numbers)', () => {
     };
 
     expect(await shortFailures(sup, children, 3, serve)).toEqual([0, 5_000, 10_000]);
+    // The relaunch waits on the exit's real fs stat too.
+    const respawned = nextSpawn();
     const restarting = sup.restart();
-    await until(() => children.length === 5, 'the restart spawn');
+    await respawned;
+    expect(children).toHaveLength(5);
     await becomeReady(sup, children[4]);
     await restarting;
     expect(sup.snapshot()).toMatchObject({ streak: 0, shortLivedFailures: 0 });
