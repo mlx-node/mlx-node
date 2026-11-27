@@ -599,8 +599,8 @@ function oldNames(text: string): string[] {
 
 const SCANNED = ['.ts', '.tsx', '.css', '.json', '.mjs'];
 const ROOTS = [SRC, join(PACKAGE, 'ui', 'src'), join(PACKAGE, 'scripts'), join(PACKAGE, '__test__')];
-const SKIP = new Set([SELF]);
-const WEB = join(PACKAGE, 'web');
+/** `pack.test.ts` names the old spellings to check the page it builds holds none of them. */
+const SKIP = new Set([SELF, join(PACKAGE, '__test__', 'pack.test.ts')]);
 
 function scan(dir: string, out: Array<[string, string[]]>): void {
   for (const name of readdirSync(dir)) {
@@ -700,22 +700,4 @@ describe('(g) the old names are gone', () => {
       expect([gone, existsSync(join(PACKAGE, gone))]).toEqual([gone, false]);
     }
   });
-
-  // `web/` is built (not in git): `pack.test.ts` builds it; on a checkout with no build there is nothing to read.
-  it.skipIf(!existsSync(join(WEB, 'index.html')))(
-    'the built page holds the new route and texts, and no old one',
-    () => {
-      const scripts = readdirSync(join(WEB, 'assets')).filter(
-        (name) => name.startsWith('index-') && name.endsWith('.js'),
-      );
-      expect(scripts.length).toBeGreaterThan(0);
-      const text = scripts.map((name) => readFileSync(join(WEB, 'assets', name), 'utf8')).join('\n');
-      expect(text).toContain('/permission-mode');
-      expect(text).toContain('Switch to Bypass in this conversation?');
-      expect(text).toContain('Allowed by bypass');
-      for (const old of ['/bypass`', "/bypass'", '/bypass"', 'Bypass permissions', 'Bypass on', 'Bypass off']) {
-        expect([old, text.includes(old)]).toEqual([old, false]);
-      }
-    },
-  );
 });

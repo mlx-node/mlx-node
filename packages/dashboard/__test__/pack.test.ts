@@ -308,6 +308,18 @@ describe('dashboard npm pack ships the SPA', () => {
  * NOT asserted: the empty-state hint builds them from the API's
  * `restoreFamilies`, so they do not appear in the bundle at all.
  */
+describe('the served bundle carries the permission mode names', () => {
+  it('holds the new route and texts, and no old one', () => {
+    const bundle = servedBundle();
+    expect(bundle).toContain('/permission-mode');
+    expect(bundle).toContain('Switch to Bypass in this conversation?');
+    expect(bundle).toContain('Allowed by bypass');
+    for (const old of ['/bypass`', "/bypass'", '/bypass"', 'Bypass permissions', 'Bypass on', 'Bypass off']) {
+      expect([old, bundle.includes(old)]).toEqual([old, false]);
+    }
+  });
+});
+
 describe('the served bundle carries the Cache-page fixes', () => {
   it('names both cold-tier object kinds in the shipped JS', () => {
     const bundle = servedBundle();
