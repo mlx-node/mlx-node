@@ -236,6 +236,18 @@ export function missingNamedFile(globs: readonly string[] | undefined, paths: re
 }
 
 /**
+ * Whether `files`, the marker list of an install, holds a weight that the globs of a build do not select: an Update of
+ * that build stages only its own files and removes the old folder, so that weight would be lost.
+ */
+export function updateDropsWeight(globs: readonly string[] | undefined, files: readonly string[]): boolean {
+  if (globs === undefined) return false;
+  const patterns = globs.map(globToRegex);
+  return files.some(
+    (file) => isWeightFile(file) && !matchesAnyGlob(basename(file), patterns) && !matchesAnyGlob(file, patterns),
+  );
+}
+
+/**
  * A catalog build that installs with no `config.json` (`configlessBuildOf` in `catalog.ts`): the family its GGUF
  * header states, and the globs of its files (`undefined`: every file, as for a job with no globs).
  */

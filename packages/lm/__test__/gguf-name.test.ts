@@ -169,6 +169,15 @@ describe('pickGgufProjector', () => {
     });
   });
 
+  it('takes a lone projector with no precision word beside an Inkling2 weight, and ranks it last', () => {
+    expect(pick('inkling2', ['mmproj-model.gguf'])).toBe('mmproj-model.gguf');
+    expect(pick('inkling2', ['mmproj-model.gguf', 'mmproj-Q8_0.gguf'])).toBe('mmproj-Q8_0.gguf');
+    expect(pickGgufProjector('inkling2', 'M.gguf', ['mmproj-b.gguf', 'mmproj-a.gguf'])).toEqual({
+      name: undefined,
+      tied: ['mmproj-a.gguf', 'mmproj-b.gguf'],
+    });
+  });
+
   it('takes none of two projectors of one precision, and names both', () => {
     expect(
       pickGgufProjector('qwen35', 'M.gguf', ['mmproj-b-BF16.gguf', 'mmproj-a-bf16.gguf', 'mmproj-F16.gguf']),

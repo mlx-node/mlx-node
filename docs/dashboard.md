@@ -539,10 +539,12 @@ browser on `/models` and the gallery and exits 1 when two cards of a page differ
   in the bar's tooltip; an installed build reads Installed, then Details (its folder in Local models) when Local
   models lists it (`build.listed` of `/api/catalog`, so it does not wait for `/api/models`) and, in System One, Open;
   an update adds an Update button. An installed build has an update when its repo or its assets repo moved, or when
-  its marker lists no file that a glob of the build with no `*` names (`lacksNamedFile`: a Qwen3.8-27B install made
-  before the catalog named `mmproj-BF16.gguf`). That job stages the build again, the weights from the download cache
-  while they are still there, and publishes it with the file; if the Hub has no such file, the job reads the install
-  as current and the badge stays. A build in a blocked state shows a status word and one button, by the first match
+  neither its marker nor its folder holds a file that a glob of the build with no `*` names (`lacksNamedFile`: a
+  Qwen3.8-27B install made before the catalog named `mmproj-BF16.gguf`). That job stages the build again, the weights
+  from the download cache while they are still there, and publishes it with the file. A folder whose marker lists a
+  weight of another build (both Qwen3.8-27B GGUFs in one folder, as `mlx download` can leave it) gets no such badge:
+  the job stages only this build and would delete that weight; `mlx download model` run again adds the file there.
+  If the Hub has no such file, the job reads the install as current and the badge stays. A build in a blocked state shows a status word and one button, by the first match
   of `catalogActionState`: job > update > installed > missing (Locate) > held > locked > adopt > cleanup > install.
 
   | state   | status word     | button               | when                                                                     |
@@ -1072,11 +1074,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 
   Model gate: `images` on a host state model row is the loaded model's own `supportsImages()` while it is in memory
   (the engine's live file, per model `images`), else discovery's answer (the endpoint file). Discovery gives a
-  `qwen3_5` or `inkling2` GGUF image support only with a sibling `mmproj-*.gguf` (`config.json` does not count), a
-  `gemma4` GGUF only with both the vision marker of its `config.json` and a sibling `mmproj-*.gguf` (its load looks for
-  a projector only then), and a `qwen3_5_moe` GGUF none (its load takes no mmproj); MLX checkpoints and Clairic keep
-  their rule.
-  Discovery reads only the file name of the projector: one of the wrong kind or width (Qwen `projection_dim`, `gemma4v`
+  `qwen3_5` GGUF image support only with a sibling `mmproj-*.gguf` (`config.json` does not count), an `inkling2` GGUF
+  only when its load pairs one (a sibling `mmproj-*.gguf` whose header says `clip.vision.projector_type` `inkling2v`,
+  `mmproj-<weight file name>` first, else the one at the best precision, none on a tie), a `gemma4` GGUF only with both
+  the vision marker of its `config.json` and a sibling `mmproj-*.gguf` (its load looks for a projector only then), and
+  a `qwen3_5_moe` GGUF none (its load takes no mmproj); MLX checkpoints and Clairic keep their rule.
+  For the other families discovery reads only the file name of the projector: one of the wrong kind or width (Qwen `projection_dim`, `gemma4v`
   against `gemma4uv`) or a Prism-Hadamard Qwen file still reads as images until the first load. That cold turn
   answers without the picture, then the loaded model's own answer takes over; after each unload the guess comes back.
   PDFs take the same gate as pictures, in Chat and in Work: a PDF added for a model that does not see images is

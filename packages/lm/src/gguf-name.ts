@@ -197,6 +197,12 @@ const PROJECTOR_PRECISIONS: ReadonlyMap<string, readonly string[]> = new Map([
 /** Architectures whose loader takes `mmproj-<weight file name>` before ranking the others. */
 const EXACT_PROJECTOR_ARCHITECTURES: ReadonlySet<string> = new Set(['gemma4', 'inkling2', 'inkling2_loop']);
 
+/**
+ * Architectures whose loader ranks a name with none of the precision words last instead of passing it over: an
+ * Inkling2 load drops a projector it cannot read and stays text-only.
+ */
+const UNRANKED_PROJECTOR_ARCHITECTURES: ReadonlySet<string> = new Set(['inkling2', 'inkling2_loop']);
+
 export interface GgufProjectorChoice {
   /** The projector file name, or undefined when there is no single one. */
   readonly name: string | undefined;
@@ -206,8 +212,8 @@ export interface GgufProjectorChoice {
 
 /**
  * The vision projector the GGUF loader of `architecture` pairs with `weightName`, among `folderNames`, the names in
- * the weight's own folder. Undefined when that loader takes no projector. A name that holds none of the precision
- * words is never picked: a Q8_0 projector beside a Qwen3.5 or Gemma4 weight fails the load.
+ * the weight's own folder. Undefined when that loader takes no projector. Beside a Qwen3.5 or Gemma4 weight a name
+ * that holds none of the precision words is never picked: a Q8_0 projector fails that load.
  */
 export function pickGgufProjector(
   architecture: string,
@@ -219,11 +225,13 @@ export function pickGgufProjector(
   const candidates = folderNames.filter(isGgufProjectorName);
   const exact = `${PROJECTOR_PREFIX}${weightName}`;
   if (EXACT_PROJECTOR_ARCHITECTURES.has(architecture) && candidates.includes(exact)) return { name: exact, tied: [] };
-  let best = precisions.length;
+  const unranked = UNRANKED_PROJECTOR_ARCHITECTURES.has(architecture) ? precisions.length : -1;
+  let best = precisions.length + 1;
   let atBest: string[] = [];
   for (const name of candidates) {
     const lower = name.toLowerCase();
-    const rank = precisions.findIndex((word) => lower.includes(word));
+    const found = precisions.findIndex((word) => lower.includes(word));
+    const rank = found < 0 ? unranked : found;
     if (rank < 0 || rank > best) continue;
     if (rank < best) {
       best = rank;

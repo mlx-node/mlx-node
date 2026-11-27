@@ -34,6 +34,7 @@ import {
   missingNamedFile,
   readCompletion,
   summarizeForeignEntry,
+  updateDropsWeight,
 } from './models.js';
 
 /** What is in the way of a blocked install: what the cleanup confirmation shows and its request echoes back. */
@@ -122,8 +123,9 @@ export interface CatalogBuildItem {
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
   /**
-   * Set when {@link installed} and the marker lists no file named by a glob of the build with no `*`: an install made
-   * before the catalog named that file. Only for a build of its own repository.
+   * Set when {@link installed} and neither the marker nor the folder holds a file named by a glob of the build with no
+   * `*`: an install made before the catalog named that file. Only for a build of its own repository, and never when
+   * the marker lists a weight of another build, which an Update would delete.
    */
   lacksNamedFile?: true;
   /**
@@ -267,6 +269,15 @@ function heldByOther(
   return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
 }
 
+/** The entry names of `dir`; none when it cannot be read. */
+function namesIn(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 /** The state of one build's install folder, by the rules on {@link CatalogBuildItem}. */
 function buildWithState(
   modelsDir: string,
@@ -313,7 +324,8 @@ function buildWithState(
   const lacksNamedFile =
     completion !== undefined &&
     hfRepo === build.hfRepo &&
-    missingNamedFile(build.globs, completion.files) !== undefined;
+    missingNamedFile(build.globs, [...completion.files, ...namesIn(dir)]) !== undefined &&
+    !updateDropsWeight(build.globs, completion.files);
   const located = locatedState(dir, configless);
   return {
     id: build.id,

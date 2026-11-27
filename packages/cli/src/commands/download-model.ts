@@ -19,6 +19,7 @@ import {
   CORE_FILES,
   ggufLoadEntries,
   ggufNextSteps,
+  globSetLacksProjector,
   globToRegex,
   isDefaultModelDownloadPath,
   isGgufRepoComplete,
@@ -666,7 +667,15 @@ export async function run(argv: string[]) {
           cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
         }
         const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
-        if (isGlobMatchedSetComplete(existingTopLevelFiles, remoteBasenames, globPatterns)) {
+        if (
+          isGlobMatchedSetComplete(existingTopLevelFiles, remoteBasenames, globPatterns) &&
+          !(await globSetLacksProjector(
+            outputDir,
+            existingTopLevelFiles,
+            cachedManifest.allFiles.map((f) => f.path),
+            globPatterns,
+          ))
+        ) {
           await repairSidecarsBeforeReturn();
           console.log('Matched files already downloaded!\n');
           console.log('To re-download, delete the output directory first:');
@@ -821,11 +830,13 @@ export async function run(argv: string[]) {
     totalSize += file.size ?? 0;
     projectorOf.set(path, weight);
   }
-  for (const { weight, tied } of projectors.without) {
+  for (const { weight, tied, unranked } of projectors.without) {
     console.log(
       tied.length > 0
         ? `No single vision projector to take beside ${weight} (${tied.join(', ')}). Name one with -g.`
-        : `No vision projector beside ${weight} in ${modelName}: it loads text-only.`,
+        : unranked.length > 0
+          ? `No vision projector beside ${weight} names a precision its loader takes (${unranked.join(', ')}): it loads text-only.`
+          : `No vision projector beside ${weight} in ${modelName}: it loads text-only.`,
     );
   }
   if (projectors.without.length > 0) console.log('');

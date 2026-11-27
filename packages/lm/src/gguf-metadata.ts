@@ -203,6 +203,8 @@ export async function readGgufHeader(read: GgufByteSource, size: number, chunk =
 const MAX_CHAT_TEMPLATE_BYTES = 1024 * 1024;
 /** Maximum length of `tokenizer.ggml.model` decoded during lightweight discovery (`"gpt2"` is 4 bytes). */
 const MAX_TOKENIZER_MODEL_BYTES = 64;
+/** Maximum length of `clip.vision.projector_type` decoded during lightweight discovery (`"inkling2v"` is 9 bytes). */
+const MAX_PROJECTOR_TYPE_BYTES = 64;
 const GGUF_TYPE_INT32 = 5;
 const GGUF_TYPE_STRING = 8;
 const GGUF_TYPE_ARRAY = 9;
@@ -216,6 +218,8 @@ export interface GgufDiscoveryMetadata {
    * reconstructs when no sidecar `tokenizer.json` is present.
    */
   hasEmbeddedGpt2Tokenizer?: boolean;
+  /** `clip.vision.projector_type` of a vision projector GGUF. */
+  projectorType?: string;
 }
 
 export async function readGgufDiscoveryMetadata(path: string): Promise<GgufDiscoveryMetadata> {
@@ -250,6 +254,7 @@ export async function readGgufSourceDiscoveryMetadata(
   let architecture: string | undefined;
   let chatTemplate: string | undefined;
   let tokenizerModel: string | undefined;
+  let projectorType: string | undefined;
   let tokensCount: number | undefined;
   let tokenTypeCount: number | undefined;
   let hasMerges = false;
@@ -273,6 +278,13 @@ export async function readGgufSourceDiscoveryMetadata(
       const length = await reader.length();
       if (length <= MAX_TOKENIZER_MODEL_BYTES) {
         tokenizerModel = new TextDecoder('utf-8').decode(await reader.bytes(length));
+      } else {
+        reader.skip(length);
+      }
+    } else if (key === 'clip.vision.projector_type' && type === GGUF_TYPE_STRING) {
+      const length = await reader.length();
+      if (length <= MAX_PROJECTOR_TYPE_BYTES) {
+        projectorType = new TextDecoder('utf-8').decode(await reader.bytes(length));
       } else {
         reader.skip(length);
       }
@@ -306,6 +318,7 @@ export async function readGgufSourceDiscoveryMetadata(
     architecture,
     ...(chatTemplate !== undefined ? { chatTemplate } : {}),
     ...(hasEmbeddedGpt2Tokenizer ? { hasEmbeddedGpt2Tokenizer: true } : {}),
+    ...(projectorType !== undefined ? { projectorType } : {}),
   };
 }
 

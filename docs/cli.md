@@ -131,17 +131,21 @@ architecture `qwen35` for Qwen3.5 / 3.6 / 3.8 dense and Clairic, `gemma4`,
 `inkling2`) also brings the one `mmproj-*.gguf` in its own repo folder that the
 loader pairs with it. Gemma 4 and Inkling 2 take `mmproj-<weight file name>`
 first; otherwise the name's precision ranks it: BF16, F16, F32 for `qwen35` and
-`gemma4`, BF16, F32, F16, Q8 for `inkling2`. A name with none of these is never
-taken (a Q8_0 projector fails a Qwen3.5 or Gemma 4 load), and nothing is added
+`gemma4`, BF16, F32, F16, Q8 for `inkling2`. Beside a `qwen35` or `gemma4` weight
+a name with none of these is never taken (a Q8_0 projector fails that load); beside
+an `inkling2` weight it ranks last, as its loader ranks it. Nothing is added
 when the globs already select a projector in that folder. The plan lists it as
 `vision projector for <weight>`. A repo with none prints `No vision projector
-beside <weight> in <repo>: it loads text-only.`; two at the best precision print
+beside <weight> in <repo>: it loads text-only.`; projectors that name no ranked
+precision print `No vision projector beside <weight> names a precision its loader
+takes (<names>): it loads text-only.`; two at the best precision print
 `No single vision projector to take beside <weight> (<names>). Name one with -g.`
 Other architectures (`qwen35moe`, `qwen4exp`, `hy_v4_flash`, `clef`,
 `muse-glimmer`, `deepseek41`) get none. The projector is never a weight, so a
 selection of only a projector still writes no marker. To add the projector to
 an install that lacks it, run the same command again: present weights are
-skipped. With `--assets-repo`:
+skipped, and a glob run whose matched files are all on disk still fetches the
+projector when the header of a weight there says its loader takes one. With `--assets-repo`:
 
 ```bash
 mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \

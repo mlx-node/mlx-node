@@ -26,6 +26,7 @@ const hub = vi.hoisted(() => ({
   downloaded: [] as string[],
   snapshotDir: '',
   coreImported: false,
+  noRevision: false,
 }));
 
 vi.mock('@mlx-node/core', async (importActual) => {
@@ -38,7 +39,7 @@ vi.mock('@huggingface/hub', () => ({
     const bytes = hub.blobs[params.path];
     return bytes ? new Blob([bytes]) : new Blob(['{}']);
   },
-  modelInfo: async () => ({ sha: 'a'.repeat(40) }),
+  modelInfo: async () => (hub.noRevision ? {} : { sha: 'a'.repeat(40) }),
   listFiles: async function* () {
     for (const entry of hub.manifest) yield entry;
   },
@@ -69,6 +70,7 @@ describe('download model GGUF header check', () => {
     hub.manifest = [];
     hub.blobs = {};
     hub.downloaded = [];
+    hub.noRevision = false;
   });
 
   afterEach(() => {
@@ -162,6 +164,18 @@ describe('download model GGUF header check', () => {
     expect(hub.downloaded).toEqual(['Tiny-UD-Q4_K_M.gguf']);
     expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(true);
   });
+
+  it('adds the projector to a folder that holds the matched weight when the revision cannot be resolved', async () => {
+    serve('Tiny-UD-Q4_K_M.gguf', tinyGgufBytes({ arch: 'inkling2' }));
+    serve('mmproj-BF16.gguf', tinyGgufBytes({ arch: 'clip' }));
+    await download('*Q4_K_M*');
+    rmSync(join(outputDir, 'mmproj-BF16.gguf'));
+    hub.downloaded = [];
+    hub.noRevision = true;
+    await download('*Q4_K_M*');
+    expect(hub.downloaded).toEqual(['mmproj-BF16.gguf']);
+    expect(existsSync(join(outputDir, 'mmproj-BF16.gguf'))).toBe(true);
+  });
 });
 
 describe('planGgufProjectors', () => {
@@ -172,11 +186,19 @@ describe('planGgufProjectors', () => {
     ).toEqual({ add: [], without: [] });
   });
 
+  it('names the projectors of the folder when none names a precision the loader takes', () => {
+    const repo = ['M-UD-Q4_K_M.gguf', 'mmproj-model.gguf', 'imatrix.gguf'];
+    expect(planGgufProjectors([['M-UD-Q4_K_M.gguf']], ['qwen35'], repo, ['M-UD-Q4_K_M.gguf'])).toEqual({
+      add: [],
+      without: [{ weight: 'M-UD-Q4_K_M.gguf', tied: [], unranked: ['mmproj-model.gguf'] }],
+    });
+  });
+
   it('takes a projector only from the folder of the weight', () => {
     const target = ['BF16/M-BF16-00001-of-00002.gguf', 'BF16/M-BF16-00002-of-00002.gguf'];
     expect(planGgufProjectors([target], ['qwen35'], [...target, 'mmproj-BF16.gguf'], target)).toEqual({
       add: [],
-      without: [{ weight: target[0], tied: [] }],
+      without: [{ weight: target[0], tied: [], unranked: [] }],
     });
     expect(planGgufProjectors([target], ['qwen35'], [...target, 'BF16/mmproj-BF16.gguf'], target)).toEqual({
       add: [{ path: 'BF16/mmproj-BF16.gguf', weight: target[0] }],
