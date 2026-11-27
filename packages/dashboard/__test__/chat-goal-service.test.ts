@@ -90,7 +90,8 @@ async function withWork(run: (fake: FakeService, project: string, gate: string) 
         {
           match: '/goal fix',
           goal: { wakeRounds: 2, wakeRoundMs: 60, gapMs: 250, end: 'complete' },
-          steps: [{ goalRound: { ms: 30, text: 'Round 0.' } }, ...END],
+          // A page attaches only after its async reads, so an ungated turn can end before the page counts its end.
+          steps: [{ holdOn: gate }, { goalRound: { ms: 30, text: 'Round 0.' } }, ...END],
         },
         {
           match: '/goal stall',
@@ -188,13 +189,14 @@ describe('the goal strip presses', () => {
 describe('the queue while a goal runs', () => {
   // Mutation: drop `goalRuns` from the drain's `free()` → the row goes in the gap before the first round.
   it('a queued row waits through the rounds the agent starts by itself and goes once the goal is done', async () => {
-    await withWork(async (fake, project) => {
+    await withWork(async (fake, project, gate) => {
       const svc = fake.service;
       const { conversation } = await svc.create({ mode: 'work', text: '/goal fix the cache', cwd: project });
       const id = conversation.id;
       const page = new Page(svc, id);
       await until(() => page.state?.turn?.phase === 'running', 5_000);
       expect(await svc.prompt(id, 'after the goal', [], undefined, 'queue')).toEqual({ queued: expect.any(String) });
+      writeFileSync(gate, '');
       await until(() => page.ends() === 1, 5_000);
       // The gap before the first round: no answer runs, the goal does.
       await sleep(120);
@@ -235,13 +237,14 @@ describe('the queue while a goal runs', () => {
 
   // Mutation: drop the goal term of the host's `steerable` → the press in the gap is refused and the row stays.
   it('Send now in the gap before a round goes to the agent', async () => {
-    await withWork(async (fake, project) => {
+    await withWork(async (fake, project, gate) => {
       const svc = fake.service;
       const { conversation } = await svc.create({ mode: 'work', text: '/goal fix the cache', cwd: project });
       const id = conversation.id;
       const page = new Page(svc, id);
       await until(() => page.state?.turn?.phase === 'running', 5_000);
       const { queued } = (await svc.prompt(id, 'use pnpm', [], undefined, 'queue')) as { queued: string };
+      writeFileSync(gate, '');
       await until(() => page.ends() === 1, 5_000);
       expect(page.state?.turn).toBeNull();
       expect(await svc.queueSend(id, queued)).toEqual({ steered: true });
