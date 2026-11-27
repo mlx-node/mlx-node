@@ -20,19 +20,21 @@
       body {
         background: light-dark(#ffffff, #141414);
         color: light-dark(#585858, #b4b4b4);
-        font:
-          13px/1.4 -apple-system,
-          BlinkMacSystemFont,
-          sans-serif;
       }
 
+      /* Set on the block itself: neither tokens.css nor the font settings may change the boot text. */
       .mlx-boot {
         align-items: center;
         display: flex;
         flex-direction: column;
+        font:
+          13px/1.4 system-ui,
+          BlinkMacSystemFont,
+          sans-serif;
         gap: 12px;
         height: 100%;
         justify-content: center;
+        letter-spacing: normal;
       }
 
       .mlx-boot__spinner {

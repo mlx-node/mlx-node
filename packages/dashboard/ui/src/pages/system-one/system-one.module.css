@@ -715,7 +715,7 @@
   background: var(--surface-muted);
   border: 1px solid var(--border-subtle);
   color: var(--foreground);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
   flex: none;
@@ -1145,7 +1145,7 @@
 }
 
 .specsSectionHint {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
@@ -1428,7 +1428,7 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1510,7 +1510,7 @@
   border-radius: 5px;
   background: var(--surface-muted);
   font-family: var(--font-code);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--foreground);
 }
 
@@ -1571,7 +1571,7 @@
   background: var(--surface);
   border: 1px solid var(--border-subtle);
   font-family: var(--font-code);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--foreground);
 }
 
@@ -1633,7 +1633,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-secondary);
   font-family: var(--font-code);
 }
@@ -1674,7 +1674,7 @@
   border-radius: 4px;
   background: var(--surface-muted);
   font-family: var(--font-code);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--foreground);
 }
 

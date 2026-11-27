@@ -12,6 +12,7 @@ import SegmentedControl, { type Segment } from '../components/arc/segmented-cont
 import { Switch } from '../components/arc/switch/switch';
 import { Tooltip } from '../components/arc/tooltip/tooltip';
 import { getJson, mutate } from '../lib/api';
+import { FONTS } from '../lib/fonts-strings';
 import { resetModelColors } from '../lib/model-colors';
 import { PROVIDERS } from '../lib/providers-strings';
 import { toast } from '../lib/toast';
@@ -111,7 +112,7 @@ function useWorkSettings(open: boolean): { settings: WorkSettings | null; save: 
   return { settings, save };
 }
 
-/** The gear in the sidebar footer: theme, model colors, Claude Code in Work, and where the data lives. */
+/** The gear in the sidebar footer: theme, fonts, model colors, Claude Code in Work, and where the data lives. */
 export function SettingsPopover({ open, onOpenChange, rail }: SettingsPopoverProps): ReactElement {
   const theme = useTheme();
   const paths = useDataPaths(open);
@@ -135,6 +136,13 @@ export function SettingsPopover({ open, onOpenChange, rail }: SettingsPopoverPro
               if (isThemePreference(value)) theme.setPreference(value);
             }}
           />
+        </div>
+        <Rule tone="strong" />
+        <div className={styles.settingsBlock}>
+          <span className={styles.settingsLabel}>{FONTS.popover.label}</span>
+          <ButtonLink to="/fonts" size="sm" variant="ghost" onClick={() => onOpenChange(false)}>
+            {FONTS.popover.link}
+          </ButtonLink>
         </div>
         <Rule tone="strong" />
         <div className={styles.settingsBlock}>

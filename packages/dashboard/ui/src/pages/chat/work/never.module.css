@@ -98,7 +98,7 @@
   min-width: 0;
   flex: 1;
   overflow: hidden;
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: var(--text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;

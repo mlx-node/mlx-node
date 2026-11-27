@@ -3,7 +3,9 @@
   min-width: 0;
   gap: var(--space-2-5);
   color: var(--foreground);
-  font-size: var(--text-sm);
+  font-family: var(--font-reading);
+  font-size: var(--text-reading);
+  letter-spacing: var(--tracking-reading);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
 }
@@ -43,12 +45,12 @@
 }
 
 .h1 {
-  font-size: var(--text-lg);
+  font-size: calc(1em * 16 / 13);
 }
 
 .h2,
 .h3 {
-  font-size: var(--text-base);
+  font-size: calc(1em * 14 / 13);
 }
 
 .list {
@@ -138,7 +140,7 @@
   padding: 0 var(--space-1);
   background: var(--surface-muted);
   font-family: var(--font-code);
-  font-size: var(--text-code);
+  font-size: calc(1em * 12 / 13);
   letter-spacing: 0;
 }
 

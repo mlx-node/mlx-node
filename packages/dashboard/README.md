@@ -16,7 +16,7 @@ Not started on its own. Portato creates the runtime, serves the built SPA
 over its `app://` scheme, and hands the page one end of a `MessageChannel`; the SPA
 calls `connectDashboardApi(port)` and every API call rides it.
 
-See [`docs/dashboard.md`](../../docs/dashboard.md) for the twelve routes, Chat and Work, web search providers, data sources, the live channel,
+See [`docs/dashboard.md`](../../docs/dashboard.md) for the thirteen routes, Chat and Work, web search providers, data sources, the live channel,
 the design system, the dev harness, `persistPagedCache`, and the env vars.
 
 ## Design

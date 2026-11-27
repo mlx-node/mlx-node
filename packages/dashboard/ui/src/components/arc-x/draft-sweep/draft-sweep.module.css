@@ -65,7 +65,7 @@
   color: var(--text-secondary);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
-  line-height: 11px;
+  line-height: 1;
   white-space: nowrap;
 }
 

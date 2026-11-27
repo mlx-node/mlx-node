@@ -163,7 +163,8 @@ describe('sticky page header', () => {
 
   it('keeps every z-index inside the page content under the stuck page row; overlays stay above it', () => {
     const row = Number(cssValue(cssRules('shell/page.module.css'), '.titleRow[data-sticky]', 'z-index'));
-    const portaled = new Set([
+    const overlays = new Set([
+      'components/arc/combobox/combobox.module.css .popover',
       'components/arc/popover/popover.module.css .content',
       'components/arc/select/select.module.css .content',
       'components/arc/tooltip/tooltip.module.css .tooltip',
@@ -188,7 +189,7 @@ describe('sticky page header', () => {
         for (const selector of rule.selectors) {
           const key = `${sheet} ${selector}`;
           if (key === 'shell/page.module.css .titleRow[data-sticky]') continue;
-          if (rule.decls.get('position') === 'fixed' || portaled.has(key)) {
+          if (rule.decls.get('position') === 'fixed' || overlays.has(key)) {
             expect(z, key).toBeGreaterThan(row);
             continue;
           }

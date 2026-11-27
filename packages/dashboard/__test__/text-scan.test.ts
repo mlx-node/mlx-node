@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  hasAsciiDigit,
   hasNonWhitespace,
   isAsciiDigit,
   isIdentifier,
   isNumericWord,
   isWhitespace,
   isWordChar,
+  keepDigitsAnd,
   keepIdChars,
   splitShortcut,
   splitWhitespace,
@@ -51,6 +53,19 @@ describe('text-scan', () => {
     expect(stripTags('<svg><path/></svg>')).toBe('');
     expect(stripTags('Save <b>now</b>')).toBe('Save now');
     expect(stripTags('a < b')).toBe('a < b');
+  });
+
+  it('finds an ASCII digit anywhere, and no other digit', () => {
+    for (const text of ['7', 'a1', 'px 12', '-.5']) expect(hasAsciiDigit(text), text).toBe(true);
+    for (const text of ['', 'px', '-.', '٣', '１']) expect(hasAsciiDigit(text), text).toBe(false);
+  });
+
+  it('keeps the ASCII digits and the extra characters, the way the number field cleans a draft', () => {
+    expect(keepDigitsAnd('-1,234.5 px', '.-')).toBe('-1234.5');
+    expect(keepDigitsAnd('12a,3.4-', ',.')).toBe('12,3.4');
+    expect(keepDigitsAnd('1\u202f234,5', '\u202f,')).toBe('1\u202f234,5');
+    expect(keepDigitsAnd('a٣b', '')).toBe('');
+    expect(keepDigitsAnd('$(1)*2', '')).toBe('12');
   });
 
   it('strips commas', () => {

@@ -114,7 +114,12 @@ function parse(source: string, reduce: boolean, conditional: boolean): CssRule[]
 
 /** Every rule of a stylesheet under `ui/src` (path relative to it), in source order. */
 export function cssRules(path: string): CssRule[] {
-  return parse(readFileSync(join(UI, path), 'utf8'), false, false);
+  return cssRulesOf(readFileSync(join(UI, path), 'utf8'));
+}
+
+/** Every rule of stylesheet text, in source order. */
+export function cssRulesOf(source: string): CssRule[] {
+  return parse(source, false, false);
 }
 
 /**

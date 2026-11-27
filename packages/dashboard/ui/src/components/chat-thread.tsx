@@ -164,7 +164,7 @@ import { Button } from './arc/button/button';
 import { CopyButton } from './arc/copy-button/copy-button';
 import { ExpandableText } from './arc/expandable-text/expandable-text';
 import { AllowedCard, HelperMarkLists, MarkLine } from './chat-permission-marks';
-import { MessageText } from './command-text';
+import { MessageText, SENT_TEXT_STYLE } from './command-text';
 import { CompactionMark } from './compaction-mark';
 import { RecapRow } from './history-mark';
 import { NoteRow } from './note-row';
@@ -1476,7 +1476,11 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement | nu
           >
             {entry.attachments !== undefined && entry.attachments.length > 0 ? (
               <div className="grid gap-2">
-                {entry.text !== '' ? <ExpandableText lines={12}>{entry.text}</ExpandableText> : null}
+                {entry.text !== '' ? (
+                  <ExpandableText lines={12} style={SENT_TEXT_STYLE}>
+                    {entry.text}
+                  </ExpandableText>
+                ) : null}
                 <AttachmentStrip readOnly items={sentChips(entry.attachments)} />
               </div>
             ) : (

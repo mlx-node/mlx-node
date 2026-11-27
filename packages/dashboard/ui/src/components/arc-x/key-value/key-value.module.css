@@ -101,7 +101,7 @@
 
 .value[data-mono] .text {
   font-family: var(--font-code);
-  font-size: var(--text-code);
+  font-size: var(--text-mono);
   letter-spacing: 0;
 }
 

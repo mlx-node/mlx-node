@@ -74,7 +74,7 @@
 
 .search {
   display: inline-flex;
-  width: 220px;
+  width: calc(var(--text-sm) * 220 / 13);
   height: var(--control-height-sm);
   box-sizing: border-box;
   flex: none;
@@ -213,6 +213,11 @@
   justify-content: center;
   gap: 12px;
   color: var(--text-secondary);
+  font:
+    13px/1.4 system-ui,
+    BlinkMacSystemFont,
+    sans-serif;
+  letter-spacing: normal;
 }
 
 .bootSpinner {

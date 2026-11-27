@@ -88,6 +88,23 @@ export function stripTags(text: string): string {
   return out;
 }
 
+export function hasAsciiDigit(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    if (isDigitCode(text.charCodeAt(i))) return true;
+  }
+  return false;
+}
+
+/** Keeps the ASCII digits and every code unit that appears in `extra`; drops the rest. */
+export function keepDigitsAnd(text: string, extra: string): string {
+  let out = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const unit = text[i];
+    if (isDigitCode(text.charCodeAt(i)) || extra.includes(unit)) out += unit;
+  }
+  return out;
+}
+
 export function stripCommas(text: string): string {
   let out = '';
   for (let i = 0; i < text.length; i += 1) {
