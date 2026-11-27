@@ -431,8 +431,8 @@ models and one Delete. The chat builds:
 
 | Model              | Build      | Folder                          | Size     |
 | ------------------ | ---------- | ------------------------------- | -------- |
-| Qwen3.8-27B        | UD-Q4_K_XL | `qwen3.8-27b-gguf`              | 17.7 GB  |
-| Qwen3.8-27B        | UD-Q4_K_M  | `qwen3.8-27b-gguf-ud-q4_k_m`    | 16.6 GB  |
+| Qwen3.8-27B        | UD-Q4_K_XL | `qwen3.8-27b-gguf`              | 18.6 GB  |
+| Qwen3.8-27B        | UD-Q4_K_M  | `qwen3.8-27b-gguf-ud-q4_k_m`    | 17.5 GB  |
 | Inkling-2-Mini     | UD-Q4_K_XL | `inkling-2-mini-gguf`           | 18.7 GB  |
 | Inkling-2-Mini     | UD-Q4_K_M  | `inkling-2-mini-gguf-ud-q4_k_m` | 17.7 GB  |
 | Inkling-2-Mini     | Original   | `inkling-2-mini`                | 20.2 GB  |
@@ -440,7 +440,9 @@ models and one Delete. The chat builds:
 | Hy4-flash          | Q4_K_M     | `hy4-flash-gguf`                | 168.3 GB |
 
 Repos, globs and assets repos are in [cli.md](cli.md#model-selection-and-first-run-wizard). A GGUF build takes one
-variant out of its repo plus the base-model tokenizer sidecars of its `assetsRepo`; the download runner glob-filters
+variant out of its repo plus the base-model tokenizer sidecars of its `assetsRepo`, and the Qwen3.8-27B and
+Inkling-2-Mini GGUF builds take `mmproj-BF16.gguf`, the vision projector their loader pairs (a catalog test checks
+each projector against the loader's pick on the real repo listing); the download runner glob-filters
 the manifest and stages the sidecars before publishing. Inkling-2-Mini Original is the safetensors release of
 `thinkingmachines/Inkling-2-Mini` and takes the default filter. Qwen3.8-Flash-Next keeps its four shards in the repo
 folder `UD-Q4_K_XL/`, and downloads keep repo paths, so they land in `<slug>/UD-Q4_K_XL/` with the sidecars at the
@@ -529,14 +531,18 @@ browser on `/models` and the gallery and exits 1 when two cards of a page differ
   attention), an up arrow (update available) or a check (installed), each with its word for screen readers. Choosing a
   segment starts nothing; it changes only what the card shows. The card shows, first match, the build chosen on this
   page visit (page state, not stored), a build with a running job, the first build on disk, the first build. Under the
-  switch, the build line reads size · source · note (`16.6 GB · Unsloth GGUF · 1.1 GB smaller`). A disk or memory
+  switch, the build line reads size · source · note (`17.5 GB · Unsloth GGUF · 1.1 GB smaller`). A disk or memory
   warning replaces it, and a running job replaces it with its live numbers.
 - **Extras:** the build's `included` text (`Vision and DSpark draft included`), or the DFlash2 line on Qwen3.8-27B.
 - **Action:** one control for the shown build. Install (`Install UD-Q4_K_M` on a card with more builds) starts that
   build only; a download shows a spinner, a bar, the percent and Cancel (none in its last step), with the file name
   in the bar's tooltip; an installed build reads Installed, then Details (its folder in Local models) when Local
   models lists it (`build.listed` of `/api/catalog`, so it does not wait for `/api/models`) and, in System One, Open;
-  an update adds an Update button. A build in a blocked state shows a status word and one button, by the first match
+  an update adds an Update button. An installed build has an update when its repo or its assets repo moved, or when
+  its marker lists no file that a glob of the build with no `*` names (`lacksNamedFile`: a Qwen3.8-27B install made
+  before the catalog named `mmproj-BF16.gguf`). That job stages the build again, the weights from the download cache
+  while they are still there, and publishes it with the file; if the Hub has no such file, the job reads the install
+  as current and the badge stays. A build in a blocked state shows a status word and one button, by the first match
   of `catalogActionState`: job > update > installed > missing (Locate) > held > locked > adopt > cleanup > install.
 
   | state   | status word     | button               | when                                                                     |

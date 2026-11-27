@@ -75,11 +75,19 @@ export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'is
 export function hasUpdate(
   item: Pick<
     CatalogBuildItem,
-    'hfRepo' | 'installed' | 'localRevision' | 'assetsRepo' | 'localAssetsRepo' | 'localAssetsRevision'
+    | 'hfRepo'
+    | 'installed'
+    | 'localRevision'
+    | 'assetsRepo'
+    | 'localAssetsRepo'
+    | 'localAssetsRevision'
+    | 'lacksNamedFile'
   >,
   remoteRevisions: ReadonlyMap<string, string | null>,
 ): boolean {
   if (!item.installed || item.localRevision === null) return false;
+  // Without the badge the Installed button stays disabled and no job ever adds the named file.
+  if (item.lacksNamedFile === true) return true;
   const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
   if (remoteRevision !== null && remoteRevision !== item.localRevision) return true;
   // The catalog's CURRENT assets repo participates too: when the entry

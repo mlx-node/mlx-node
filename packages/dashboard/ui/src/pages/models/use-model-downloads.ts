@@ -134,6 +134,7 @@ export type DownloadItem = Pick<
   | 'assetsRepo'
   | 'localAssetsRepo'
   | 'localAssetsRevision'
+  | 'lacksNamedFile'
   | 'present'
   | 'blockedByForeignDir'
   | 'blocker'

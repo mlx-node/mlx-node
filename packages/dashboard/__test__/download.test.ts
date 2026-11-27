@@ -46,7 +46,13 @@ import {
   type ReplaceBlocker,
   restoreWindowsSymlink,
 } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
+import {
+  DOWNLOAD_COMPLETE_MARKER,
+  deleteLocalModel,
+  isModelInstalled,
+  readCompletion,
+  summarizeForeignEntry,
+} from '../src/models.js';
 import { hasUpdate, modelPresent } from '../ui/src/lib/catalog.js';
 import { catalogActionState } from '../ui/src/pages/models/catalog.js';
 import { ggufHeader } from './helpers/configless-gguf-fixtures.js';
@@ -1311,12 +1317,14 @@ describe('DownloadManager', () => {
 
   it('downloads only the glob-matched variants of a multi-variant GGUF repo', async () => {
     // A real Unsloth repo ships dozens of quantization variants side by side. The
-    // entry's globs (`*UD-Q4_K_XL*`, `config.json`) must select exactly the
-    // one build the wizard installs — never the whole multi-hundred-GB repo.
+    // entry's globs (`*UD-Q4_K_XL*`, `config.json`, `mmproj-BF16.gguf`) must select
+    // exactly the one build the wizard installs and its vision projector — never the
+    // whole multi-hundred-GB repo.
     const OTHER_QUANT = 'Qwen3.8-27B-UD-Q8_K_XL.gguf';
     const NON_UD = 'Qwen3.8-27B-Q4_K_M.gguf';
     const MTP = 'MTP/mtp-Qwen3.8-27B-Q4_0.gguf';
     const MMPROJ = 'mmproj-BF16.gguf';
+    const OTHER_MMPROJ = 'mmproj-F16.gguf';
     const README = 'README.md';
     hub.manifest = [
       { type: 'file', path: WEIGHT, size: 300 },
@@ -1324,6 +1332,7 @@ describe('DownloadManager', () => {
       { type: 'file', path: NON_UD, size: 111 },
       { type: 'file', path: MTP, size: 33 },
       { type: 'file', path: MMPROJ, size: 44 },
+      { type: 'file', path: OTHER_MMPROJ, size: 43 },
       { type: 'file', path: README, size: 55 },
     ];
     // The assets repo is a genuinely different repo, so it gets its own listing.
@@ -1332,43 +1341,80 @@ describe('DownloadManager', () => {
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
-      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, [MTP]: 33, 'config.json': 12 }),
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, [MTP]: 33, [MMPROJ]: 44, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
     const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
-    // Exactly the glob-matched primary file moved (the MTP artifact is NOT
+    // Exactly the glob-matched primary files moved (the MTP artifact is NOT
     // globbed: the UD file carries its MTP layer inline, nothing pairs a GGUF
-    // MTP sidecar). The `start` frame carries the FULL total — the primary
-    // weight plus the assets repo's config.json sidecar (300 + 12) — because
-    // the sidecar plan is resolved before `start` so the byte bar never
+    // MTP sidecar). The `start` frame carries the FULL total — the weight, the
+    // projector and the assets repo's config.json sidecar (300 + 44 + 12) —
+    // because the sidecar plan is resolved before `start` so the byte bar never
     // overshoots.
     expect(events.find((event) => event.type === 'start')).toMatchObject({
       type: 'start',
       repo: REPO,
-      totalBytes: 312,
-      fileCount: 2,
+      totalBytes: 356,
+      fileCount: 3,
     });
-    // EVERY frame must report the aggregate (1 primary + 1 sidecar): the UI
+    // EVERY frame must report the aggregate (2 primary + 1 sidecar): the UI
     // reducer replaces its count with each progress event's, so a primary-only
     // count here would shrink the displayed total and then jump when the
     // sidecar starts.
     const progressCounts = events.filter((event) => event.type === 'progress').map((event) => event.fileCount);
     expect(progressCounts.length).toBeGreaterThan(0);
-    expect(new Set(progressCounts)).toEqual(new Set([2]));
-    expect([...hub.downloaded].sort()).toEqual([WEIGHT, 'config.json'].sort());
+    expect(new Set(progressCounts)).toEqual(new Set([3]));
+    expect([...hub.downloaded].sort()).toEqual([WEIGHT, MMPROJ, 'config.json'].sort());
 
     // The unmatched variants were never fetched and never published…
-    for (const path of [OTHER_QUANT, NON_UD, MTP, MMPROJ, README]) {
+    for (const path of [OTHER_QUANT, NON_UD, MTP, OTHER_MMPROJ, README]) {
       expect(hub.downloaded, `${path} must not be fetched`).not.toContain(path);
       expect(existsSync(join(finalDir(), path)), `${path} must not be published`).toBe(false);
     }
-    // …while the selected build and the core metadata landed.
-    expect(existsSync(join(finalDir(), WEIGHT))).toBe(true);
-    expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
-    expect(buildState(SLUG)!.installed).toBe(true);
+    // …while the selected build, its projector and the core metadata landed.
+    for (const path of [WEIGHT, MMPROJ, 'config.json']) expect(existsSync(join(finalDir(), path)), path).toBe(true);
+    expect(readCompletion(finalDir())!.files).toContain(MMPROJ);
+    expect(buildState(SLUG)).toMatchObject({ installed: true });
+    expect(buildState(SLUG)!.lacksNamedFile).toBeUndefined();
+  });
+
+  it('updates an install whose marker lacks the projector the catalog names, and publishes it', async () => {
+    const MMPROJ = 'mmproj-BF16.gguf';
+    hub.manifest = [
+      { type: 'file', path: WEIGHT, size: 300 },
+      { type: 'file', path: MMPROJ, size: 44 },
+    ];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, [MMPROJ]: 44, 'config.json': 12 }),
+    });
+    const runJob = async (): Promise<DownloadEvent[]> => {
+      const events: DownloadEvent[] = [];
+      const id = manager.start(SLUG).id;
+      manager.subscribe(id, (event) => events.push(event));
+      await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+      return events;
+    };
+    expect((await runJob()).at(-1)?.type).toBe('done');
+
+    // The install as a catalog without the projector made it: same revision, the projector neither on disk nor listed.
+    const marker = readCompletion(finalDir())!;
+    rmSync(join(finalDir(), MMPROJ));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ ...marker, files: marker.files.filter((file) => file !== MMPROJ) }),
+    );
+    expect(buildState(SLUG)).toMatchObject({ installed: true, lacksNamedFile: true });
+
+    expect((await runJob()).at(-1)?.type).toBe('done');
+    expect(existsSync(join(finalDir(), MMPROJ))).toBe(true);
+    expect(readCompletion(finalDir())!.files).toContain(MMPROJ);
+    expect(buildState(SLUG)!.lacksNamedFile).toBeUndefined();
   });
 
   it('fetches the tokenizer sidecars from the entry assetsRepo and lists them in the completion marker', async () => {

@@ -86,6 +86,11 @@ describe('hasUpdate', () => {
     expect(hasUpdate(sidecar, new Map([['org/base', 's1']]))).toBe(false);
     expect(hasUpdate(sidecar, new Map([['org/base', 's2']]))).toBe(true);
   });
+
+  it('treats an install that lacks a file the catalog names as an update, with no revision known', () => {
+    expect(hasUpdate({ ...base, lacksNamedFile: true }, new Map())).toBe(true);
+    expect(hasUpdate({ ...base, installed: false, lacksNamedFile: true }, new Map())).toBe(false);
+  });
 });
 
 describe('offeredOnHost', () => {

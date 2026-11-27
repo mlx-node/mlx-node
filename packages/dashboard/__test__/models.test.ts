@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -1330,6 +1331,23 @@ describe('catalogWithState — two builds of one repository', () => {
       blocker: null,
       localRevision: null,
     });
+  });
+
+  it('an install whose marker lacks the projector the catalog names reads lacksNamedFile, and only an install', () => {
+    expect(XL.globs).toContain('mmproj-BF16.gguf');
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ installed: true, lacksNamedFile: true });
+
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', 'mmproj-BF16.gguf'), ggufHeader('clip'));
+    writeCompletion('qwen3.8-27b-gguf', REPO, ['config.json', XL_FILE, 'mmproj-BF16.gguf']);
+    expect(buildItem('qwen3.8-27b-gguf').installed).toBe(true);
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
+
+    writeGgufInstall('qwen3.8-27b-gguf-ud-q4_k_m', M_FILE);
+    const marker = join(modelsDir, 'qwen3.8-27b-gguf-ud-q4_k_m', DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(marker, JSON.stringify({ ...JSON.parse(readFileSync(marker, 'utf8')), scope: 'partial' }));
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m')).toMatchObject({ present: true, installed: false });
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m').lacksNamedFile).toBeUndefined();
   });
 
   it('a renamed install of one build makes only that build present', () => {

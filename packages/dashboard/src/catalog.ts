@@ -31,6 +31,7 @@ import {
   isPathOccupied,
   type LocatedState,
   locatedState,
+  missingNamedFile,
   readCompletion,
   summarizeForeignEntry,
 } from './models.js';
@@ -120,6 +121,11 @@ export interface CatalogBuildItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /**
+   * Set when {@link installed} and the marker lists no file named by a glob of the build with no `*`: an install made
+   * before the catalog named that file. Only for a build of its own repository.
+   */
+  lacksNamedFile?: true;
   /**
    * Set when Locate made `<slug>` from files the user already had: the folder they are in, whether the models folder
    * shares them on disk or links to them, and whether they can be reached now. A folder whose files cannot be reached
@@ -304,6 +310,10 @@ function buildWithState(
   // Read from the build's own folder ONLY — see `localRevision` for why a
   // provenance-matched renamed dir deliberately reports null.
   const completion = installed ? readCompletion(dir) : undefined;
+  const lacksNamedFile =
+    completion !== undefined &&
+    hfRepo === build.hfRepo &&
+    missingNamedFile(build.globs, completion.files) !== undefined;
   const located = locatedState(dir, configless);
   return {
     id: build.id,
@@ -322,6 +332,7 @@ function buildWithState(
     localRevision: completion?.revision ?? null,
     localAssetsRepo: completion?.assetsRepo ?? null,
     localAssetsRevision: completion?.assetsRevision ?? null,
+    ...(lacksNamedFile ? { lacksNamedFile: true } : {}),
     located:
       located === null ? null : { from: located.from, mode: located.mode, filesAvailable: located.filesAvailable },
     listed: isListedFolder(dir),

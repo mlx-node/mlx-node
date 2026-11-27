@@ -32,7 +32,15 @@ import {
   type ModelVariantName,
 } from './model-variant.js';
 
-export { ggufSplitPartNames, isGgufCompanionName, parseGgufFileName, type GgufFileName } from './gguf-name.js';
+export {
+  ggufSplitPartNames,
+  isGgufCompanionName,
+  isGgufProjectorName,
+  parseGgufFileName,
+  pickGgufProjector,
+  type GgufFileName,
+  type GgufProjectorChoice,
+} from './gguf-name.js';
 export type { ModelFormat } from './model-variant.js';
 
 /** Native-free inventory shared by the agent, setup UI, and inference host. */

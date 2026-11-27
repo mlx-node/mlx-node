@@ -178,3 +178,59 @@ const BONSAI_PQ2_GGUF_NAME = 'ternary-bonsai-2-27b-pq2_0.gguf';
 export function isBonsaiPq2GgufName(name: string): boolean {
   return name.toLowerCase() === BONSAI_PQ2_GGUF_NAME;
 }
+
+const PROJECTOR_PREFIX = 'mmproj-';
+
+/** A `mmproj-*.gguf` name, the only names a GGUF loader scans for a vision projector. */
+export function isGgufProjectorName(name: string): boolean {
+  return name.toLowerCase().startsWith(PROJECTOR_PREFIX) && withoutGgufExtension(name) !== undefined;
+}
+
+/** Precision words a loader ranks projectors by, best first, per GGUF `general.architecture`. */
+const PROJECTOR_PRECISIONS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['qwen35', ['bf16', 'f16', 'f32']],
+  ['gemma4', ['bf16', 'f16', 'f32']],
+  ['inkling2', ['bf16', 'f32', 'f16', 'q8']],
+  ['inkling2_loop', ['bf16', 'f32', 'f16', 'q8']],
+]);
+
+/** Architectures whose loader takes `mmproj-<weight file name>` before ranking the others. */
+const EXACT_PROJECTOR_ARCHITECTURES: ReadonlySet<string> = new Set(['gemma4', 'inkling2', 'inkling2_loop']);
+
+export interface GgufProjectorChoice {
+  /** The projector file name, or undefined when there is no single one. */
+  readonly name: string | undefined;
+  /** The names that share the best precision when there is no single one; else empty. */
+  readonly tied: readonly string[];
+}
+
+/**
+ * The vision projector the GGUF loader of `architecture` pairs with `weightName`, among `folderNames`, the names in
+ * the weight's own folder. Undefined when that loader takes no projector. A name that holds none of the precision
+ * words is never picked: a Q8_0 projector beside a Qwen3.5 or Gemma4 weight fails the load.
+ */
+export function pickGgufProjector(
+  architecture: string,
+  weightName: string,
+  folderNames: readonly string[],
+): GgufProjectorChoice | undefined {
+  const precisions = PROJECTOR_PRECISIONS.get(architecture);
+  if (precisions === undefined) return undefined;
+  const candidates = folderNames.filter(isGgufProjectorName);
+  const exact = `${PROJECTOR_PREFIX}${weightName}`;
+  if (EXACT_PROJECTOR_ARCHITECTURES.has(architecture) && candidates.includes(exact)) return { name: exact, tied: [] };
+  let best = precisions.length;
+  let atBest: string[] = [];
+  for (const name of candidates) {
+    const lower = name.toLowerCase();
+    const rank = precisions.findIndex((word) => lower.includes(word));
+    if (rank < 0 || rank > best) continue;
+    if (rank < best) {
+      best = rank;
+      atBest = [];
+    }
+    atBest.push(name);
+  }
+  if (atBest.length === 1) return { name: atBest[0], tied: [] };
+  return { name: undefined, tied: atBest.sort() };
+}

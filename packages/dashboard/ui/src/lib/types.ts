@@ -108,6 +108,8 @@ export interface CatalogBuildItem {
    */
   localAssetsRepo: string | null;
   localAssetsRevision: string | null;
+  /** The install's marker lists no file the catalog names for the build (a glob with no `*`); absent otherwise. */
+  lacksNamedFile?: true;
   /** The folder was made by Locate from model files elsewhere on this Mac; `null` otherwise. */
   located: LocatedFiles | null;
   /** Local models lists the folder at `slug`. */

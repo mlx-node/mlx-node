@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,7 +51,7 @@ vi.mock('@huggingface/hub', () => ({
   },
 }));
 
-import { run } from '../../packages/cli/src/commands/download-model.js';
+import { checkGgufTargets, planGgufProjectors, run } from '../../packages/cli/src/commands/download-model.js';
 
 function serve(path: string, bytes: Uint8Array<ArrayBuffer>): void {
   hub.blobs[path] = bytes;
@@ -120,5 +120,67 @@ describe('download model GGUF header check', () => {
     await expect(download('*UD-Q4_K_XL*')).rejects.toThrow(/parts 1, 3 of 3; select every part/);
     expect(hub.downloaded).toEqual([]);
     expect(existsSync(join(outputDir, 'Tiny-UD-Q4_K_XL-00001-of-00003.gguf'))).toBe(false);
+  });
+
+  it('returns the header architecture of each target', async () => {
+    serve('Tiny-UD-Q4_K_M.gguf', tinyGgufBytes({ arch: 'inkling2' }));
+    serve('sub/Other-Q8_0.gguf', tinyGgufBytes({ arch: 'llama' }));
+    const checked = await checkGgufTargets({ repo: REPO, paths: ['Tiny-UD-Q4_K_M.gguf', 'sub/Other-Q8_0.gguf'] });
+    expect(checked.targets).toEqual([['Tiny-UD-Q4_K_M.gguf'], ['sub/Other-Q8_0.gguf']]);
+    expect(checked.architectures).toEqual(['inkling2', 'llama']);
+  });
+
+  it('downloads the vision projector the loader pairs beside a selected weight, and lists it in the marker', async () => {
+    serve('Tiny-UD-Q4_K_M.gguf', tinyGgufBytes({ arch: 'inkling2' }));
+    serve('Tiny-UD-Q4_K_XL.gguf', tinyGgufBytes({ arch: 'inkling2' }));
+    serve('mmproj-BF16.gguf', tinyGgufBytes({ arch: 'clip' }));
+    serve('mmproj-F16.gguf', tinyGgufBytes({ arch: 'clip' }));
+    await download('*Q4_K_M*');
+    expect([...hub.downloaded].sort()).toEqual(['Tiny-UD-Q4_K_M.gguf', 'mmproj-BF16.gguf']);
+    expect(
+      readdirSync(outputDir)
+        .filter((name) => name.endsWith('.gguf'))
+        .sort(),
+    ).toEqual(['Tiny-UD-Q4_K_M.gguf', 'mmproj-BF16.gguf']);
+    const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf8')) as {
+      files: string[];
+    };
+    expect(marker.files).toContain('mmproj-BF16.gguf');
+  });
+
+  it('says a weight with no projector beside it loads text-only, and installs it', async () => {
+    serve('Tiny-UD-Q4_K_M.gguf', tinyGgufBytes({ arch: 'inkling2' }));
+    const log = vi.spyOn(console, 'log');
+    try {
+      await download('*Q4_K_M*');
+      expect(log).toHaveBeenCalledWith(
+        `No vision projector beside Tiny-UD-Q4_K_M.gguf in ${REPO}: it loads text-only.`,
+      );
+    } finally {
+      log.mockRestore();
+    }
+    expect(hub.downloaded).toEqual(['Tiny-UD-Q4_K_M.gguf']);
+    expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(true);
+  });
+});
+
+describe('planGgufProjectors', () => {
+  it('adds nothing when the selection already holds a projector in the weight folder', () => {
+    const repo = ['M-UD-Q4_K_M.gguf', 'mmproj-BF16.gguf', 'mmproj-F16.gguf'];
+    expect(
+      planGgufProjectors([['M-UD-Q4_K_M.gguf']], ['qwen35'], repo, ['M-UD-Q4_K_M.gguf', 'mmproj-F16.gguf']),
+    ).toEqual({ add: [], without: [] });
+  });
+
+  it('takes a projector only from the folder of the weight', () => {
+    const target = ['BF16/M-BF16-00001-of-00002.gguf', 'BF16/M-BF16-00002-of-00002.gguf'];
+    expect(planGgufProjectors([target], ['qwen35'], [...target, 'mmproj-BF16.gguf'], target)).toEqual({
+      add: [],
+      without: [{ weight: target[0], tied: [] }],
+    });
+    expect(planGgufProjectors([target], ['qwen35'], [...target, 'BF16/mmproj-BF16.gguf'], target)).toEqual({
+      add: [{ path: 'BF16/mmproj-BF16.gguf', weight: target[0] }],
+      without: [],
+    });
   });
 });

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
 import { downloadFile } from '@huggingface/hub';
-import { readGgufHeader } from '@mlx-node/lm/gguf-metadata';
+import { readGgufHeader, readGgufSourceArchitecture } from '@mlx-node/lm/gguf-metadata';
 import { ggufSplitPart, isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 
 /**
@@ -19,7 +19,7 @@ export async function checkGgufTargets(opts: {
   revision?: string;
   paths: readonly string[];
   accessToken?: string;
-}): Promise<{ targets: string[][]; headerBytes: number }> {
+}): Promise<{ targets: string[][]; architectures: string[]; headerBytes: number }> {
   const groups = new Map<string, { stem: string; parts: Map<number, string>; totals: Set<number> }>();
   for (const path of opts.paths) {
     const name = basename(path);
@@ -42,7 +42,7 @@ export async function checkGgufTargets(opts: {
     }
     targets.push(numbers.map((n) => parts.get(n) as string));
   }
-  if (targets.length === 0) return { targets, headerBytes: 0 };
+  if (targets.length === 0) return { targets, architectures: [], headerBytes: 0 };
 
   const { checkGgufHeaders } = await import('@mlx-node/core');
   const repo = { type: 'model' as const, name: opts.repo };
@@ -52,6 +52,7 @@ export async function checkGgufTargets(opts: {
     return blob;
   };
   let headerBytes = 0;
+  const architectures: string[] = [];
   for (const target of targets) {
     const scratch = await mkdtemp(join(tmpdir(), 'mlx-gguf-check-'));
     try {
@@ -64,6 +65,14 @@ export async function checkGgufTargets(opts: {
           blob.size,
         );
         headerBytes += header.length;
+        if (path === target[0]) {
+          architectures.push(
+            await readGgufSourceArchitecture(
+              async (position, length) => header.subarray(position, position + length),
+              header.length,
+            ),
+          );
+        }
         await writeFile(join(dir, basename(path)), header);
       }
       const folder = dirname(target[0]);
@@ -82,5 +91,5 @@ export async function checkGgufTargets(opts: {
       await rm(scratch, { recursive: true, force: true });
     }
   }
-  return { targets, headerBytes };
+  return { targets, architectures, headerBytes };
 }

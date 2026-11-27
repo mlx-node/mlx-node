@@ -222,6 +222,20 @@ export function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
 }
 
 /**
+ * The first of `globs` with no `*` that is neither a path nor a base name of `paths`, in any case: a file the build
+ * needs that `paths` lacks.
+ */
+export function missingNamedFile(globs: readonly string[] | undefined, paths: readonly string[]): string | undefined {
+  if (globs === undefined) return undefined;
+  const names = new Set<string>();
+  for (const path of paths) {
+    names.add(path.toLowerCase());
+    names.add(basename(path).toLowerCase());
+  }
+  return globs.find((glob) => !glob.includes('*') && !names.has(glob.toLowerCase()));
+}
+
+/**
  * A catalog build that installs with no `config.json` (`configlessBuildOf` in `catalog.ts`): the family its GGUF
  * header states, and the globs of its files (`undefined`: every file, as for a job with no globs).
  */

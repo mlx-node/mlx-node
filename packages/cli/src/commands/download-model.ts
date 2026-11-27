@@ -30,8 +30,10 @@ import {
   isRetriableFetchError,
   matchesAnyGlob,
   pickAssetSidecars,
+  planGgufProjectors,
   withRetries,
   type GgufLoadEntry,
+  type GgufProjectorPlan,
 } from './download-model-helpers.js';
 import {
   assertCompletionRepoCompatible,
@@ -58,8 +60,10 @@ export {
   isModelAlreadyDownloaded,
   isRetriableFetchError,
   pickAssetSidecars,
+  planGgufProjectors,
   withRetries,
   type GgufLoadEntry,
+  type GgufProjectorPlan,
 };
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
@@ -102,6 +106,11 @@ Glob Filtering:
 
   Multiple --glob flags can be combined; a file is included if it matches ANY
   of the patterns.
+
+  A selected GGUF weight whose loader takes a vision projector (Qwen3.5 and
+  Qwen3.8 dense, Gemma 4, Inkling 2) also brings the one mmproj-*.gguf in its
+  repo folder that the loader pairs with it (BF16 first), unless the globs
+  already select a projector there. Without one the model loads text-only.
 
 Examples:
   mlx download model
@@ -765,7 +774,8 @@ export async function run(argv: string[]) {
     await restoreCompletionMarker();
     throw error;
   }
-  const { totalSize, filesToDownload, allFiles, components } = manifest;
+  const { filesToDownload, allFiles, components } = manifest;
+  let totalSize = manifest.totalSize;
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');
@@ -785,17 +795,40 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
+  let projectors: GgufProjectorPlan;
   try {
-    await checkGgufTargets({
+    const { targets, architectures } = await checkGgufTargets({
       repo: modelName,
       revision: remoteSha ?? undefined,
       paths: filesToDownload.map((file) => file.path),
       accessToken: HUGGINGFACE_TOKEN,
     });
+    projectors = planGgufProjectors(
+      targets,
+      architectures,
+      allFiles.map((file) => file.path),
+      filesToDownload.map((file) => file.path),
+    );
   } catch (error) {
     await restoreCompletionMarker();
     throw error;
   }
+  const projectorOf = new Map<string, string>();
+  for (const { path, weight } of projectors.add) {
+    const file = allFiles.find((entry) => entry.path === path);
+    if (file === undefined) continue;
+    filesToDownload.push(file);
+    totalSize += file.size ?? 0;
+    projectorOf.set(path, weight);
+  }
+  for (const { weight, tied } of projectors.without) {
+    console.log(
+      tied.length > 0
+        ? `No single vision projector to take beside ${weight} (${tied.join(', ')}). Name one with -g.`
+        : `No vision projector beside ${weight} in ${modelName}: it loads text-only.`,
+    );
+  }
+  if (projectors.without.length > 0) console.log('');
 
   // ── Preflight: resolve every prune/certify guard input BEFORE the first
   // write. The download loop and the sidecar fetch write IN PLACE into
@@ -953,7 +986,10 @@ export async function run(argv: string[]) {
   if (globPatterns?.length) {
     console.log(`Matched ${filesToDownload.length} file(s):`);
     for (const f of filesToDownload) {
-      console.log(`  ${f.path} (${formatBytes(f.size)})`);
+      const weight = projectorOf.get(f.path);
+      console.log(
+        `  ${f.path} (${formatBytes(f.size)})${weight === undefined ? '' : `, vision projector for ${weight}`}`,
+      );
     }
     console.log('');
   }
