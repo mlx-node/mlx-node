@@ -173,12 +173,21 @@ describe('turnTitle', () => {
     expect(turnTitle([])).toBe('(no prompt)');
   });
 
-  // Mutation: the Read it now command left as the title (its JSON shows) → red.
+  // Mutations: the Read it now command left as the title (its JSON shows); the app's own start titled as the person's → red.
   it('reads a Read it now command as the row it draws, by the name of its PDF', () => {
-    const command = readPdfCommand('laz3a7wn-40', 'What are the findings?', 'report.pdf');
-    const turn: TranscriptEntry[] = [{ kind: 'user', ts: 1, text: command, promptIndex: 0 }];
-    expect(turnTitle(turn, new Map([['laz3a7wn-40', 'report.pdf']]))).toBe('You started reading report.pdf');
-    expect(turnTitle(turn)).toBe(CHAT.pdf.hostStartBare);
+    const names = new Map([['laz3a7wn-40', 'report.pdf']]);
+    const turn = (by: 'you' | 'app'): TranscriptEntry[] => [
+      {
+        kind: 'user',
+        ts: 1,
+        text: readPdfCommand('laz3a7wn-40', 'What are the findings?', 'report.pdf', by),
+        promptIndex: 0,
+      },
+    ];
+    expect(turnTitle(turn('you'), names)).toBe('You started reading report.pdf');
+    expect(turnTitle(turn('you'))).toBe(CHAT.pdf.hostStartBare);
+    expect(turnTitle(turn('app'), names)).toBe('Started reading report.pdf');
+    expect(turnTitle(turn('app'))).toBe(CHAT.pdf.appStartBare);
   });
 
   it('says what woke the agent when no prompt was typed', () => {

@@ -1746,10 +1746,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   file of the Work folder takes one of its names, and (`conversation-busy`) while a run of `read-pdf` of
   the conversation is active or paused, so two runs never share the image lane. For a model of `HOST_START_FAMILIES`
   (`gemma4`, `qwen3_5`: they started the tool from the note in 2 of 10 tries each, against 10 of 10 for
-  Inkling-2-Mini) the service sends that command itself when the turn that sent the PDF ends (completed, output limit
-  or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it; not after a Stop, a deny
-  or a failed turn, and not while another turn or a run of the tool goes on, which leaves Read it now. A Read it now
-  sent while that start is in flight gets its turn.
+  Inkling-2-Mini) the service sends that command itself in Auto and Bypass when the turn that sent the PDF ends
+  (completed, output limit or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it;
+  not in Ask, not in a fork (its page folders are the original's), not after a Stop, a deny or a failed turn, and not
+  while another turn or a run of the tool goes on, which leaves Read it now. A Read it now sent while that start is in
+  flight gets its turn. The command's args carry `by`: `"you"` for Read it now, `"app"` for the service's own start
+  (the script does not read it).
   - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
     320 pages: "{name} has {n} pages. Up to 320 pages can be read."); only a PDF of 20 pages or fewer keeps its pages
     in the window too, so a model change moves it between the two ways with no second draw. The page plans the ways
@@ -1775,10 +1777,11 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
     try "It failed twice. Its pages were not read." The cuts and "combine" keep the plain row.
   - Read it now. Under a finished Work turn that sent a PDF to the tool and that no run read: "The pages of {name} were
     not read." with Read it now while the conversation's model sees images and nothing runs ("The PDF tool could not
-    start. Try again." on a failure). Its command turn is drawn as one row, "You started reading {name}".
+    start. Try again." on a failure). Its command turn is drawn as one row, "You started reading {name}", or "Started
+    reading {name}" for the service's own start. A fork shows neither the line nor the button.
   - Ask. The launch card reads "Read {name} with the PDF tool · {n} pages · {r} reader agents".
   - Sessions. The transcript draws the same chip, block, line, rows and end row from stored lines, the unread line with
-    no button, and the command turn as its row.
+    no button (none in a fork), and the command turn as its row.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip
@@ -3062,8 +3065,8 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   a PDF past the message's room and "pdftool" launches `read-pdf` on it (`readPdf` step; `$PDF` and `$RUN` in a
   script's steps stand for the PDF id its note names and the turn's run id): readers one after another, 4 pages
   each, each opening its pages with `read_file` and a live tick, pages 9-12 failing twice, then "combine", the report
-  and the wake. "pdfnot" answers without reading; on the `qwen3_5` family the host then sends the `/workflow
-  read-pdf` turn itself, and with `MLX_DEV_IMAGE_FAMILY=inkling2` the turn leaves the Read it now line, whose
+  and the wake. "pdfnot" answers without reading; on the `qwen3_5` family in Auto or Bypass the host then sends the
+  `/workflow read-pdf` turn itself ("Started reading report.pdf"), in Ask and with `MLX_DEV_IMAGE_FAMILY=inkling2` the turn leaves the Read it now line, whose
   `/workflow read-pdf` turn starts the same run from the Work scenario's `readPdf` (pages 5-8 fail once). The fake
   agent stores a tool PDF's note as its own chunk, so the Sessions transcript shows its chip. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
   `model_auto_switched` line and `end_turn`, nothing stored): "No model answered." with the agent's words under it;

@@ -757,20 +757,28 @@ describe('a run of the PDF tool', () => {
     expect(pdfOf([note, script, pdfRun()])).toBeNull();
   });
 
+  // Mutation: the app's own start read as the person's → it shows "You started reading".
   it('a Read it now that opens the turn of the run names its PDF; any other prompt there does not', () => {
     const typed: TranscriptEntry = {
       kind: 'user',
       ts: T0 - 500,
-      text: readPdfCommand(ID, 'Summarize the findings', 'report.pdf'),
+      text: readPdfCommand(ID, 'Summarize the findings', 'report.pdf', 'you'),
       promptIndex: 1,
     };
     expect(pdfOf([note, typed, pdfRun()])).toEqual({ id: ID, name: 'report.pdf', pages: all(40), by: 'you' });
+    const own: TranscriptEntry = { ...typed, text: readPdfCommand(ID, 'Summarize the findings', 'report.pdf', 'app') };
+    expect(pdfOf([note, own, pdfRun()])).toEqual({ id: ID, name: 'report.pdf', pages: all(40), by: 'app' });
     const end: TranscriptEntry = { kind: 'turn-end', ts: T0 - 200, stopReason: 'end_turn' };
     expect(pdfOf([note, typed, end, pdfRun()])).toBeNull();
     expect(pdfOf([note, pdfRun()])).toBeNull();
     const names = pdfNames([note]);
     expect(hostStartWords(typed.text, names)).toBe(fill(P.hostStart, { name: 'report.pdf' }));
     expect(hostStartWords(typed.text, new Map())).toBe(P.hostStartBare);
+    expect(hostStartWords(own.text, names)).toBe('Started reading report.pdf');
+    expect(hostStartWords(own.text, new Map())).toBe('Started reading a PDF');
+    expect(hostStartWords('/workflow read-pdf {"pdf": "abcdefgh-40", "by": "model"}', names)).toBe(
+      'You started reading report.pdf',
+    );
     expect(hostStartWords('/workflow read-pdf {"pdf": "nope"}', names)).toBeNull();
     expect(hostStartWords('Summarize the findings', names)).toBeNull();
     expect(pdfRunName({ name: 'report.pdf' })).toBe('Reading report.pdf');
@@ -890,19 +898,21 @@ describe('a run of the PDF tool', () => {
     expect(leftWords(2 * 3_600_000)).toBe(fill(P.left.hours, { n: 2 }));
   });
 
-  // Mutation: Read it now while the turn runs → a second run starts beside the model's own.
+  // Mutations: Read it now while the turn runs → a second run starts beside the model's own; the fork check dropped →
+  // a fork offers a PDF whose page folder is the original's.
   it('Read it now: a PDF sent to the tool that no run read, once its turn ended, never while an answer runs', () => {
     const entries = [note];
-    expect(pdfUnread(entries, 0, false, new Set())).toEqual([{ id: ID, name: 'report.pdf' }]);
-    expect(pdfUnread(entries, 0, true, new Set())).toEqual([]);
+    expect(pdfUnread(entries, 0, false, new Set(), false)).toEqual([{ id: ID, name: 'report.pdf' }]);
+    expect(pdfUnread(entries, 0, true, new Set(), false)).toEqual([]);
+    expect(pdfUnread(entries, 0, false, new Set(), true)).toEqual([]);
     const read = [note, launch({ pdf: ID, question: 'q' }), pdfRun()];
-    expect(pdfUnread(read, 0, false, startedPdfs(runsAt(read)))).toEqual([]);
+    expect(pdfUnread(read, 0, false, startedPdfs(runsAt(read)), false)).toEqual([]);
     const other = [note, launch({ pdf: 'zzzzzzzz-40', question: 'q' }), pdfRun()];
-    expect(pdfUnread(other, 0, false, startedPdfs(runsAt(other)))).toEqual([{ id: ID, name: 'report.pdf' }]);
+    expect(pdfUnread(other, 0, false, startedPdfs(runsAt(other)), false)).toEqual([{ id: ID, name: 'report.pdf' }]);
     const inMessage: TranscriptEntry = {
       ...note,
       attachments: [{ kind: 'pdf', name: 'short.pdf', pages: 2, way: 'message', bytes: 9, chars: 12 }],
     };
-    expect(pdfUnread([inMessage], 0, false, new Set())).toEqual([]);
+    expect(pdfUnread([inMessage], 0, false, new Set(), false)).toEqual([]);
   });
 });

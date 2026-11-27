@@ -224,7 +224,7 @@ describe('a file of the Work folder that takes a PDF tool name first', () => {
 
 describe('the host start', () => {
   it("is the agent's own /workflow command with the args as JSON, which Work sends as typed", () => {
-    const text = readPdfCommand('k3f9a2c1-212', 'What does "p. 4" say?\nAnd the table?', 'report.pdf');
+    const text = readPdfCommand('k3f9a2c1-212', 'What does "p. 4" say?\nAnd the table?', 'report.pdf', 'app');
     expect(text.startsWith('/workflow read-pdf {')).toBe(true);
     const slash = parseSlash(text)!;
     expect(slash.name).toBe('workflow');
@@ -232,6 +232,7 @@ describe('the host start', () => {
       pdf: 'k3f9a2c1-212',
       question: 'What does "p. 4" say?\nAnd the table?',
       objective: 'Read report.pdf',
+      by: 'app',
     });
     expect(text.includes('\n')).toBe(false);
     expect(workflowCommand(text)).toBeNull();
@@ -244,7 +245,7 @@ describe('the host start', () => {
 
   it('cuts a long question, never inside a surrogate pair', () => {
     const long = `${'q'.repeat(READ_PDF_QUESTION_MAX - 1)}😀 and more`;
-    const args = JSON.parse(parseSlash(readPdfCommand('k3f9a2c1-212', long, 'a.pdf'))!.args.slice(9)) as {
+    const args = JSON.parse(parseSlash(readPdfCommand('k3f9a2c1-212', long, 'a.pdf', 'you'))!.args.slice(9)) as {
       question: string;
     };
     expect(args.question).toBe('q'.repeat(READ_PDF_QUESTION_MAX - 1));

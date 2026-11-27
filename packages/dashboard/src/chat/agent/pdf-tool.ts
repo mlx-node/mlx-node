@@ -9,7 +9,7 @@
 import { lstat, mkdir, readdir, readFile, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
-import { PDF_READER_PAGES, PDF_TOOL_MAX_PAGES } from '../attachment-rule.js';
+import { PDF_READER_PAGES, PDF_TOOL_MAX_PAGES, type PdfStartBy } from '../attachment-rule.js';
 import { writeFileAtomic } from '../paths.js';
 
 export const READ_PDF_WORKFLOW = 'read-pdf';
@@ -513,11 +513,11 @@ function cutUnits(text: string, max: number): string {
 }
 
 /**
- * The prompt that starts a run with no model call: the agent runs `/workflow <name> {json}` itself, and `objective`
- * names the run.
+ * The prompt that starts a run with no model call: the agent runs `/workflow <name> {json}` itself, `objective` names
+ * the run, and `by` (which the script does not read) says who sent it.
  */
-export function readPdfCommand(id: string, question: string, name: string): string {
-  const args = { pdf: id, question: cutUnits(question, READ_PDF_QUESTION_MAX), objective: `Read ${name}` };
+export function readPdfCommand(id: string, question: string, name: string, by: PdfStartBy): string {
+  const args = { pdf: id, question: cutUnits(question, READ_PDF_QUESTION_MAX), objective: `Read ${name}`, by };
   return `/workflow ${READ_PDF_WORKFLOW} ${JSON.stringify(args)}`;
 }
 

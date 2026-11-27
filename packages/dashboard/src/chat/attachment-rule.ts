@@ -59,6 +59,11 @@ export const FLASH_NEXT_IMAGES_MAX = 4;
 export const PDF_NOTE_MARKER = 'Portato PDF note 1';
 /** Pages the PDF tool gives one reader agent. */
 export const PDF_READER_PAGES = 4;
+/**
+ * Who sent a `/workflow read-pdf` prompt, as its `by` arg: the person's Read it now, or the app itself after a turn
+ * whose model did not start the tool.
+ */
+export type PdfStartBy = 'you' | 'app';
 /** A stage id: lowercase base32 letters; its first {@link PDF_ID_LETTERS} name the page folder. */
 export const PDF_STAGE_CHARS = 26;
 export const PDF_ID_LETTERS = 8;

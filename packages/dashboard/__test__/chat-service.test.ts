@@ -34,7 +34,14 @@ import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secre
 import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
 import { routeError } from '../src/chat/route-errors.js';
 import type { ChatService } from '../src/chat/service.js';
-import type { ChatHostEvent, ChatHostState, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
+import type {
+  ChatHostEvent,
+  ChatHostState,
+  ConversationEvent,
+  CwdProblem,
+  Interaction,
+  PermissionMode,
+} from '../src/chat/types.js';
 import { CWD_PROBLEM_MESSAGES } from '../src/chat/work-folder.js';
 import { readScratchRecordsSync, stampName } from '../src/chat/work-scratch.js';
 import type { RuntimeLive } from '../src/live.js';
@@ -1205,7 +1212,7 @@ describe('Chat service — attachments', () => {
           await svc.readPdf(conversation.id, id);
           await until(() => done() === 3, 5_000);
           const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
-          expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf') });
+          expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf', 'you') });
           const gone = await apiError(svc.readPdf(conversation.id, pdfToolId('b'.repeat(26), 3)));
           expect([gone.code, gone.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
           page.detach();
@@ -1249,10 +1256,10 @@ describe('Chat service — attachments', () => {
     }, 20_000);
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
-    // Mutations: the host start left out; the family check dropped; a start after the model's call of the PDF, after
-    // any call of the tool, or after a deny; Read it now while a run of the tool goes on; Read it now during the host's
-    // start not answered with its turn → red.
-    it('Work: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
+    // Mutations: the host start left out; the family check dropped; a start in Ask; a start in a fork; a start after the
+    // model's call of the PDF, after any call of the tool, or after a deny; the start sent as the person's; Read it now
+    // while a run of the tool goes on; Read it now during the host's start not answered with its turn → red.
+    it('Work Auto and Bypass: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
       const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
       const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
       await withWork(
@@ -1263,22 +1270,27 @@ describe('Chat service — attachments', () => {
             prompts(fake)
               .filter((p) => p.sessionId === session)
               .map((p) => (p.prompt as Array<{ text?: string }>)[0]!.text ?? '');
-          /** Sends `text` with a 3-page tool PDF on `model`; its page, and its first turn's end as the page saw it. */
-          const send = async (text: string, model: string) => {
+          const ended = (page: Page) => () => {
+            const first = page.events[0];
+            return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0) > 0;
+          };
+          let drafts = 0;
+          /** Sends `text` with a 3-page tool PDF on `model` in `mode`; its page, and its first turn's end as the page saw it. */
+          const send = async (text: string, model: string, mode: PermissionMode) => {
             const stage = await staged(svc, 3);
+            const draft = `d${++drafts}`;
+            if (mode !== 'ask') await svc.setDraftPermissionMode(draft, mode, true, project, null);
             const { conversation, turnId } = await svc.create({
               mode: 'work',
               text,
               cwd: project,
               modelId: model,
               attachments: [tool(stage, 3)],
+              draft,
             });
+            expect(conversation.permissionMode).toBe(mode);
             const page = new Page(svc, conversation.id);
-            const ended = () => {
-              const first = page.events[0];
-              return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0) > 0;
-            };
-            return { id: conversation.id, pdf: pdfToolId(stage, 3), turnId, page, ended };
+            return { id: conversation.id, pdf: pdfToolId(stage, 3), turnId, page, ended: ended(page) };
           };
           const settle = () => new Promise((resolve) => setTimeout(resolve, 500));
           const answered = async (p: Awaited<ReturnType<typeof send>>, optionId: string) => {
@@ -1287,8 +1299,13 @@ describe('Chat service — attachments', () => {
             await until(p.ended, 10_000);
             await settle();
           };
+          const quiet = async (p: Awaited<ReturnType<typeof send>>) => {
+            await until(p.ended, 10_000);
+            await settle();
+            expect(interactionsOf(p.page)).toEqual([]);
+          };
 
-          const skipped = await send('pdfnot', GEMMA.name);
+          const skipped = await send('pdfnot', GEMMA.name, 'bypass');
           let pressed: Promise<{ turnId: string }> | null = null;
           let hostTurn: string | null = null;
           const stopWatch = svc.watchConversation(skipped.id, (event) => {
@@ -1298,41 +1315,53 @@ describe('Chat service — attachments', () => {
             pressed = svc.readPdf(skipped.id, skipped.pdf);
           });
           await until(() => texts(skipped.id).length === 2, 10_000);
-          expect(texts(skipped.id)).toEqual(['pdfnot', readPdfCommand(skipped.pdf, 'pdfnot', 'report.pdf')]);
+          expect(texts(skipped.id)).toEqual(['pdfnot', readPdfCommand(skipped.pdf, 'pdfnot', 'report.pdf', 'app')]);
           await until(() => pressed !== null, 5_000);
           expect(await pressed!).toEqual({ turnId: hostTurn });
           stopWatch();
 
-          const other = await send('pdfnot', INKLING.name);
-          await until(other.ended, 10_000);
+          const auto = await send('pdfnot', GEMMA.name, 'auto');
+          await until(() => texts(auto.id).length === 2, 10_000);
+          expect(texts(auto.id)).toEqual(['pdfnot', readPdfCommand(auto.pdf, 'pdfnot', 'report.pdf', 'app')]);
+
+          const asked = await send('pdfnot', GEMMA.name, 'ask');
+          await quiet(asked);
+          expect(texts(asked.id)).toEqual(['pdfnot']);
+
+          const forked = (await svc.fork(asked.id)).id;
+          expect(await svc.setPermissionMode(forked, 'bypass', true)).toEqual({ mode: 'bypass' });
+          const forkPage = new Page(svc, forked);
+          const stage = await staged(svc, 3);
+          await svc.prompt(forked, 'pdfnot', [tool(stage, 3)]);
+          await until(ended(forkPage), 10_000);
           await settle();
+          expect(texts(forked)).toEqual(['pdfnot']);
+          forkPage.detach();
+
+          const other = await send('pdfnot', INKLING.name, 'bypass');
+          await quiet(other);
           expect(texts(other.id)).toEqual(['pdfnot']);
 
-          const own = await send('pdftool', GEMMA.name);
-          await answered(own, 'allow-once');
+          const own = await send('pdftool', GEMMA.name, 'bypass');
+          await quiet(own);
           expect(texts(own.id)).toEqual(['pdftool']);
           const busy = await apiError(svc.readPdf(own.id, own.pdf));
           expect(busy.code).toBe('E_CONFLICT');
           expect(texts(own.id)).toEqual(['pdftool']);
 
-          const refused = await send('pdftool', GEMMA.name);
-          await answered(refused, 'reject-once');
-          expect(refused.page.ends()[0]).toMatchObject({ outcome: 'denied' });
-          expect(texts(refused.id)).toEqual(['pdftool']);
-
-          const called = await send('pdfcall', GEMMA.name);
-          await answered(called, 'allow-once');
+          const called = await send('pdfcall', GEMMA.name, 'bypass');
+          await quiet(called);
           expect(texts(called.id)).toEqual(['pdfcall']);
 
-          const wrong = await send('pdfwrong', GEMMA.name);
+          const wrong = await send('pdfwrong', GEMMA.name, 'auto');
           await answered(wrong, 'allow-once');
-          expect(texts(wrong.id)).toEqual(['pdfwrong', readPdfCommand(wrong.pdf, 'pdfwrong', 'report.pdf')]);
+          expect(texts(wrong.id)).toEqual(['pdfwrong', readPdfCommand(wrong.pdf, 'pdfwrong', 'report.pdf', 'app')]);
 
-          const wrongDenied = await send('pdfwrong', GEMMA.name);
+          const wrongDenied = await send('pdfwrong', GEMMA.name, 'auto');
           await answered(wrongDenied, 'reject-once');
           expect(wrongDenied.page.ends()[0]).toMatchObject({ outcome: 'denied' });
           expect(texts(wrongDenied.id)).toEqual(['pdfwrong']);
-          for (const p of [skipped, other, own, refused, called, wrong, wrongDenied]) p.page.detach();
+          for (const p of [skipped, auto, asked, other, own, called, wrong, wrongDenied]) p.page.detach();
         },
         { endpointModels: [GEMMA, INKLING] },
       );

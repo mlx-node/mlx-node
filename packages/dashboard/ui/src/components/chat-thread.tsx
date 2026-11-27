@@ -266,6 +266,8 @@ export interface ChatThreadProps {
   live?: LiveActivity;
   /** Work, while the conversation's model sees images: Read it now of a PDF sent to the PDF tool. */
   onReadPdf?: (id: string) => Promise<void>;
+  /** The conversation is a fork: the PDFs its copied messages sent are the original's, so no "not read" line shows. */
+  forked?: boolean;
   /**
    * Set to the thread's jump: it mounts the turn of entry `at` first (older turns wait behind a button), scrolls to it
    * and flashes it; a run's block opens and its head takes focus.
@@ -327,6 +329,7 @@ interface ThreadPdf {
   names: ReadonlyMap<string, string>;
   started: ReadonlySet<string>;
   running: boolean;
+  fork: boolean;
   onRead: ((id: string) => Promise<void>) | undefined;
 }
 
@@ -334,6 +337,7 @@ const PdfContext = createContext<ThreadPdf>({
   names: new Map(),
   started: new Set(),
   running: false,
+  fork: false,
   onRead: undefined,
 });
 
@@ -1681,7 +1685,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement | nu
   }
 
   if (finished && mode === 'work')
-    for (const pdf of pdfUnread(turn.entries, 0, pdfThread.running, pdfThread.started))
+    for (const pdf of pdfUnread(turn.entries, 0, pdfThread.running, pdfThread.started, pdfThread.fork))
       items.push(<PdfUnreadRow key={`pdf-${pdf.id}`} pdf={pdf} onRead={pdfThread.onRead} />);
 
   if (finished && (turn.end !== null || props.outcome !== null || turnPrompt(turn) !== null)) {
@@ -2495,9 +2499,10 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
   const pdfStarted = useMemo(() => startedPdfs(places), [places]);
   const pdfRunning = liveLast || props.creating === true;
   const onReadPdf = props.onReadPdf;
+  const pdfFork = props.forked === true;
   const threadPdf = useMemo<ThreadPdf>(
-    () => ({ names: pdfNamesKept, started: pdfStarted, running: pdfRunning, onRead: onReadPdf }),
-    [pdfNamesKept, pdfStarted, pdfRunning, onReadPdf],
+    () => ({ names: pdfNamesKept, started: pdfStarted, running: pdfRunning, fork: pdfFork, onRead: onReadPdf }),
+    [pdfNamesKept, pdfStarted, pdfRunning, pdfFork, onReadPdf],
   );
   const agentHandlers = props.agentHandlers;
   const openAgent = props.openAgent ?? null;

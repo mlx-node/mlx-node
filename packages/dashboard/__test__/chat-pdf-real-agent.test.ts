@@ -370,7 +370,7 @@ describe.skipIf(BIN === undefined)('The PDF tool in Work on the real agent', () 
       const { fake, engine, wire } = r;
       const id = await session(fake);
       const placed = await placedPdf(fake, id);
-      const turn = fake.host.startTurn(id, readPdfCommand(placed.id, QUESTION, NAME), {
+      const turn = fake.host.startTurn(id, readPdfCommand(placed.id, QUESTION, NAME, 'app'), {
         modelId: MODEL,
         cwd: fake.project,
       });

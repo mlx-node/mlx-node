@@ -6,7 +6,13 @@
  * One function per rule, so the block, its end and the Sessions page say the same.
  */
 
-import { parsePages, PDF_READER_PAGES, PDF_TOOL_MAX_PAGES, pdfIdPages } from '../../../src/chat/attachment-rule.js';
+import {
+  parsePages,
+  PDF_READER_PAGES,
+  PDF_TOOL_MAX_PAGES,
+  pdfIdPages,
+  type PdfStartBy,
+} from '../../../src/chat/attachment-rule.js';
 import type { AgentNow, AgentRow } from './agents';
 import { CHAT, fill } from './chat-strings';
 import type { EngineRequest } from './chat-turns';
@@ -18,7 +24,7 @@ type RunEntry = Extract<TranscriptEntry, { kind: 'workflow' }>;
 type UserEntry = Extract<TranscriptEntry, { kind: 'user' }>;
 
 export const READ_PDF = 'read-pdf';
-/** The prompt Read it now sends: the agent starts the run itself, with no model call. */
+/** The prompt Read it now and the app's own start send: the agent starts the run itself, with no model call. */
 const HOST_START = `/workflow ${READ_PDF} `;
 /** The script's labels: `pages 33-36` for a reader, `pages 33-36 again` for its second try. */
 const READER_LABEL = 'pages ';
@@ -41,8 +47,8 @@ export interface PdfRun {
   name: string | null;
   /** The pages the run reads, in order: its `pages` arg, else every page. */
   pages: number[];
-  /** The model's `workflow` call started it, or the person's Read it now. */
-  by: 'model' | 'you';
+  /** The model's `workflow` call started it, the person's Read it now, or the app after a turn that skipped it. */
+  by: 'model' | PdfStartBy;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,6 +105,11 @@ function readArgs(value: unknown): ReadArgs | null {
   return { pdf, pages: typeof value.pages === 'string' ? value.pages : null };
 }
 
+/** A `/workflow read-pdf` prompt's args, and who sent it: the app when its `by` says so, else the person. */
+interface StartArgs extends ReadArgs {
+  by: PdfStartBy;
+}
+
 /** The args of the model's `workflow` call that starts `read-pdf` by name; null for any other call. */
 export function launchArgs(launch: ToolEntry): ReadArgs | null {
   if (launch.name !== 'workflow') return null;
@@ -109,8 +120,8 @@ export function launchArgs(launch: ToolEntry): ReadArgs | null {
   return readArgs(input.args);
 }
 
-/** The args of the person's Read it now, from its prompt text (`/workflow read-pdf {json}`); null for any other text. */
-export function hostStartOf(text: string): ReadArgs | null {
+/** The args of a Read it now or the app's own start, from its prompt text (`/workflow read-pdf {json}`); null for any other text. */
+export function hostStartOf(text: string): StartArgs | null {
   if (!text.startsWith(HOST_START)) return null;
   let value: unknown;
   try {
@@ -118,7 +129,9 @@ export function hostStartOf(text: string): ReadArgs | null {
   } catch {
     return null;
   }
-  return readArgs(value);
+  const args = readArgs(value);
+  if (args === null) return null;
+  return { ...args, by: isRecord(value) && value.by === 'app' ? 'app' : 'you' };
 }
 
 /** The name the note of `id` gives: a PDF a message of the conversation sent to the tool; null when none did. */
@@ -151,8 +164,9 @@ export function pdfRunOf(
   if (run.launch !== null) args = launchArgs(run.launch);
   else if (run.place.kind === 'entry') {
     const prompt = promptOf(entries, run.place.at);
-    args = prompt === null ? null : hostStartOf(prompt.text);
-    by = 'you';
+    const start = prompt === null ? null : hostStartOf(prompt.text);
+    args = start;
+    if (start !== null) by = start.by;
   }
   if (args === null) return null;
   const total = pdfIdPages(args.pdf)!;
@@ -445,17 +459,18 @@ export interface UnreadPdf {
 
 /**
  * The PDFs of the message at `at` that went to the PDF tool and that no run of the tool read: shown once its turn
- * ended, so never while an answer of the conversation runs (a Read it now that starts runs as one). `started`: the ids
- * of the conversation's PDF runs.
+ * ended, so never while an answer of the conversation runs (a Read it now that starts runs as one), and never in a
+ * fork, whose page folders are the original's. `started`: the ids of the conversation's PDF runs.
  */
 export function pdfUnread(
   entries: readonly TranscriptEntry[],
   at: number,
   running: boolean,
   started: ReadonlySet<string>,
+  fork: boolean,
 ): UnreadPdf[] {
   const entry = entries[at];
-  if (running || entry?.kind !== 'user' || entry.attachments === undefined) return [];
+  if (fork || running || entry?.kind !== 'user' || entry.attachments === undefined) return [];
   const out: UnreadPdf[] = [];
   for (const item of entry.attachments) {
     if (item.kind !== 'pdf' || item.way !== 'tool' || item.id === undefined || started.has(item.id)) continue;
@@ -476,10 +491,15 @@ export function pdfNames(entries: readonly TranscriptEntry[]): ReadonlyMap<strin
   return names;
 }
 
-/** The words a Read it now prompt shows in place of its command: `You started reading {file}`; null for any other. */
+/**
+ * The words a `/workflow read-pdf` prompt shows in place of its command: `You started reading {file}` for Read it now,
+ * `Started reading {file}` for the app's own start; null for any other text.
+ */
 export function hostStartWords(text: string, names: ReadonlyMap<string, string>): string | null {
   const args = hostStartOf(text);
   if (args === null) return null;
   const name = names.get(args.pdf);
-  return name === undefined ? CHAT.pdf.hostStartBare : fill(CHAT.pdf.hostStart, { name });
+  const p = CHAT.pdf;
+  if (args.by === 'app') return name === undefined ? p.appStartBare : fill(p.appStart, { name });
+  return name === undefined ? p.hostStartBare : fill(p.hostStart, { name });
 }

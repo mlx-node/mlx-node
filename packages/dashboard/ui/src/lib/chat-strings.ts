@@ -232,6 +232,8 @@ export const CHAT = {
     readNowFailed: 'The PDF tool could not start. Try again.',
     hostStart: 'You started reading {name}',
     hostStartBare: 'You started reading a PDF',
+    appStart: 'Started reading {name}',
+    appStartBare: 'Started reading a PDF',
     /** Work Ask: the card of the model's call that starts the PDF tool. */
     askCard: 'Read {name} with the PDF tool · {pages} · {readers}',
     askPages: '{n} pages',

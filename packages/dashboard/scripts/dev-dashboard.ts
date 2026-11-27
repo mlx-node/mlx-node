@@ -53,9 +53,10 @@
  * "Read report.pdf with the PDF tool · 40 pages · 10 reader agents"); Allow runs the block "Reading report.pdf": one
  * reader after another, 4 pages each, each row with the page it opened; pages 9-12 fail twice, so the end reads "36 of
  * 40 pages read · … · pages 9-12 not read". The Work word "pdfnot" answers without reading the PDF. The image models
- * are `qwen3_5`, a family the host starts the run for when the turn ends ("You started reading report.pdf"); with
- * `MLX_DEV_IMAGE_FAMILY=inkling2` the turn ends with "The pages of report.pdf were not read." and Read it now, which
- * starts the run as your own `/workflow` turn. Its pages 5-8 fail once and are read at the end.
+ * are `qwen3_5`, a family the host starts the run for in Auto and Bypass when the turn ends ("Started reading
+ * report.pdf"); in Ask, and with `MLX_DEV_IMAGE_FAMILY=inkling2`, the turn ends with "The pages of report.pdf were not
+ * read." and Read it now, which starts the run as your own `/workflow` turn ("You started reading report.pdf"). A fork
+ * shows neither. Its pages 5-8 fail once and are read at the end.
  * Pictures in tool results: the Work words "picture" and "readpdf" read a picture and three pages of a 12-page PDF; the
  * read row reads "1 picture · …" or "3 of 12 pages · …" and opens to tiles read from disk, and a tile opens the viewer
  * (← →, − + 0, Esc). The live Work session's 2nd answer reads a screenshot and a PDF the same way.

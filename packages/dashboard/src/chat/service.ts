@@ -61,6 +61,7 @@ import {
   imageCount,
   isToolPdf,
   pdfToolId,
+  type PdfStartBy,
   storedPictureChars,
 } from './attachment-rule.js';
 import { checkCommand } from './commands.js';
@@ -1264,10 +1265,10 @@ export class ChatService {
       const started = await mark.started;
       if (started !== null && this.hosts.work.turnState(id)?.turnId === started.turnId) return started;
     }
-    return this.startPdfRead(id, pdf);
+    return this.startPdfRead(id, pdf, 'you');
   }
 
-  private async startPdfRead(id: string, pdf: string): Promise<{ turnId: string }> {
+  private async startPdfRead(id: string, pdf: string, by: PdfStartBy): Promise<{ turnId: string }> {
     const conversation = await this.known(id);
     if (conversation.info.mode !== 'work') throw ApiError.badRequest(PDF_READ_WORK_ONLY);
     if (!conversation.hasBase()) await this.loadBase(conversation);
@@ -1275,7 +1276,7 @@ export class ChatService {
     const facts = sent === null ? null : await this.pdfFacts(id, pdf);
     if (sent === null || facts === null || facts.session !== id) throw ApiError.notFound(PDF_GONE);
     if (!facts.images || !facts.tool) throw chatRouteError('attachment-refused');
-    const text = readPdfCommand(pdf, sent.text, sent.name);
+    const text = readPdfCommand(pdf, sent.text, sent.name, by);
     await this.checkSlash(conversation, text);
     const cwd = await this.sendChecks(conversation, [], true);
     // Checked in the tick that starts the turn: a run that started during the awaits counts.
@@ -1301,9 +1302,10 @@ export class ChatService {
   }
 
   /**
-   * Work, a model of {@link HOST_START_FAMILIES}: the turn that sent the PDF `pdf` to the tool ended and no `read-pdf`
-   * call of the model named it, whatever its answer, so the host starts it as Read it now does. Not after a Stop, a
-   * deny or a failed turn, and not while another turn or a run of the tool goes on (Read it now stays offered).
+   * Work in Auto or Bypass, a model of {@link HOST_START_FAMILIES}: the turn that sent the PDF `pdf` to the tool ended
+   * and no `read-pdf` call of the model named it, whatever its answer, so the host starts it as Read it now does. Not
+   * in Ask, not in a fork (its page folders are the original's), not after a Stop, a deny or a failed turn, and not
+   * while another turn or a run of the tool goes on (Read it now stays offered).
    */
   private async hostStartPdf(
     conversation: Conversation,
@@ -1312,11 +1314,12 @@ export class ChatService {
   ): Promise<{ turnId: string } | null> {
     if (outcome === undefined || !HOST_START_OUTCOMES.has(outcome)) return null;
     const id = conversation.info.id;
-    if (this.conversations.get(id) !== conversation) return null;
+    if (this.conversations.get(id) !== conversation || conversation.info.forkOf !== undefined) return null;
+    if (this.modeOf(id) === 'ask') return null;
     const family = (await this.state()).models.find((m) => m.id === conversation.info.modelId)?.family;
     if (family === null || family === undefined || !HOST_START_FAMILIES.has(family)) return null;
     if (conversation.pdfCalled(pdf) !== false) return null;
-    return this.startPdfRead(id, pdf);
+    return this.startPdfRead(id, pdf, 'app');
   }
 
   /** Work: the PDF tool is there, by the last agent start, else by the files in the agent home. */

@@ -457,6 +457,7 @@ export default function SessionDetail(): ReactElement {
               live={live}
               asOfMs={arrivedAt ?? undefined}
               transcriptError={data.transcriptError}
+              fork={session.kind === 'fork'}
               onInspectTurn={(turn) => {
                 update({ tab: 'activity', turn: String(turn) });
                 setScrollToInspector((count) => count + 1);

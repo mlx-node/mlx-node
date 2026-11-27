@@ -3058,6 +3058,7 @@ export default function Chat(): ReactElement {
         agentMarksOpen={marksOpen}
         live={conv?.live}
         onReadPdf={mode === 'work' && seesPages && pdfTool ? readPdfNow : undefined}
+        forked={conv?.conversation.forkOf !== undefined}
         agentLive={conv?.conversation.hot === true}
         rewind={threadRewind}
         onRemoveRule={mode === 'work' ? removeThreadRule : undefined}
