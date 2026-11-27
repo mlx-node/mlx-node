@@ -755,8 +755,18 @@ pub enum LayerCache {
 impl LayerCache {
     /// Empty state for a layer of kind `attn`; `cap` = the admitted context.
     pub fn new(attn: Attn, window: usize, cap: usize, width: i64) -> Self {
+        Self::new_with_slack(attn, window, WINDOW_SLACK, cap, width)
+    }
+
+    pub(crate) fn new_with_slack(
+        attn: Attn,
+        window: usize,
+        slack: usize,
+        cap: usize,
+        width: i64,
+    ) -> Self {
         match attn {
-            Attn::Sliding => Self::Window(WindowRing::new(window, WINDOW_RING_SLACK, width)),
+            Attn::Sliding => Self::Window(WindowRing::new(window, slack, width)),
             Attn::Indexed => Self::Latent(LatentBuf::new(cap, width)),
         }
     }

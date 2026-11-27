@@ -987,13 +987,22 @@ impl Model {
                 self.cfg.context_length
             )));
         }
+        let window_slack = if self.cuda_cache.is_some() {
+            super::cache::WINDOW_RING_SLACK
+        } else {
+            WINDOW_SLACK
+        };
         Ok(Session {
             tokens: Vec::new(),
             written: Vec::new(),
             calls: 0,
             cap,
             kpool: self.cfg.indexer.kpool,
-            layers: self.blocks.iter().map(|b| b.new_state(cap)).collect(),
+            layers: self
+                .blocks
+                .iter()
+                .map(|b| b.new_state_with_slack(cap, window_slack))
+                .collect(),
         })
     }
 
