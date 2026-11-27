@@ -3,7 +3,7 @@
  * as the agent's own strings, and every way the card ends without an answer gives "no answer" (`cancelled`).
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,6 +21,7 @@ import {
   fakeHost,
   fakeService,
   noProviders,
+  storedWhen,
   until,
   type FakeHost,
   type FakeHostOptions,
@@ -116,12 +117,15 @@ function liveAsk(fake: FakeHost, sessionId: string): Tool[] {
   return reducer.snapshot().entries.filter((e): e is Tool => e.kind === 'tool' && e.name === 'ask_user_question');
 }
 
-function storedAsk(fake: FakeHost): Tool[] {
-  const files = readdirSync(fake.agentHome, { recursive: true, encoding: 'utf8' }).filter((f) =>
-    f.endsWith('updates.jsonl'),
+/** The stored question rows once the line {@link steps} ends with is on disk. */
+async function storedAsk(fake: FakeHost): Promise<Tool[]> {
+  const files = await storedWhen(
+    fake.agentHome,
+    () => true,
+    (text) => text.includes('"text":"Went on."'),
   );
   expect(files).toHaveLength(1);
-  return parseUpdates(readFileSync(join(fake.agentHome, files[0]!), 'utf8')).transcript.filter(
+  return parseUpdates(files[0]!).transcript.filter(
     (e): e is Tool => e.kind === 'tool' && e.name === 'ask_user_question',
   );
 }
@@ -207,7 +211,7 @@ describe('a question of the agent (Work)', () => {
             ],
           },
         });
-        expect(storedAsk(fake)).toEqual(live);
+        expect(await storedAsk(fake)).toEqual(live);
       },
       { providers: noProviders({ secretNeedles: () => [KEY] }), mutate: steps(threeQuestions()) },
     );
@@ -414,7 +418,7 @@ describe('a question of the agent (Work)', () => {
         ]);
         const live = liveAsk(fake, id);
         expect(live.map((t) => t.ask?.result)).toEqual([{ kind: 'discuss' }, { kind: 'plan-now' }]);
-        expect(storedAsk(fake)).toEqual(live);
+        expect(await storedAsk(fake)).toEqual(live);
       },
       {
         providers: noProviders({ secretNeedles: () => [KEY] }),
@@ -469,7 +473,7 @@ describe('a question of the agent (Work)', () => {
           kind: 'answered',
           answers: [{ picks: ['Sidebar layout'], other: null }],
         });
-        expect(storedAsk(fake)).toEqual(live);
+        expect(await storedAsk(fake)).toEqual(live);
       },
       {
         providers: noProviders({ secretNeedles: () => [KEY] }),

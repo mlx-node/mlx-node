@@ -12,7 +12,7 @@ import { activityOf, wakeReportOf, wakeReportsOf } from '../ui/src/lib/activity.
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import { fill } from '../ui/src/lib/chat-strings.js';
 import { WAKE_ENDED, WAKE_REPORTED, wakeTitle } from '../ui/src/lib/sessions.js';
-import { fakeHost, fakeService, until, type FakeHost, type Json } from './helpers/chat-fake.js';
+import { ended, fakeHost, fakeService, storedWhen, until, type FakeHost, type Json } from './helpers/chat-fake.js';
 
 const MODEL = 'qwen3.5-4b';
 
@@ -321,10 +321,7 @@ describe('chat-harness scenario', () => {
             continue;
           if (drawn[drawn.length - 1] !== op.entry.output) drawn.push(op.entry.output);
         }
-        const files = readdirSync(fake.agentHome, { recursive: true, encoding: 'utf8' })
-          .filter((f) => f.endsWith('updates.jsonl'))
-          .map((f) => readFileSync(join(fake.agentHome, f), 'utf8'))
-          .filter((text) => text.includes('run_terminal_command'));
+        const files = await storedWhen(fake.agentHome, (_, text) => text.includes('run_terminal_command'), ended(1));
         expect(files).toHaveLength(1);
         const storedTool = parseUpdates(files[0]!).transcript.find((e) => e.kind === 'tool');
         const liveTool = reducer.snapshot().entries.find((e) => e.kind === 'tool');
@@ -513,10 +510,7 @@ describe('chat-harness scenario', () => {
       expect((await turn.done).outcome).toBe('completed');
       feed();
       const live = reducer.snapshot().entries.filter((e) => e.kind === 'tool');
-      const files = readdirSync(fake.agentHome, { recursive: true, encoding: 'utf8' })
-        .filter((f) => f.endsWith('updates.jsonl'))
-        .map((f) => readFileSync(join(fake.agentHome, f), 'utf8'))
-        .filter((text) => text.includes('docs/notes.md'));
+      const files = await storedWhen(fake.agentHome, (_, text) => text.includes('docs/notes.md'), ended(1));
       expect(files).toHaveLength(1);
       const stored = parseUpdates(files[0]!).transcript.filter((e) => e.kind === 'tool');
       expect(stored).toEqual(live);
@@ -736,10 +730,7 @@ describe('chat-harness scenario', () => {
           stopReason: 'error',
           error: 'API error (status 500 Internal Server Error): upstream failed',
         });
-        const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-          .filter((f) => f.endsWith('updates.jsonl'))
-          .map((f) => readFileSync(join(fake.root, f), 'utf8'))
-          .filter((text) => text.includes('retry_state'));
+        const files = await storedWhen(fake.root, (_, text) => text.includes('retry_state'), ended(ends.length));
         expect(files).toHaveLength(1);
         const stored = parseUpdates(files[0]!).transcript;
         expect(stored.filter((e) => e.kind === 'notice')).toEqual(notices);
@@ -865,9 +856,7 @@ describe('chat-harness scenario', () => {
             ? ['`run_terminal_command` blocked by global/no-rm: deleting build output is not allowed here']
             : [],
         );
-        const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-          .filter((f) => f.endsWith('updates.jsonl'))
-          .map((f) => readFileSync(join(fake.root, f), 'utf8'));
+        const files = await storedWhen(fake.root, () => true, ended(ends.length));
         expect(files).toHaveLength(1);
         expect(files[0]).not.toContain('hook_run_started');
         expect(files[0]).not.toContain('hookblock');
@@ -906,10 +895,7 @@ describe('chat-harness scenario', () => {
         entries.flatMap((e) => (e.kind === 'wake' ? [{ cause: e.cause, tasks: e.tasks, title: wakeTitle(e) }] : []));
       const live = wakes(reducer.snapshot().entries);
       expect(live).toMatchObject([{ cause: 'notifications', title }]);
-      const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-        .filter((f) => f.endsWith('updates.jsonl'))
-        .map((f) => readFileSync(join(fake.root, f), 'utf8'))
-        .filter((text) => text.includes('notifications-'));
+      const files = await storedWhen(fake.root, (_, text) => text.includes('notifications-'), ended(2));
       expect(files).toHaveLength(1);
       expect(wakes(parseUpdates(files[0]!).transcript)).toEqual(live);
     } finally {

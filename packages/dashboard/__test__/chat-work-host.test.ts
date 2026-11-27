@@ -38,6 +38,8 @@ import {
   fakeHost,
   fakeService,
   noProviders,
+  ended,
+  storedWhen,
   until,
   type FakeHost,
   type FakeHostOptions,
@@ -696,9 +698,9 @@ describe('plan mode rides the prompt', () => {
           entries.flatMap((e) => (e.kind === 'plan-mode' ? [`mode:${e.mode}`] : e.kind === 'user' ? ['user'] : []));
         const live = page()!.entries;
         expect(shape(live)).toEqual(['user', 'mode:plan', 'mode:default']);
-        const root = join(fake.root, 'agent-home', 'sessions');
-        const dir = readdirSync(root).find((d) => existsSync(join(root, d, conversation.id, 'updates.jsonl')))!;
-        const disk = parseUpdates(readFileSync(join(root, dir, conversation.id, 'updates.jsonl'), 'utf8')).transcript;
+        const ends = live.filter((e) => e.kind === 'turn-end').length;
+        const [text] = await storedWhen(join(fake.root, 'agent-home'), (f) => f.includes(conversation.id), ended(ends));
+        const disk = parseUpdates(text!).transcript;
         const modes = (entries: readonly TranscriptEntry[]) => entries.filter((e) => e.kind === 'plan-mode');
         expect(modes(disk)).toEqual(modes(live));
         expect(disk.map((e) => e.kind)).toEqual(live.map((e) => e.kind));
@@ -2988,9 +2990,11 @@ describe('Delete a schedule (T3)', () => {
         reducer.userPrompt('go');
         for (const u of fake.events.updates) if (u.sessionId === id) reducer.apply(u.line);
         expect(fake.events.updates.some((u) => u.line.update.sessionUpdate === 'scheduled_task_fired')).toBe(true);
-        const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-          .filter((f) => f.endsWith('updates.jsonl') && f.includes(id))
-          .map((f) => readFileSync(join(fake.root, f), 'utf8'));
+        const files = await storedWhen(
+          fake.root,
+          (f) => f.includes(id),
+          (text) => text.includes('"text":"Scheduled."'),
+        );
         expect(files).toHaveLength(1);
         expect(files[0]).not.toContain('scheduled_task_fired');
         const live = scheduleOf(reducer.snapshot().entries);
@@ -3192,10 +3196,9 @@ describe('the goal loop (#17)', () => {
     return reducer.snapshot().entries;
   }
 
-  function disk(fake: FakeHost, id: string): TranscriptEntry[] {
-    const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-      .filter((f) => f.endsWith('updates.jsonl') && f.includes(id))
-      .map((f) => readFileSync(join(fake.root, f), 'utf8'));
+  /** The stored transcript once it holds `ends` turn ends. */
+  async function disk(fake: FakeHost, id: string, ends: number): Promise<TranscriptEntry[]> {
+    const files = await storedWhen(fake.root, (f) => f.includes(id), ended(ends));
     expect(files).toHaveLength(1);
     return parseUpdates(files[0]!).transcript;
   }
@@ -3226,7 +3229,7 @@ describe('the goal loop (#17)', () => {
         // The row sits where the goal began: after its message, before its first answer.
         const row = now.findIndex((e) => e.kind === 'goal');
         expect(now[row - 1]).toMatchObject({ kind: 'user', text: typed });
-        const stored = disk(fake, id);
+        const stored = await disk(fake, id, 3);
         // The agent stores its goal rules as the prompt; the row reads as what was typed.
         expect(stored.find((e) => e.kind === 'user')).toMatchObject({ text: typed });
         expect(goals(stored)).toEqual(goals(now));
@@ -3257,7 +3260,7 @@ describe('the goal loop (#17)', () => {
         await sleep(50);
         const read = fake.records().filter((r) => r.kind === 'steer-read');
         expect(read.map((r) => r.text)).toEqual(['use pnpm', 'and yarn']);
-        const stored = disk(fake, id);
+        const stored = await disk(fake, id, 2);
         const said = stored.flatMap((e) => (e.kind === 'user' ? [e.text] : []));
         expect(said).toEqual([typed, 'use pnpm', 'and yarn']);
         expect(goals(stored)).toEqual(goals(live(fake, id, typed)));

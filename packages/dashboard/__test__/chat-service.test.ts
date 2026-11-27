@@ -49,11 +49,13 @@ import type { RuntimeLive } from '../src/live.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import {
   ageTree,
+  ended,
   endpointModel,
   fakeService,
   INFERENCE_TOKEN,
   memoryProviders,
   NO_NETWORK,
+  storedWhen,
   until,
   type FakeService,
   type Json,
@@ -1214,6 +1216,7 @@ describe('Chat service — attachments', () => {
           await until(() => done() === 3, 5_000);
           const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
           expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf', 'you') });
+          await storedWhen(join(fake.root, 'agent-home'), (f) => f.includes(conversation.id), ended(3));
           const work = new AgentSessionsReader({ agentHome: join(fake.root, 'agent-home') });
           const stored = work.detail(conversation.id)!.transcript;
           const command = stored.findIndex((e) => e.kind === 'user' && e.text.startsWith('/workflow read-pdf '));

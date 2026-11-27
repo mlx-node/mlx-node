@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { AgentSessionsReader } from '../../src/agent-sessions/reader.js';
 import type { RunState } from '../../src/agent-sessions/run-state.js';
-import type { UpdateLine } from '../../src/agent-sessions/transcript.js';
+import { parseUpdates, type UpdateLine } from '../../src/agent-sessions/transcript.js';
 import {
   AgentHost,
   type AgentLaunch,
@@ -384,6 +384,32 @@ export async function until(check: () => boolean, ms = 3_000): Promise<void> {
     if (Date.now() > end) throw new Error('condition not reached');
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+/** A stored `updates.jsonl` text that holds `n` turn ends or more. */
+export function ended(n: number): (text: string) => boolean {
+  return (text) => parseUpdates(text).transcript.filter((e) => e.kind === 'turn-end').length >= n;
+}
+
+/**
+ * The texts of the stored `updates.jsonl` files under `root` that `keep` takes, once `ready` holds for one of them.
+ * The agent stores a line after it sends it: a read right after a live event can miss that line.
+ */
+export async function storedWhen(
+  root: string,
+  keep: (path: string, text: string) => boolean,
+  ready: (text: string) => boolean,
+  ms = 5_000,
+): Promise<string[]> {
+  const read = (): string[] =>
+    readdirSync(root, { recursive: true, encoding: 'utf8' })
+      .filter((f) => f.endsWith('updates.jsonl'))
+      .flatMap((f) => {
+        const text = readFileSync(join(root, f), 'utf8');
+        return keep(f, text) ? [text] : [];
+      });
+  await until(() => read().some(ready), ms);
+  return read();
 }
 
 export interface FakeServiceOptions {
