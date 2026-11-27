@@ -440,7 +440,8 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '25'
+          # Temurin publishes no Windows ARM64 build of JDK 25; setup-java fails with "No matching version".
+          java-version: '21'
           architecture: aarch64
 
       # Credential-free pinned download (matching Komac in jobs.winget).
