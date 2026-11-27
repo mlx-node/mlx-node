@@ -5,7 +5,7 @@
 //! fixed-depth MTP when the checkpoint has MTP heads.
 //!
 //! `QWEN35_MOE_STAGE2_MODEL_PATH=/abs/qwen3.5-moe cargo test -p mlx-core \
-//!   --test qwen3_5_moe_concurrent_batched_parity -- --ignored --nocapture`
+//!   --features e2e-tests --test qwen3_5_moe_concurrent_batched_parity -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

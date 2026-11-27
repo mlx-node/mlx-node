@@ -11,7 +11,7 @@
 //!
 //! ```shell
 //! MLX_TEST_GEMMA4_MODEL_PATH=./.cache/models/gemma4-e2b-it-mlx-bf16 \
-//!     cargo test -p mlx-core --test gemma4_session -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test gemma4_session -- --ignored --nocapture
 //! ```
 
 use std::path::Path;

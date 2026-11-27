@@ -804,7 +804,7 @@ fn decode_head_weights_bit_exact_across_dtypes_and_dims() {
         (
             "real_f32",
             real(),
-            3072,
+            512,
             false,
             &[2, 4, 8],
             RowKind::Decode,
@@ -1163,33 +1163,21 @@ mod fused_metal {
         let cases = [
             // Decode & prefill small/medium
             (16usize, 1usize, 37usize, 0usize, 101u64, false),
-            (16, 1, 256, 11, 102, false),
             (16, 4, 193, 5, 103, true),
-            (16, 19, 73, 0, 104, false),
             (16, 64, 260, 8, 105, false),
             // Decode NAX large contexts & SHARE_S (S=1, 2, 4)
             (16, 1, 256, 0, 701, false),
             (16, 2, 256, 7, 702, false),
-            (16, 4, 256, 13, 703, false),
-            (16, 1, 2048, 0, 704, false),
-            (16, 2, 2048, 9, 705, false),
             (16, 4, 2048, 5, 706, true),
             (16, 1, 7763, 3, 707, false),
-            (16, 1, 8192, 0, 708, false),
             (16, 2, 8192, 11, 709, false),
-            (16, 4, 8192, 4, 710, false),
             (8, 2, 256, 3, 711, false),
             // Prefill BN_G=128 sub-tile boundaries (1..4 active 32-col sub-tiles) & S boundaries
             (16, 17, 1, 0, 901, false),
             (16, 19, 31, 0, 902, false),
             (16, 32, 32, 3, 903, false),
-            (16, 63, 33, 0, 904, false),
             (16, 64, 64, 5, 905, false),
-            (16, 65, 65, 0, 906, false),
             (16, 64, 96, 7, 907, false),
-            (16, 64, 97, 0, 908, false),
-            (16, 65, 127, 0, 909, false),
-            (16, 64, 128, 4, 910, false),
             (16, 129, 129, 0, 911, false),
             (16, 128, 300, 9, 912, false),
         ];

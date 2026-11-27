@@ -115,11 +115,15 @@ function modeChanged(): ApiError {
   return new ApiError('E_CONFLICT', 'The permission mode could not be changed.', 'mode-changed');
 }
 
-/** A message with pictures is refused once the chat's stored pictures and its own pass {@link CHAT_PICTURES_MAX_BASE64}. */
-function checkPictureRoom(conversation: Conversation, attachments: readonly AttachmentInput[]): void {
+/** A message with pictures is refused once the chat's stored pictures and its own pass `maxBase64`. */
+function checkPictureRoom(
+  conversation: Conversation,
+  attachments: readonly AttachmentInput[],
+  maxBase64: number = CHAT_PICTURES_MAX_BASE64,
+): void {
   const added = attachments.map(attachmentView);
   if (!added.some((item) => item.kind === 'image')) return;
-  if (storedPictureChars([...conversation.userAttachments(), ...added]) > CHAT_PICTURES_MAX_BASE64) {
+  if (storedPictureChars([...conversation.userAttachments(), ...added]) > maxBase64) {
     throw chatRouteError('pictures-full');
   }
 }
@@ -169,6 +173,8 @@ export interface ChatServiceOptions {
   flushMs?: number;
   stateCoalesceMs?: number;
   unloadMaxMs?: number;
+  /** Override for the per-chat base64 picture cap (default {@link CHAT_PICTURES_MAX_BASE64}). */
+  maxPicturesBase64?: number;
   now?: () => number;
   /** How earlier Control Panel lives ended (MAIN's ledger), carried in the host state. */
   appEnds?: Promise<readonly AppEnd[]>;
@@ -549,7 +555,7 @@ export class ChatService {
     const host = this.hosts[mode];
     if (host.isBusy(id)) throw chatRouteError('conversation-busy');
     if (!conversation.hasBase()) await this.loadBase(conversation);
-    checkPictureRoom(conversation, attachments);
+    checkPictureRoom(conversation, attachments, this.opts.maxPicturesBase64 ?? CHAT_PICTURES_MAX_BASE64);
     if (host.isBusy(id)) throw chatRouteError('conversation-busy');
     await this.endpoint();
     return { turnId: this.startTurn(conversation, text, cwd, attachments).turnId };

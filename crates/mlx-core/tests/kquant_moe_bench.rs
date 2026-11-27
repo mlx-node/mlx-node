@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! MLX_KQUANT_MOE_BENCH=1 cargo test -p mlx-core --release \
-//!   --test kquant_moe_bench -- --ignored --nocapture
+//!   --features e2e-tests --test kquant_moe_bench -- --ignored --nocapture
 //! ```
 //!
 //! `MLX_KQUANT_MOE_BENCH_MODES=q4k`, `_SHAPES=qwen|lfm2`, `_REPS=11`,

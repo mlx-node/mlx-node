@@ -11,7 +11,7 @@
 //!
 //! ```shell
 //! MLX_SYM8_TEST_MODEL_PATH=/tmp/qwen35-0.8b-sym8-mlx \
-//!     cargo test -p mlx-core --release --test qwen3_5_sym8_smoke -- --ignored --nocapture
+//!     cargo test -p mlx-core --release --features e2e-tests --test qwen3_5_sym8_smoke -- --ignored --nocapture
 //! ```
 //!
 //! Optional: `MLX_SYM8_DEBUG=1` prints per-forward kernel dispatch lines

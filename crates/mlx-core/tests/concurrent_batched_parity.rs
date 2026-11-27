@@ -1,7 +1,7 @@
 //! Real-Qwen3 continuous-batching parity and occupancy gate.
 //!
 //! Run with:
-//! `QWEN3_STAGE1_MODEL_PATH=/abs/qwen3-0.6b-mlx-bf16 cargo test -p mlx-core --test concurrent_batched_parity -- --ignored --nocapture`
+//! `QWEN3_STAGE1_MODEL_PATH=/abs/qwen3-0.6b-mlx-bf16 cargo test -p mlx-core --features e2e-tests --test concurrent_batched_parity -- --ignored --nocapture`
 
 use std::path::PathBuf;
 use std::time::Instant;

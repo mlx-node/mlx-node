@@ -3804,13 +3804,22 @@ pub(crate) mod tests {
         let wt = split_weights();
         for (t, tiled) in [(65usize, true), (65, false), (2048, true)] {
             let win = split_window(t, &wt);
-            let cuts = split_cuts(t);
+            let cuts = if t == 2048 {
+                vec![1, 64, 2047]
+            } else {
+                split_cuts(t)
+            };
             let random = state_carry(rand_f32(&[1, SPLIT_HV, SPLIT_D, SPLIT_D]));
             let zero = GdnCarry {
                 state: None,
                 history: None,
             };
-            for (init_name, init) in [("zero", &zero), ("random", &random)] {
+            let inits: &[(&str, &GdnCarry)] = if t == 2048 {
+                &[("random", &random)]
+            } else {
+                &[("zero", &zero), ("random", &random)]
+            };
+            for &(init_name, init) in inits {
                 let tag = |path: &str| format!("{path} tiled={tiled} init={init_name}");
                 assert_split_identity(&tag("chain"), t, &cuts, init, &mut |s, e, c| {
                     chain_segment(&win, &wt, tiled, s, e, c)

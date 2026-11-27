@@ -460,8 +460,9 @@ export async function downloadAgentBinary(
   tag?: string,
   env: NodeJS.ProcessEnv = process.env,
   floor?: string,
+  lockDeadlineMs?: number,
 ): Promise<string> {
-  if (tag !== undefined) return installAgentRelease(dest, tag, await fetchAgentRelease(dest, tag), env);
+  if (tag !== undefined) return installAgentRelease(dest, tag, await fetchAgentRelease(dest, tag), env, lockDeadlineMs);
   // Unpinned: walk the resolved candidates. Resolution already gated on a
   // parseable checksum plus a reachable archive, but that probe raced the
   // real download — a tag whose fetch/verify still fails yields to the
@@ -484,7 +485,7 @@ export async function downloadAgentBinary(
     }
     // Install failures (lock contention, fs errors) are not tag-specific —
     // propagating beats retrying the same failure under another tag.
-    return installAgentRelease(dest, candidate, binary, env);
+    return installAgentRelease(dest, candidate, binary, env, lockDeadlineMs);
   }
   if (!eligible) {
     throw new Error(`mlx agent: no release newer than ${floor} is fetchable — the installed version was kept.`);
@@ -704,7 +705,13 @@ async function fetchAgentRelease(dest: string, tag: string): Promise<Buffer> {
  * the install lock. Failures here are never retried with another tag —
  * they are local (lock, fs), not mirror problems.
  */
-async function installAgentRelease(dest: string, tag: string, binary: Buffer, env: NodeJS.ProcessEnv): Promise<string> {
+async function installAgentRelease(
+  dest: string,
+  tag: string,
+  binary: Buffer,
+  env: NodeJS.ProcessEnv,
+  lockDeadlineMs?: number,
+): Promise<string> {
   const versioned = join(dirname(dest), agentBinName(tag));
   const { chmodSync, renameSync, readdirSync } = await import('node:fs');
   // The staged write → pointer flip → sweep sequence runs under a lockfile:
@@ -713,7 +720,7 @@ async function installAgentRelease(dest: string, tag: string, binary: Buffer, en
   // this section WITHOUT the lock is worse than not installing — a merely
   // suspended holder plus an unlocked waiter can interleave sweeps and
   // leave the pointer naming a deleted binary — so the lock is mandatory.
-  await acquireInstallLock(`${dest}.lock`);
+  await acquireInstallLock(`${dest}.lock`, lockDeadlineMs !== undefined ? { deadlineMs: lockDeadlineMs } : {});
   try {
     // Under the lock, a same-tag install may already be complete: two first
     // launches can download the same release concurrently, and renaming

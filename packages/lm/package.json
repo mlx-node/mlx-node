@@ -68,6 +68,16 @@
       "@mlx-node/source": "./src/clairic-types.ts",
       "types": "./dist/clairic-types.d.ts",
       "import": "./dist/clairic-types.js"
+    },
+    "./chat-session": {
+      "@mlx-node/source": "./src/chat-session.ts",
+      "types": "./dist/chat-session.d.ts",
+      "import": "./dist/chat-session.js"
+    },
+    "./tool-call-buffer": {
+      "@mlx-node/source": "./src/tool-call-buffer.ts",
+      "types": "./dist/tool-call-buffer.d.ts",
+      "import": "./dist/tool-call-buffer.js"
     }
   },
   "scripts": {

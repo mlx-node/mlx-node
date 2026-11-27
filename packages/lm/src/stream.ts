@@ -29,6 +29,9 @@ import type {
 
 import type { SessionCapableModel } from './chat-session.js';
 import { FAMILY_ROWS, type ChatFamilyId, type FamilyStreamOpts } from './family-data.js';
+import { getLoadedModelPath, modelPathsForTokenizers } from './model-path.js';
+
+export { getLoadedModelPath };
 
 interface NativeChatSessionCall {
   cancel(): void;
@@ -125,23 +128,7 @@ export interface ChatStreamControl {
   stop: (() => boolean) | null;
 }
 
-const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
-
-/**
- * Return the recorded checkpoint or prepared-assets directory for a loaded
- * streaming model instance, if available.
- */
-export function getLoadedModelPath(model: object): string | undefined {
-  const recorded = modelPathsForTokenizers.get(model);
-  if (recorded !== undefined) return recorded;
-  const nativeAssets = (model as { modelAssetsPath?: () => unknown }).modelAssetsPath;
-  if (typeof nativeAssets === 'function') {
-    const value = nativeAssets.call(model);
-    if (typeof value === 'string' && value.length > 0) return value;
-  }
-  return undefined;
-}
 
 type TemplateContentOrder = 'textThenMedia' | 'imagesThenText';
 

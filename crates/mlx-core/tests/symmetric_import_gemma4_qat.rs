@@ -38,7 +38,7 @@
 //!
 //! Run:
 //!   SYM_QAT_ROOT=... cargo test -p mlx-core --release \
-//!     --test symmetric_import_gemma4_qat -- --ignored --nocapture
+//!     --features e2e-tests --test symmetric_import_gemma4_qat -- --ignored --nocapture
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;

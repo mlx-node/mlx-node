@@ -16,9 +16,11 @@
  */
 
 import type { ChatResult } from '@mlx-node/core';
-import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, type SessionCapableModel } from '@mlx-node/lm/chat-session';
 import { SessionRegistry } from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 /**
  * Build a minimal `SessionCapableModel` stub. Mirrors the mock in

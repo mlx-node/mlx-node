@@ -38,9 +38,12 @@
  */
 
 import type { ChatConfig } from '@mlx-node/core';
-import type { SessionContextLimits } from '@mlx-node/lm';
-import type { SessionCapableModel } from '@mlx-node/lm';
-import { contextLane, getLoadedModelPath } from '@mlx-node/lm';
+import {
+  contextLane,
+  getLoadedModelPath,
+  type SessionCapableModel,
+  type SessionContextLimits,
+} from '@mlx-node/lm/chat-session';
 import {
   chatFamilyIdFor,
   reasoningEffortsFor,

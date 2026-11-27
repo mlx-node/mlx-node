@@ -9,7 +9,7 @@
 //! MLX_DFLASH2_REPLAY_REQUESTS=/path/to/requests.json \
 //! MLX_DFLASH2_REPLAY_TOKENIZER=/path/to/tokenizer.json \
 //! MLX_DFLASH2_REPLAY_RESULT=/path/to/result.json \
-//! cargo test -p mlx-core --test dflash2_replay_offline -- --ignored --nocapture
+//! cargo test -p mlx-core --features e2e-tests --test dflash2_replay_offline -- --ignored --nocapture
 //! ```
 
 use std::path::Path;

@@ -3,6 +3,13 @@ name = "mlx-sys"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+# Pure extern "C" FFI declarations with zero unit/doc tests; disabling test
+# harness compilation prevents workspace `--lib` runs from re-running build.rs
+# under the test profile solely to execute 0 tests.
+test = false
+doctest = false
+
 [build-dependencies]
 cmake = { workspace = true }
 cc = { workspace = true }

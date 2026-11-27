@@ -56,6 +56,13 @@ export interface LiveOptions {
 export const LIVE_REFETCH_MIN_MS = 5000;
 export const LIVE_REFETCH_FAST_MS = 1000;
 
+let liveRefetchMinMsOverride: number | undefined;
+
+/** @internal Test hook to shrink live-refetch throttle delays without fake timers. */
+export function __setLiveRefetchMinMsForTests(ms: number | undefined): void {
+  liveRefetchMinMsOverride = ms;
+}
+
 export interface JsonOptions {
   /** Refetch when the runtime reports new data, rate-limited per query. `true` is `{}`. */
   live?: boolean | LiveOptions;
@@ -131,7 +138,7 @@ export function useJson<T>(path: string, options: JsonOptions = {}): AsyncState<
   }, [generation, reload]);
 
   const live = options.live === undefined || options.live === false ? null : options.live === true ? {} : options.live;
-  const minIntervalMs = live?.minIntervalMs ?? LIVE_REFETCH_MIN_MS;
+  const minIntervalMs = liveRefetchMinMsOverride ?? live?.minIntervalMs ?? LIVE_REFETCH_MIN_MS;
   const throttle = useRef({ lastStart: 0, lastDuration: 0, inFlight: false, pending: false, run: 0 });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tryRefetch = useRef<() => void>(() => {});

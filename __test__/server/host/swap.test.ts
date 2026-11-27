@@ -6,6 +6,8 @@ import type { LoadableModel } from '@mlx-node/lm';
 import { MODEL_FAMILY_DATA, familyDataFor, reasoningEffortsFor } from '@mlx-node/lm/family-data';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import {
   chatCapability,
   withCapabilityModels,

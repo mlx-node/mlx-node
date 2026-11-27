@@ -5,6 +5,13 @@ import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+// No test in this file runs the production first-run download wizard (every `run` test injects `deps.wizard`).
+vi.mock('../../packages/cli/src/commands/download-model.js', () => ({
+  run: async () => {
+    throw new Error('unexpected production wizard download in agent-args test');
+  },
+}));
+
 import type { GrokAgentLaunchOptions } from '../../packages/cli/src/commands/agent/grok-build.js';
 import {
   agentModelArg,

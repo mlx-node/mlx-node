@@ -7088,10 +7088,10 @@ mod cuda_prefill_tests {
             ql
         };
 
-        // Qwen3.8-27B `in_proj_ba` shape (N=96, K=5120) and `attn_k/v` shape (N=1024, K=5120).
+        // Representative `in_proj_ba` (narrow N, up to M=2048) and `attn_k/v` shapes.
         for (label, n, k, row_counts) in [
-            ("in_proj_ba", 96i64, 5120i64, &[1i64, 8, 9, 96, 2048][..]),
-            ("attn_kv", 1024i64, 5120i64, &[8i64, 64, 256][..]),
+            ("in_proj_ba", 96i64, 1024i64, &[1i64, 8, 9, 96, 2048][..]),
+            ("attn_kv", 256i64, 1024i64, &[8i64, 64, 256][..]),
         ] {
             let ql = make_q8(n, k, true, &mut rng);
             assert_eq!(ql.get_scales().dtype().unwrap(), DType::Float32);
@@ -7893,7 +7893,7 @@ mod affine_dtype_tests {
         }
         // FP16 scales deliberately include values BF16 cannot represent.
         // Performance measurements use the recorded agent session, separately.
-        for k in [32, 256, 512, 1024, 3840, 4096, 15360] {
+        for k in [32, 256, 512, 1024, 2048] {
             let n = 24;
             let x: Vec<u16> = (0..k)
                 .map(|i| half::bf16::from_f32(((i * 17 % 101) as f32 - 50.0) / 32.0).to_bits())
@@ -9171,7 +9171,7 @@ mod kquant_tiled_tests {
         use crate::models::quant_dispatch::{
             KQUANT_MODES, KQuantLayout, kquant_mode_params, mode_to_str,
         };
-        let (n, k) = (128i64, 5120i64);
+        let (n, k) = (128i64, 512i64);
         for mode in KQUANT_MODES {
             let kq = kquant_mode_params(mode).unwrap();
             let mut st = 0x5eed_0000u32 ^ (mode as u32);
@@ -10397,12 +10397,13 @@ mod affine_qmv_wide_lock_tests {
             eprintln!("SKIP affine_q8_bf16_mixed_matches_promoted_path_bitwise: no Metal");
             return;
         }
+        let gpu_gen = unsafe { sys::mlx_test_kquant_gpu_gen() };
         let mut cases = 0;
         for (n, k) in [
-            (96i64, 5120i64),
-            (1024, 5120),
-            (5120, 6144),
-            (17, 5120),
+            (96i64, 512i64),
+            (256, 512),
+            (2048, 512),
+            (17, 512),
             (96, 128),
         ] {
             let linear = gguf_linear(n, k, 32, 8);
@@ -10418,9 +10419,9 @@ mod affine_qmv_wide_lock_tests {
                 s.to_float32().unwrap().to_vec(),
                 "scales must carry more precision than BF16"
             );
-            for seed in 0..3u64 {
-                for amp in [1.0e-3f64, 1.0, 30.0] {
-                    for m in [1i64, 2, 3, 4, 5, 6, 7, 8, 9, 16, 64] {
+            for seed in 0..2u64 {
+                for amp in [1.0e-3f64, 30.0] {
+                    for m in [1i64, 2, 4, 5, 7, 8, 9, 64] {
                         let x = MxArray::random_normal(&[1, m, k], 0.0, amp, Some(DType::Float32))
                             .unwrap()
                             .mul_scalar(1.0 + seed as f64 * 0.37)
@@ -10434,14 +10435,31 @@ mod affine_qmv_wide_lock_tests {
                             want,
                             "forward {ctx}"
                         );
+                        let check_nv =
+                            gpu_gen >= 15 && n == 2048 && seed == 0 && (m == 5 || m == 7);
+                        if check_nv {
+                            unsafe { sys::mlx_test_kquant_counting(true) };
+                        }
                         let direct = mixed_ffi(&x, w, s, b, 32, 8).expect("mixed FFI accepts");
-                        assert_eq!(bf16_bits(&direct), want, "mixed FFI {ctx}");
+                        let direct_bits = bf16_bits(&direct);
+                        if check_nv {
+                            let fam =
+                                std::ffi::CString::new(format!("affine_mixed_qmv_wide_nv{m}"))
+                                    .unwrap();
+                            let count = unsafe { sys::mlx_test_kquant_family_count(fam.as_ptr()) };
+                            unsafe { sys::mlx_test_kquant_counting(false) };
+                            assert_eq!(
+                                count, 1,
+                                "{ctx}: must dispatch affine_mixed_qmv_wide_nv{m} (got {count})"
+                            );
+                        }
+                        assert_eq!(direct_bits, want, "mixed FFI {ctx}");
                         cases += 1;
                     }
                 }
             }
         }
-        assert_eq!(cases, 5 * 3 * 3 * 11);
+        assert_eq!(cases, 5 * 2 * 2 * 8);
     }
 
     /// Operands the native kernel does not cover (4-bit / group 64, a

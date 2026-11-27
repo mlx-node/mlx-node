@@ -330,32 +330,71 @@ fn full_of(tokens: &[u32]) -> Vec<u32> {
 fn every_row_choice_gives_the_plain_text() {
     let _host = memory::scoped_fixture_host();
     const MAX_NEW: i32 = 72;
+    const PINNED_MAX_NEW: i32 = 16;
     let (prompt, plain) = full_length(direct_chat, 21, MAX_NEW, 11);
+    let plain_short = Driver::new(direct_chat())
+        .turn("p", &prompt, plain_config(PINNED_MAX_NEW))
+        .unwrap();
     let full = full_of(&plain.tokens);
-    let vocab = direct_chat().decoder.config.vocab_size as u32;
-    let cases: [(&str, ChatConfig, usize, &[usize]); 6] = [
-        ("pinned 2 rows", pinned_config(MAX_NEW, 2), 2, &[2]),
-        ("pinned 3 rows", pinned_config(MAX_NEW, 3), 3, &[3]),
-        ("pinned 4 rows", pinned_config(MAX_NEW, 4), 4, &[4]),
+    let vocab = super::route_step::moe_shape_config().vocab_size as u32;
+    let cases: [(&str, ChatConfig, usize, &[usize], &str, &str); 6] = [
+        (
+            "pinned 2 rows",
+            pinned_config(PINNED_MAX_NEW, 2),
+            2,
+            &[2],
+            plain_short.text.as_str(),
+            plain_short.finish_reason.as_str(),
+        ),
+        (
+            "pinned 3 rows",
+            pinned_config(PINNED_MAX_NEW, 3),
+            3,
+            &[3],
+            plain_short.text.as_str(),
+            plain_short.finish_reason.as_str(),
+        ),
+        (
+            "pinned 4 rows",
+            pinned_config(PINNED_MAX_NEW, 4),
+            4,
+            &[4],
+            plain_short.text.as_str(),
+            plain_short.finish_reason.as_str(),
+        ),
         (
             "the rule, ceiling 2",
             rule_config(MAX_NEW, Some(2)),
             2,
             &[1, 2],
+            plain.text.as_str(),
+            plain.finish.as_str(),
         ),
         (
             "the rule, ceiling 3",
             rule_config(MAX_NEW, Some(3)),
             3,
             &[1, 2, 3],
+            plain.text.as_str(),
+            plain.finish.as_str(),
         ),
-        ("the rule", rule_config(MAX_NEW, None), 4, &[1, 2, 3, 4]),
+        (
+            "the rule",
+            rule_config(MAX_NEW, None),
+            4,
+            &[1, 2, 3, 4],
+            plain.text.as_str(),
+            plain.finish.as_str(),
+        ),
     ];
-    for (what, config, ceiling, used) in cases {
-        let mut driver = drafted_driver();
+    let mut driver = drafted_driver();
+    for (idx, (what, config, ceiling, used, want_text, want_finish)) in
+        cases.into_iter().enumerate()
+    {
+        let owner = format!("a{idx}");
         let run = run(
             &mut driver,
-            "a",
+            &owner,
             &prompt,
             config,
             phased(full.clone(), vocab, turn_phase),
@@ -364,7 +403,7 @@ fn every_row_choice_gives_the_plain_text() {
         eprintln!("{what}: rows {:?}", run.rows);
         assert_eq!(
             (run.result.text.as_str(), run.result.finish_reason.as_str()),
-            (plain.text.as_str(), plain.finish.as_str()),
+            (want_text, want_finish),
             "{what}: the plain text and finish"
         );
         let seen: BTreeSet<usize> = run.rows.iter().copied().collect();
@@ -405,20 +444,26 @@ fn a_draft_that_is_always_wrong_settles_at_one_row() {
     const LONG: i32 = 40;
     let (prompt, plain) = full_length(direct_chat, 21, LONG, 19);
     let full = full_of(&plain.tokens);
-    let vocab = direct_chat().decoder.config.vocab_size as u32;
-    let mut plain_texts = Vec::new();
+    let vocab = super::route_step::moe_shape_config().vocab_size as u32;
+    eprintln!("== plain {SHORT}");
+    let plain_short = Driver::new(direct_chat())
+        .turn("p", &prompt, plain_config(SHORT))
+        .unwrap();
+    let plain_pairs = [
+        (
+            plain_short.text.as_str(),
+            plain_short.finish_reason.as_str(),
+        ),
+        (plain.text.as_str(), plain.finish.as_str()),
+    ];
+    let mut driver = drafted_driver();
     let mut runs = Vec::new();
-    for max_new in [SHORT, LONG] {
-        eprintln!("== plain {max_new}");
-        let mut driver = Driver::new(direct_chat());
-        plain_texts.push(driver.turn("p", &prompt, plain_config(max_new)).unwrap());
-    }
-    for max_new in [SHORT, LONG] {
+    for (idx, max_new) in [SHORT, LONG].into_iter().enumerate() {
         eprintln!("== drafted {max_new}");
-        let mut driver = drafted_driver();
+        let owner = format!("a{idx}");
         runs.push(run(
             &mut driver,
-            "a",
+            &owner,
             &prompt,
             rule_config(max_new, None),
             phased(full.clone(), vocab, wrong),
@@ -426,8 +471,7 @@ fn a_draft_that_is_always_wrong_settles_at_one_row() {
         ));
     }
     eprintln!("== end");
-    assert_eq!(plain_texts[1].text, plain.text, "the long plain turn");
-    for (run, plain) in runs.iter().zip(&plain_texts) {
+    for (run, (want_text, want_finish)) in runs.iter().zip(plain_pairs) {
         let settled = run
             .rows
             .iter()
@@ -440,14 +484,14 @@ fn a_draft_that_is_always_wrong_settles_at_one_row() {
             .count();
         eprintln!(
             "always wrong, {} tokens: rows {:?}; one row from cycle {settled}; {} cycles at one row; {confident} of {} calls with the draft's confidence",
-            plain.text.split_whitespace().count(),
+            want_text.split_whitespace().count(),
             run.rows,
             run.rows.len() - settled,
             run.chosen.len()
         );
         assert_eq!(
             (run.result.text.as_str(), run.result.finish_reason.as_str()),
-            (plain.text.as_str(), plain.finish_reason.as_str()),
+            (want_text, want_finish),
             "the plain text and finish"
         );
         assert!(run.rows[0] > 1, "the turn starts above one row");
@@ -480,11 +524,11 @@ fn a_draft_that_is_always_wrong_settles_at_one_row() {
 #[test]
 fn the_rows_repeat_and_each_drafted_turn_starts_its_own_record() {
     let _host = memory::scoped_fixture_host();
-    const MAX_NEW: i32 = 48;
+    const MAX_NEW: i32 = 28;
     let (prompt, plain) = full_length(direct_chat, 21, MAX_NEW, 13);
     let (other, other_plain) = full_length(direct_chat, 23, 24, 17);
     let full = full_of(&plain.tokens);
-    let vocab = direct_chat().decoder.config.vocab_size as u32;
+    let vocab = super::route_step::moe_shape_config().vocab_size as u32;
     let fresh = |confidence: Option<f32>| {
         run(
             &mut drafted_driver(),

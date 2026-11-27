@@ -28,7 +28,7 @@
  * content was not recorded.
  *
  * `--offline` loads no weights. It maps every body through the server's
- * `mapAnthropicRequest`, then `cargo test --test dflash2_replay_offline` renders
+ * `mapAnthropicRequest`, then `cargo test --features e2e-tests --test dflash2_replay_offline` renders
  * each request through the target tokenizer and classifies the log's row order
  * with the turn ledger under today's flat rule (one live state). It fails
  * unless:
@@ -492,7 +492,18 @@ export function classifyOffline(requests: OfflineRequest[], dir: string, tokeniz
   const requestsPath = join(dir, 'requests.json');
   const resultPath = join(dir, 'offline.json');
   writeFileSync(requestsPath, JSON.stringify(requests));
-  const argv = ['test', '-p', 'mlx-core', '--test', 'dflash2_replay_offline', '--', '--ignored', '--nocapture'];
+  const argv = [
+    'test',
+    '-p',
+    'mlx-core',
+    '--features',
+    'e2e-tests',
+    '--test',
+    'dflash2_replay_offline',
+    '--',
+    '--ignored',
+    '--nocapture',
+  ];
   console.error(`$ cargo ${argv.join(' ')}`);
   const run = spawnSync('cargo', argv, {
     cwd: ROOT,

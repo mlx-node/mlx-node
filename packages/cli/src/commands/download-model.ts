@@ -1,21 +1,38 @@
-import { constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { readdir, copyFile, rm, mkdtemp, mkdir, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { constants, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readdir, copyFile, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { downloadFile, listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
 // Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
 // addon, and downloading a model must work before any of that is needed.
-import { MODEL_FAMILY_DATA, type ModelFamilyData } from '@mlx-node/lm/family-data';
-import { readGgufHeader } from '@mlx-node/lm/gguf-metadata';
-import { readGgufArchitecture } from '@mlx-node/lm/model-detection';
-import { ggufSplitPart, isGgufCompanionName, parseGgufFileName } from '@mlx-node/lm/model-discovery';
+import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 import { resolveModelsDir } from '@mlx-node/server/host/paths';
 import { ttsComponents } from '@mlx-node/tts/catalog';
 
 import { ensureDir, formatBytes } from '../utils.js';
+import { checkGgufTargets } from './download-gguf-check.js';
 import { markCompletionPartial, readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
+import {
+  ASSET_SIDECAR_CANDIDATES,
+  CORE_FILES,
+  ggufLoadEntries,
+  ggufNextSteps,
+  globToRegex,
+  isDefaultModelDownloadPath,
+  isGgufRepoComplete,
+  isGlobMatchedSetComplete,
+  isGlobVariantPresent,
+  isLoadableWeightFile,
+  isLocalCopyComplete,
+  isModelAlreadyDownloaded,
+  isRetriableFetchError,
+  matchesAnyGlob,
+  pickAssetSidecars,
+  withRetries,
+  type GgufLoadEntry,
+} from './download-model-helpers.js';
 import {
   assertCompletionRepoCompatible,
   buildMarkerFiles,
@@ -29,208 +46,23 @@ import {
 } from './download-sync.js';
 import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
+export {
+  checkGgufTargets,
+  ggufLoadEntries,
+  ggufNextSteps,
+  isDefaultModelDownloadPath,
+  isGgufRepoComplete,
+  isGlobMatchedSetComplete,
+  isGlobVariantPresent,
+  isLocalCopyComplete,
+  isModelAlreadyDownloaded,
+  isRetriableFetchError,
+  pickAssetSidecars,
+  withRetries,
+  type GgufLoadEntry,
+};
+
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
-
-/** Attempts per file before a download gives up. */
-const MAX_FETCH_ATTEMPTS = 4;
-
-/** Base backoff; attempt N waits `BASE << (N - 1)` ms (1s, 2s, 4s). */
-const RETRY_BASE_MS = 1_000;
-
-/** Node errno values no retry can fix: the LOCAL filesystem said no. */
-const PERMANENT_FS_CODES = new Set([
-  'ENOSPC', // disk full
-  'EDQUOT', // over quota
-  'EACCES', // not permitted
-  'EPERM',
-  'EROFS', // read-only filesystem
-  'EISDIR',
-  'ENOTDIR',
-  'ENAMETOOLONG',
-  'EFBIG',
-  'EXDEV',
-]);
-
-/**
- * Hub-client PROTOCOL refusals: the bytes arrived and the parser rejected
- * them. `XetBlob` throws these from inside the chunk reader
- * (`XetBlob.ts:387,395`) after part of the shard has already streamed, and
- * they carry no status and no errno — so without this they land on the
- * default-retry branch and cost three more full multi-GB transfers to fail
- * identically. Deterministic in the payload, so a retry cannot change them.
- *
- * Deliberately NOT here: `Failed to fetch all data for term …`
- * (`XetBlob.ts:473`), which means the transfer was TRUNCATED. That is the
- * transient case, and it must keep retrying.
- */
-const PERMANENT_PROTOCOL_MESSAGES = ['Unsupported chunk version', 'Unsupported compression scheme'];
-
-/**
- * Deterministic composite-model refusals raised by `listModelFilesOnce`, which
- * runs INSIDE `withRetries`. Each describes repo state a repeat cannot change:
- * a vanished config, a component that is incomplete at this revision, or a
- * composite listing with no immutable revision to pin to — so they must not
- * cost four recursive listings plus 1/2/4s of backoff to fail identically.
- */
-const PERMANENT_DOWNLOAD_MESSAGES = [
-  'Repository config disappeared',
-  'Composite models require an immutable revision',
-  'Required model component',
-];
-
-/** The human-readable text of a failure, whatever shape it arrived in. */
-function failureText(error: unknown): string {
-  if (typeof error === 'string') return error;
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-/**
- * A hub error flattened to text; see {@link isRetriableFetchError}.
- *
- * Only matches when the failing response had a NON-JSON body. `createApiError`
- * (`@huggingface/hub@2.13.2`, `src/error.ts:9-26`) builds this exact prefix and
- * then REPLACES the whole message with `json.error || json.message` whenever
- * the response is `application/json`, keeping only a `. URL: …` trailer. The
- * status is not recoverable from that text — it survives only on the error
- * OBJECT, which the blob-stream path throws away. So a JSON-bodied failure on
- * the content GET reaches the default-retry branch regardless of its status.
- * That is a known looseness, not an oversight: it errs toward retrying, which
- * is the safe direction here (see the harm asymmetry below).
- */
-const FLATTENED_STATUS = /^Api error with status (\d{3})\b/;
-
-/**
- * 408 is transient by definition (RFC 9110 §15.5.9 — the server did not get a
- * complete request in time, and "the client MAY repeat that request"), so it
- * belongs with 429 and 5xx rather than with the settled 4xx answers.
- *
- * Included as hardening, not as a fix for an observed failure: nothing in
- * `@huggingface/hub@2.13.2` filters, branches on, or internally retries 408
- * (its only repeat-a-request logic is a one-shot 403 token refresh in
- * `XetBlob.ts:307`), so if a CDN ever emits one it lands here and aborts a
- * multi-GB download for free. Costs one comparison.
- *
- * 425 Too Early is deliberately NOT here: it requires TLS 0-RTT early data,
- * which this client never sends. Adding it would be speculation, and the
- * default-retry branch already covers anything unmodelled.
- */
-function isRetriableStatus(status: number): boolean {
-  return status >= 500 || status === 429 || status === 408;
-}
-
-/**
- * Whether a failed download step is worth repeating.
- *
- * Three shapes reach here, because the hub client does not normalize them:
- *
- *  - A `HubApiError` with a numeric `statusCode`. This is what CI hit (a 500
- *    from the Xet CDN), thrown by `createApiError` and carried out through the
- *    stream's async-iterator `pull`, so the object survives intact.
- *  - A bare STRING. `WebBlob.stream()` and `XetBlob.stream()` abort their
- *    writable with `error.message` rather than the error, so a failure on the
- *    content GET — the multi-GB shard itself — arrives with no type at all
- *    (verified: `typeof e === 'string'`, `e instanceof Error === false`). A
- *    predicate that only understands `Error` refuses to retry the single most
- *    important case, so the status is read back out of the text.
- *  - A plain `Error` with a Node errno and no status. This is BOTH a transport
- *    failure and a local filesystem failure, which is why the errno matters:
- *    `downloadFileToCacheDir` mkdirs, streams to `<blob>.incomplete`, renames,
- *    then symlinks, and wraps none of it.
- *
- * Unknown status-less failures default to RETRY, deliberately. The transport
- * failure space is open-ended and library-version-dependent — `fetch` rejects
- * `TypeError: fetch failed` on connect but `TypeError: terminated` on a
- * mid-body reset, and a timeout is a `DOMException` with a NUMERIC code — so an
- * allowlist of known network errors turns every unmodelled one into a hard
- * abort of a 30 GB download, which is the failure this retry exists to prevent.
- * The harm is asymmetric, but NOT as cheaply as "7 s of backoff": because each
- * attempt truncates `<blob>.incomplete` and re-GETs without a Range header, a
- * wrongly-retried failure also re-transfers the shard up to three more times.
- * That is why the categories which are deterministic AND status-less —
- * {@link PERMANENT_FS_CODES}, {@link PERMANENT_PROTOCOL_MESSAGES}, and
- * {@link PERMANENT_DOWNLOAD_MESSAGES} — are
- * named explicitly instead of being left to the default. Refusing to retry
- * something transient still costs the whole download, so everything else
- * unmodelled keeps defaulting to retry.
- *
- * Never retried: 4xx other than 429 and 408 (401/403 is no token or no access,
- * 404 is the wrong repo or revision) and the filesystem refusals above. Those
- * are settled answers, and repeating them only buries the message the user
- * needs.
- *
- * That last paragraph holds for the ERROR-OBJECT shape, which keeps its
- * `statusCode`. It does NOT hold for the flattened-string shape when the
- * response body was JSON: the hub client overwrites the message with the
- * server's own text and the status is gone, so such a failure takes the
- * default-retry branch whatever it was. See {@link FLATTENED_STATUS}. Closing
- * that would mean pattern-matching human-readable server prose, which is the
- * allowlist this function exists to avoid.
- */
-export function isRetriableFetchError(error: unknown): boolean {
-  if (typeof error !== 'string' && !(error instanceof Error)) return false;
-
-  // Checked on BOTH shapes: the chunk reader's refusals reach us as a bare
-  // string through the blob stream, but as an Error when awaited directly.
-  const text = failureText(error);
-  if (PERMANENT_PROTOCOL_MESSAGES.some((m) => text.includes(m))) return false;
-  if (PERMANENT_DOWNLOAD_MESSAGES.some((m) => text.includes(m))) return false;
-
-  if (typeof error === 'string') {
-    const status = FLATTENED_STATUS.exec(error);
-    return status ? isRetriableStatus(Number(status[1])) : true;
-  }
-
-  const status = (error as { statusCode?: unknown }).statusCode;
-  if (typeof status === 'number') return isRetriableStatus(status);
-
-  const code = (error as NodeJS.ErrnoException).code;
-  // EMFILE/ENFILE ("too many open files") are deliberately absent: those do
-  // clear on their own, so they stay retriable.
-  if (typeof code === 'string' && PERMANENT_FS_CODES.has(code)) return false;
-
-  return true;
-}
-
-/**
- * Run `attempt`, repeating it while the failure looks transient.
- *
- * A checkpoint is tens of files and tens of gigabytes pulled from a CDN, so a
- * single 5xx somewhere in the set is ordinary — and without this ONE of them
- * aborted the whole multi-GB download, discarding every completed file. This
- * is what CI hit:
- *
- *   HubApiError: Api error with status 500
- *     data: { message: 'Key service error: Timeout occurred while creating a new object' }
- *
- * Safe to repeat, but NOT free: `downloadFileToCacheDir` short-circuits on a
- * blob that is already COMPLETE, so finished files are never re-fetched — a
- * PARTIAL one is not resumed. It reopens `<blob>.incomplete` with `'w'`
- * (truncating it) and re-issues the GET without a Range header, so an
- * interrupted shard restarts from byte 0. That is what bounds the attempts at
- * {@link MAX_FETCH_ATTEMPTS} rather than retrying indefinitely, and it is why
- * a local disk-full failure must not be retried at all.
- */
-export async function withRetries<T>(what: string, attempt: () => Promise<T>): Promise<T> {
-  for (let n = 1; ; n++) {
-    try {
-      return await attempt();
-    } catch (error) {
-      if (n >= MAX_FETCH_ATTEMPTS || !isRetriableFetchError(error)) throw error;
-      const waitMs = RETRY_BASE_MS << (n - 1);
-      // The status when there is one, else the failure's text — never the error
-      // object itself, which stringifies to `[object Object]` and would make the
-      // one line explaining the pause useless. `failureText` rather than
-      // `.message` because the content-GET failures this retry exists for
-      // arrive as bare STRINGS, on which `.message` is `undefined` — printing
-      // `failed (undefined)` for exactly the case that matters most.
-      const status = (error as { statusCode?: unknown }).statusCode;
-      const reason = typeof status === 'number' ? `HTTP ${status}` : failureText(error);
-      console.warn(`    ${what} failed (${reason}); retry ${n}/${MAX_FETCH_ATTEMPTS - 1} in ${waitMs}ms`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-    }
-  }
-}
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
 
@@ -289,52 +121,6 @@ Examples:
   mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \\
     --assets-repo Qwen/Qwen3.8-27B
 `);
-}
-
-const CORE_FILES = [
-  'LICENSE',
-  'LICENSE.md',
-  'README.md',
-  'config.json',
-  'tokenizer.json',
-  'tokenizer_config.json',
-  'special_tokens_map.json',
-  'vocab.json',
-  'merges.txt',
-];
-
-/**
- * Sidecar files a GGUF quantization repo typically lacks, fetched from
- * `--assets-repo` (the base model's repo). Names absent from that repo are
- * skipped, so one fixed list serves every model family.
- *
- * Mandatory for correct tool calling, not a nicety: when no sidecar
- * `tokenizer.json` sits next to the `.gguf`, the native runtime extracts the
- * embedded tokenizer, and that extraction marks `<tool_call>`/`</tool_call>`
- * `special: true` (the official files mark them false) — every decode path
- * then skips special tokens, the tool-call wrapper is stripped, and the model
- * silently "answers" instead of calling tools.
- */
-const ASSET_SIDECAR_CANDIDATES = [
-  'config.json',
-  'tokenizer.json',
-  'tokenizer_config.json',
-  'chat_template.jinja',
-  'generation_config.json',
-  'preprocessor_config.json',
-  'video_preprocessor_config.json',
-  'processor_config.json',
-];
-
-/** Convert a simple glob pattern (with * wildcards) to a RegExp */
-function globToRegex(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`, 'i');
-}
-
-/** Check if a filename matches any of the glob patterns */
-function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
-  return patterns.some((re) => re.test(filename));
 }
 
 /**
@@ -446,100 +232,6 @@ async function listModelFilesOnce(
 }
 
 /**
- * Splash `install/upstream.py` `gguf_target` + `model-check`: before any
- * weight byte is fetched, range-read the header of every selected target GGUF
- * (a split GGUF is one target of all its parts), write the headers to a
- * scratch target directory and run the native header check over it. Throws a
- * refusal naming the target; the native addon is loaded only when a GGUF
- * target is selected.
- */
-export async function checkGgufTargets(opts: {
-  repo: string;
-  revision?: string;
-  paths: readonly string[];
-  accessToken?: string;
-}): Promise<{ targets: string[][]; headerBytes: number }> {
-  const groups = new Map<string, { stem: string; parts: Map<number, string>; totals: Set<number> }>();
-  for (const path of opts.paths) {
-    const name = basename(path);
-    if (!name.toLowerCase().endsWith('.gguf') || isGgufCompanionName(name)) continue;
-    const split = ggufSplitPart(name);
-    const key = `${dirname(path)}\0${split ? `split\0${split.stem}` : `file\0${name}`}`;
-    const group = groups.get(key) ?? { stem: split?.stem ?? name, parts: new Map(), totals: new Set() };
-    group.parts.set(split?.part ?? 1, path);
-    group.totals.add(split?.total ?? 1);
-    groups.set(key, group);
-  }
-  const targets: string[][] = [];
-  for (const { stem, parts, totals } of groups.values()) {
-    const total = Math.max(...totals);
-    const numbers = [...parts.keys()].sort((a, b) => a - b);
-    if (totals.size !== 1 || numbers.length !== total || numbers.some((n, i) => n !== i + 1)) {
-      throw new Error(
-        `split GGUF ${stem}: the selection holds parts ${numbers.join(', ')} of ${total}; select every part`,
-      );
-    }
-    targets.push(numbers.map((n) => parts.get(n) as string));
-  }
-  if (targets.length === 0) return { targets, headerBytes: 0 };
-
-  const { checkGgufHeaders } = await import('@mlx-node/core');
-  const repo = { type: 'model' as const, name: opts.repo };
-  const fetch = async (path: string): Promise<Blob> => {
-    const blob = await downloadFile({ repo, path, revision: opts.revision, accessToken: opts.accessToken });
-    if (!blob) throw new Error(`${path} disappeared from ${opts.repo}`);
-    return blob;
-  };
-  let headerBytes = 0;
-  for (const target of targets) {
-    const scratch = await mkdtemp(join(tmpdir(), 'mlx-gguf-check-'));
-    try {
-      const dir = join(scratch, 'target');
-      await mkdir(dir);
-      for (const path of target) {
-        const blob = await fetch(path);
-        const header = await readGgufHeader(
-          async (position, length) => new Uint8Array(await blob.slice(position, position + length).arrayBuffer()),
-          blob.size,
-        );
-        headerBytes += header.length;
-        await writeFile(join(dir, basename(path)), header);
-      }
-      const folder = dirname(target[0]);
-      const config = folder === '.' ? 'config.json' : `${folder}/config.json`;
-      if (opts.paths.includes(config)) {
-        await writeFile(join(dir, 'config.json'), new Uint8Array(await (await fetch(config)).arrayBuffer()));
-      }
-      try {
-        checkGgufHeaders(dir);
-      } catch (error) {
-        throw new Error(
-          `Refusing to download ${target.join(', ')}: ${error instanceof Error ? error.message : String(error)}. No weight was fetched.`,
-        );
-      }
-    } finally {
-      await rm(scratch, { recursive: true, force: true });
-    }
-  }
-  return { targets, headerBytes };
-}
-
-/** Root-default selection plus nested files already claimed by a prior marker. */
-export function isDefaultModelDownloadPath(path: string, previouslyTracked: ReadonlySet<string>): boolean {
-  if (previouslyTracked.has(path)) return true;
-  if (path.includes('/')) return false;
-  return (
-    CORE_FILES.includes(path) ||
-    path.endsWith('.safetensors') ||
-    path.endsWith('.json') ||
-    path.endsWith('.pdiparams') ||
-    path.endsWith('.yml') ||
-    path.endsWith('.gguf') ||
-    path.endsWith('.jinja')
-  );
-}
-
-/**
  * The current commit sha of the repo's `main`, or `null` when it cannot be
  * resolved (offline, missing auth on a gated repo, API change). `null` makes
  * the caller fall back to the legacy local-only behavior — the update check
@@ -554,215 +246,6 @@ async function resolveRemoteRevision(modelName: string, accessToken?: string): P
     return typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
   } catch {
     return null;
-  }
-}
-
-/**
- * Pre-flight check: does `outputDir` already hold a complete model download?
- *
- * Returns true ONLY when we can declare "already downloaded" with confidence.
- * For sharded models we additionally parse `model.safetensors.index.json`
- * and verify every shard listed under `weight_map` is present on disk —
- * otherwise an interrupted prior run that landed the index but not all
- * shards would silently exit as "already downloaded" and leave the user
- * with a broken local copy.
- *
- * Reads local configuration, declared components and shard indexes without
- * network I/O. `excludedPaths` checks the future layout before planned pruning.
- */
-export function isModelAlreadyDownloaded(
-  outputDir: string,
-  files: string[],
-  excludedPaths: ReadonlySet<string> = new Set(),
-): boolean {
-  const fileSet = new Set(files.filter((file) => !excludedPaths.has(file)));
-  const hasConfig = fileSet.has('config.json');
-  if (!hasConfig) return false;
-  try {
-    const config = JSON.parse(readFileSync(join(outputDir, 'config.json'), 'utf8')) as { model_type?: unknown };
-    for (const component of ttsComponents(config)) {
-      const path = join(outputDir, component);
-      const prefix = `${component}/`;
-      const excluded = new Set(
-        [...excludedPaths].filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length)),
-      );
-      if (!isModelAlreadyDownloaded(path, readdirSync(path), excluded)) return false;
-    }
-  } catch {
-    return false;
-  }
-
-  const hasSingleModel = fileSet.has('model.safetensors') || fileSet.has('weights.safetensors');
-  const hasPaddleModel = fileSet.has('inference.pdiparams');
-  if (hasSingleModel || hasPaddleModel) return true;
-
-  const hasShardedModel = fileSet.has('model.safetensors.index.json');
-  if (!hasShardedModel) return false;
-
-  // Sharded: verify every shard the index references actually exists on disk.
-  let parsed: unknown;
-  try {
-    const raw = readFileSync(join(outputDir, 'model.safetensors.index.json'), 'utf8');
-    parsed = JSON.parse(raw);
-  } catch {
-    return false;
-  }
-  const weightMap =
-    parsed && typeof parsed === 'object' && 'weight_map' in parsed
-      ? (parsed as { weight_map?: unknown }).weight_map
-      : undefined;
-  if (!weightMap || typeof weightMap !== 'object') return false;
-
-  const shardFilenames = new Set<string>();
-  for (const value of Object.values(weightMap as Record<string, unknown>)) {
-    if (typeof value === 'string') shardFilenames.add(value);
-  }
-  if (shardFilenames.size === 0) return false;
-
-  for (const shard of shardFilenames) {
-    if (excludedPaths.has(shard) || !existsSync(join(outputDir, shard))) return false;
-  }
-  return true;
-}
-
-/**
- * Pre-flight check: do any files in `outputDir` actually match the user's
- * glob patterns?
- *
- * Returns true ONLY when at least one existing file matches a glob —
- * proving the requested variant is already on disk. CORE_FILES (config,
- * tokenizer, etc.) are deliberately excluded: they're auxiliary metadata
- * laid down by ANY prior download, so counting them would falsely report
- * a Q4 variant as "already downloaded" the moment a Q8 variant had been
- * fetched (which already drops config.json + tokenizer.json into the
- * same directory).
- *
- * Pure function: no I/O, no network. Caller passes the file list and
- * patterns; helper returns boolean.
- */
-export function isGlobVariantPresent(files: string[], globPatterns: string[]): boolean {
-  if (globPatterns.length === 0) return false;
-  const globs = globPatterns.map(globToRegex);
-  return files.some((f) => matchesAnyGlob(f, globs));
-}
-
-/**
- * Pre-flight check: is the user's glob-filtered download complete?
- *
- * Returns true ONLY when EVERY remote file whose basename matches any of
- * the supplied glob patterns is also present locally. Returns false on
- * empty intersection (no remote file matches any glob — the downstream
- * "no files matched" path handles that case) and false on empty manifest
- * (likely upstream error).
- *
- * Why this exists: `isGlobVariantPresent` only checks for AT LEAST ONE
- * local hit. If a prior `--glob "*Q4*"` run was interrupted after fetching
- * one Q4 shard but before the others, rerunning the same command would
- * exit as "Matched files already downloaded" while silently leaving the
- * local copy incomplete. This helper closes that gap by verifying the
- * full glob-matched set against the remote manifest — symmetric to
- * `isGgufRepoComplete` for the no-glob branch.
- *
- * Per-file basenames are compared on both sides (the remote manifest may
- * publish under a sub-directory like `models/foo.gguf` while the local
- * `readdir(outputDir)` is flat) so nested-prefix repos don't false-negative.
- *
- * Pure function: no I/O, no network. Caller fetches the manifest via
- * `getModelFiles` (or equivalent) and hands the basenames in.
- */
-export function isGlobMatchedSetComplete(localFiles: string[], remoteFiles: string[], globPatterns: string[]): boolean {
-  if (globPatterns.length === 0) return false;
-  if (remoteFiles.length === 0) return false;
-  const globs = globPatterns.map(globToRegex);
-  const localSet = new Set(localFiles);
-  let matched = 0;
-  for (const remote of remoteFiles) {
-    const basename = remote.split('/').pop() ?? remote;
-    if (!matchesAnyGlob(basename, globs) && !matchesAnyGlob(remote, globs)) continue;
-    matched++;
-    if (!localSet.has(basename)) return false;
-  }
-  // Empty intersection: no remote file matches any glob. The caller's
-  // downstream "no files matched the given criteria" path handles this
-  // case after listing available variants; declaring "complete" here
-  // would be wrong (nothing was supposed to be downloaded but nothing
-  // was — that's not the same as "we already have what was requested").
-  if (matched === 0) return false;
-  return true;
-}
-
-/**
- * Pre-flight check: is a no-glob GGUF download complete?
- *
- * Returns true ONLY when EVERY `.gguf` file in the remote repo manifest
- * is also present locally. Returns false otherwise — including the
- * "this is not a GGUF repo" case (the remote has no `.gguf` files), so
- * the caller knows to fall through to the normal sharded/single-file
- * checks rather than mis-routing through the GGUF early-return.
- *
- * Why this exists: the previous early-return was `files.some((f) =>
- * f.endsWith('.gguf'))`, so as soon as ANY `.gguf` was on disk the
- * command silently exited. For multi-variant GGUF repos that publish
- * Q2_K, Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0 as separate files, an
- * interrupted prior download that left only Q2_K on disk would short-
- * circuit a re-run without `--glob` and never fetch the rest. The user
- * received zero warning that their local copy was incomplete.
- *
- * The fix is manifest-aware: compare the local file list against the
- * remote `.gguf` filenames and only declare "already downloaded" when
- * every advertised variant is present. Per-file basenames are compared
- * (the remote manifest uses paths like `models/Q4_K_M.gguf` while local
- * `readdir` is flat) so nested-prefix repos don't false-negative.
- *
- * Pure function: no I/O, no network. Caller fetches the manifest via
- * `getModelFiles` (or equivalent) and hands the basenames in.
- */
-export function isGgufRepoComplete(localFiles: string[], remoteFiles: string[]): boolean {
-  // Empty manifest is never complete — and is almost certainly an upstream
-  // error rather than a legitimate empty repo. Falling through to the
-  // download loop will surface the real failure (404 / auth rejection /
-  // network) instead of masking it as "already downloaded".
-  if (remoteFiles.length === 0) return false;
-  const remoteGguf = remoteFiles.filter((f) => f.endsWith('.gguf'));
-  // Not a GGUF repo — caller should route through the normal
-  // `isModelAlreadyDownloaded` (sharded / single-file) path instead.
-  if (remoteGguf.length === 0) return false;
-  const localSet = new Set(localFiles);
-  for (const remote of remoteGguf) {
-    // Remote manifest paths can include prefixes (`models/foo.gguf`);
-    // local `readdir(outputDir)` is flat. Compare basenames so a repo
-    // that publishes under a sub-directory still resolves cleanly.
-    const basename = remote.split('/').pop() ?? remote;
-    if (!localSet.has(basename)) return false;
-  }
-  return true;
-}
-
-/**
- * Per-file check inside the download loop: is `destPath` already a complete
- * copy of the remote `file`?
- *
- * Returns true when the local file exists AND its byte size matches the
- * remote manifest's `file.size`. Truncated/interrupted prior copies fail
- * the size check and re-copy. When the manifest has no size (`<= 0`), we
- * fall back to existence-only — losing partial-recovery for that one
- * file but matching the pre-d139679 reconciler's `existsSync` check.
- *
- * Why this exists: `downloadFileToCacheDir` is content-addressed (no
- * network re-fetch when the cache already holds the blob), but the
- * subsequent `copyFile` always copies bytes regardless. For a sharded
- * model with the early-return short-circuited (e.g. an interrupted run
- * left the safetensors index but not all shards), the per-file copy
- * would otherwise re-write every already-complete shard to disk on
- * resume — gigabytes of pointless I/O.
- */
-export function isLocalCopyComplete(destPath: string, expectedSize: number): boolean {
-  if (!existsSync(destPath)) return false;
-  if (expectedSize <= 0) return true;
-  try {
-    return statSync(destPath).size === expectedSize;
-  } catch {
-    return false;
   }
 }
 
@@ -795,27 +278,6 @@ async function verifyDownload(outputDir: string, weightFiles: string[]): Promise
   }
 
   return allPresent;
-}
-
-/** Root-level sidecar entries found in an assetsRepo listing. */
-export function pickAssetSidecars(allFiles: ListFileEntry[]): ListFileEntry[] {
-  // Candidate names are all root-level; a nested same-named file is not the
-  // base model's tokenizer/config. Order follows ASSET_SIDECAR_CANDIDATES so
-  // the log and the download order are deterministic.
-  const byName = new Map(allFiles.filter((file) => !file.path.includes('/')).map((file) => [file.path, file]));
-  return ASSET_SIDECAR_CANDIDATES.flatMap((name) => {
-    const file = byName.get(name);
-    return file === undefined ? [] : [file];
-  });
-}
-
-/** Does `file` name a weight artifact a loader can open (companions/projectors do not count)? */
-function isLoadableWeightFile(file: string): boolean {
-  return (
-    file.endsWith('.safetensors') ||
-    file.endsWith('.pdiparams') ||
-    (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)))
-  );
 }
 
 /** The assets-repo sidecar selection, resolved before anything is written. */
@@ -943,105 +405,6 @@ async function fetchAssetSidecars(opts: {
 async function replaceWithCopy(from: string, to: string): Promise<void> {
   await rm(to, { force: true });
   await copyFile(from, to, constants.COPYFILE_EXCL);
-}
-
-export interface GgufLoadEntry {
-  /** Repo-relative path a loader opens: the single file, or shard 00001 of a split set. */
-  readonly path: string;
-  /** Shard count declared by the file name; 1 for a single file. */
-  readonly shards: number;
-  /** Distinct shards of the set present in the selection; equals `shards` when the set is complete. */
-  readonly present: number;
-  /** Path without the `.gguf` and `-NNNNN-of-NNNNN` suffixes. */
-  readonly stem: string;
-}
-
-/** Collapse every split set to one entry: loaders and converters open one file, never each shard. */
-export function ggufLoadEntries(weightFiles: readonly string[]): GgufLoadEntry[] {
-  const order: string[] = [];
-  const sets = new Map<string, { stem: string; shards: number; ordinals: Map<number, string> }>();
-  for (const path of weightFiles) {
-    const name = parseGgufFileName(path);
-    if (name === undefined) continue;
-    const { stem, shards } = name;
-    const key = `${stem.toLowerCase()}\0${shards}`;
-    let set = sets.get(key);
-    if (set === undefined) {
-      set = { stem, shards, ordinals: new Map() };
-      sets.set(key, set);
-      order.push(key);
-    }
-    set.ordinals.set(name.ordinal, path);
-  }
-  return order.map((key) => {
-    const { stem, shards, ordinals } = sets.get(key)!;
-    const first = ordinals.get(1) ?? `${stem}-00001-of-${String(shards).padStart(5, '0')}.gguf`;
-    const present = [...ordinals.keys()].filter((ordinal) => ordinal >= 1 && ordinal <= shards).length;
-    return { path: first, shards, present, stem };
-  });
-}
-
-/** The family whose native loader opens this GGUF directly, if any. */
-function directGgufFamily(architecture: string | undefined, shards: number): ModelFamilyData | undefined {
-  if (architecture === undefined) return undefined;
-  const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;
-  const family = rows.find((row) => row.ggufArchitectures?.includes(architecture));
-  if (family === undefined || (shards > 1 && !family.ggufDiscovery?.split)) return undefined;
-  return family;
-}
-
-/**
- * Post-download guidance for a GGUF selection. Families listed with
- * `ggufArchitectures` load the file directly. `mlx convert` reads one file, so
- * converting a split set shard by shard yields a model with one shard's tensors.
- */
-export async function ggufNextSteps(outputDir: string, weightFiles: readonly string[]): Promise<string[]> {
-  const entries = ggufLoadEntries(weightFiles);
-  const mlxOutput = (entry: GgufLoadEntry): string =>
-    entries.length === 1 ? `${outputDir}-mlx` : `${outputDir}-mlx-${entry.stem.replaceAll('/', '-').toLowerCase()}`;
-  const incomplete: string[] = [];
-  const direct: string[] = [];
-  const merge: string[] = [];
-  const convert: string[] = [];
-  for (const entry of entries) {
-    const fullPath = join(outputDir, entry.path);
-    if (entry.present < entry.shards) {
-      incomplete.push(`  ${join(outputDir, entry.stem)}: ${entry.present} of ${entry.shards} shards selected`);
-      continue;
-    }
-    const architecture = await readGgufArchitecture(fullPath).catch(() => undefined);
-    const family = directGgufFamily(architecture, entry.shards);
-    if (family !== undefined) {
-      direct.push(
-        `  ${fullPath}${entry.shards > 1 ? ` (reads the other ${entry.shards - 1} shard(s) beside it)` : ''}`,
-      );
-      const folder = dirname(fullPath);
-      if (
-        family.ggufDiscovery?.requiresAssets &&
-        !(existsSync(join(folder, 'config.json')) && existsSync(join(folder, 'tokenizer.json')))
-      ) {
-        // `--assets-repo` writes sidecars to outputDir only; the loader reads them beside the GGUF.
-        direct.push(
-          folder === resolve(outputDir)
-            ? `    needs config.json and tokenizer.json in ${folder}: run again with --assets-repo <base-model repo>`
-            : `    needs config.json and tokenizer.json in ${folder}: copy them there from the base-model repo`,
-        );
-      }
-    } else if (entry.shards > 1) {
-      const merged = join(outputDir, `${entry.stem}.gguf`);
-      merge.push(`  llama-gguf-split --merge ${fullPath} ${merged}`);
-      merge.push(`  mlx convert -i ${merged} -o ${mlxOutput(entry)}`);
-    } else {
-      convert.push(`  mlx convert -i ${fullPath} -o ${mlxOutput(entry)}`);
-    }
-  }
-  const lines: string[] = [];
-  if (incomplete.length > 0)
-    lines.push('Incomplete split GGUF (select every shard to load or convert it):', ...incomplete);
-  if (direct.length > 0) lines.push('Load directly (no conversion needed):', ...direct);
-  if (merge.length > 0) lines.push('Split GGUF with no split-aware loader: merge the shards, then convert:', ...merge);
-  if (convert.length > 0) lines.push('To convert GGUF to MLX SafeTensors format:', ...convert);
-  return lines;
 }
 
 export async function run(argv: string[]) {

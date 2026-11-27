@@ -179,6 +179,28 @@ impl ExpertSlots {
             readers: Vec::new(),
         }
     }
+
+    /// Independent test clone of an identity-ready direct bank set: shares the
+    /// read-only quantized weight handles while resetting all mutable slot
+    /// bookkeeping (`ages`, `tick`, `readers`, `device_mapping`).
+    #[cfg(test)]
+    pub(super) fn clone_identity_for_test(&self) -> Option<Self> {
+        if !self.identity_ready() {
+            return None;
+        }
+        Some(Self {
+            banks: self.banks.clone(),
+            direct: true,
+            names: self.names.clone(),
+            rows: self.rows,
+            occupants: self.occupants.clone(),
+            mapping: self.mapping.clone(),
+            device_mapping: None,
+            ages: vec![0; self.ages.len()],
+            tick: 0,
+            readers: Vec::new(),
+        })
+    }
 }
 
 struct DirectRequest {

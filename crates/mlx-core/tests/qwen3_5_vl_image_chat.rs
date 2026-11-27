@@ -34,7 +34,7 @@
 //! Run:
 //!   MLX_TEST_QWEN35_VL_MODEL_PATH=.cache/models/Qwen3.5-4B-mlx \
 //!   MLX_TEST_VLM_IMAGE_PATH=examples/ocr.png \
-//!     cargo test -p mlx-core --test qwen3_5_vl_image_chat -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_vl_image_chat -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 

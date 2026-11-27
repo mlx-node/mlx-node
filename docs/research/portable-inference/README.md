@@ -92,9 +92,9 @@ Run the retained regression tests from the repository root:
 
 ```sh
 vp run build:native
-cargo test -p mlx-core --release --test portable_d256_sdpa -- --ignored --nocapture --test-threads=1
+cargo test -p mlx-core --release --features e2e-tests --test portable_d256_sdpa -- --ignored --nocapture --test-threads=1
 MLX_METAL_GPU_ARCH=applegpu_g15s MLX_PORTABLE_KQUANT=1 \
-  cargo test -p mlx-core --release --test kquant_mode_guards -- --nocapture
+  cargo test -p mlx-core --release --test kquant_suite kquant_mode_guards:: -- --nocapture
 ```
 
 The [paged-prefill operator benchmark](../../../crates/mlx-core/tests/qwen35_paged_prefill_operator_bench.rs)

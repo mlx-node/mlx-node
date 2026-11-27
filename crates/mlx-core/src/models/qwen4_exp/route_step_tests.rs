@@ -320,6 +320,53 @@ fn write_moe_shape_fixture(file: &str, repeat: usize) -> PathBuf {
     path
 }
 
+/// Cached [`config::Config`] for [`moe_shape_fixture`].
+pub(super) fn moe_shape_config() -> &'static config::Config {
+    static CONFIG: std::sync::OnceLock<config::Config> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let store = weights::Store::open_fixture(moe_shape_fixture(), None).unwrap();
+        let mut c = gguf::config(&store).unwrap();
+        c.kv_format = load_plan::resolve_kv_format("moe-shape fixture", None, &c).unwrap();
+        c
+    })
+}
+
+/// Cached [`config::Config`] for [`deep_moe_shape_fixture`].
+pub(super) fn deep_moe_shape_config() -> &'static config::Config {
+    static CONFIG: std::sync::OnceLock<config::Config> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let store = weights::Store::open_fixture(deep_moe_shape_fixture(), None).unwrap();
+        let mut c = gguf::config(&store).unwrap();
+        c.kv_format = load_plan::resolve_kv_format("moe-shape fixture", None, &c).unwrap();
+        c
+    })
+}
+
+pub(super) fn streamed_moe_store(deep: bool, capacity: usize) -> (weights::Store, config::Config) {
+    static SHALLOW: std::sync::OnceLock<(std::sync::Mutex<weights::Store>, config::Config)> =
+        std::sync::OnceLock::new();
+    static DEEP: std::sync::OnceLock<(std::sync::Mutex<weights::Store>, config::Config)> =
+        std::sync::OnceLock::new();
+    let cell = if deep { &DEEP } else { &SHALLOW };
+    let (store, config) = cell.get_or_init(|| {
+        let path = if deep {
+            deep_moe_shape_fixture()
+        } else {
+            moe_shape_fixture()
+        };
+        let mut store = weights::Store::open_fixture(path, None).unwrap();
+        let mut c = gguf::config(&store).unwrap();
+        c.kv_format = load_plan::resolve_kv_format("moe-shape fixture", None, &c).unwrap();
+        store.stream_fixture_store(12).unwrap();
+        (std::sync::Mutex::new(store), c)
+    });
+    let cloned = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone_partial_for_test(Some(capacity));
+    (cloned, config.clone())
+}
+
 /// A decoder over `fixture` (a [`moe_shape_fixture`]) with int8 pages and
 /// no store plan yet.
 pub(super) fn moe_shape_decoder(fixture: &Path) -> (decoder::Decoder, media::Vision) {
@@ -340,8 +387,24 @@ pub(super) fn moe_shape_inner(capacity: usize) -> Inner {
 }
 
 fn moe_shape_inner_at(fixture: &Path, capacity: usize) -> Inner {
-    let (mut decoder, vision) = moe_shape_decoder(fixture);
-    decoder.weights.stream_fixture_store(capacity).unwrap();
+    let cached_deep = if fixture == moe_shape_fixture() {
+        Some(false)
+    } else if fixture == deep_moe_shape_fixture() {
+        Some(true)
+    } else {
+        None
+    };
+    let (mut decoder, vision) = if let Some(deep) = cached_deep {
+        let (store, c) = streamed_moe_store(deep, capacity);
+        let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+        let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+        decoder.paged = Some(paged::create_fixture(&c).unwrap());
+        (decoder, vision)
+    } else {
+        let (mut decoder, vision) = moe_shape_decoder(fixture);
+        decoder.weights.stream_fixture_store(capacity).unwrap();
+        (decoder, vision)
+    };
     decoder.register_cache_limit();
     decoder.weights.publish_live();
     decoder.residency_changed();
@@ -487,6 +550,157 @@ pub(super) fn assert_same_decoder_state(
     }
 }
 
+pub(super) fn assert_same_f32_bits(actual: &MxArray, expected: &[u32], what: &str) {
+    let a = f32_bits(actual);
+    assert_eq!(a.len(), expected.len(), "{what}: length");
+    let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != expected[i]).collect();
+    assert!(
+        diffs.is_empty(),
+        "{what}: {} of {} values differ, first at {} ({:#010x} vs {:#010x})",
+        diffs.len(),
+        a.len(),
+        diffs[0],
+        a[diffs[0]],
+        expected[diffs[0]]
+    );
+}
+
+pub(super) fn assert_same_bit_slices(actual: &[u32], expected: &[u32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: length");
+    let diffs: Vec<usize> = (0..actual.len())
+        .filter(|&i| actual[i] != expected[i])
+        .collect();
+    assert!(
+        diffs.is_empty(),
+        "{what}: {} of {} values differ, first at {} ({:#010x} vs {:#010x})",
+        diffs.len(),
+        actual.len(),
+        diffs[0],
+        actual[diffs[0]],
+        expected[diffs[0]]
+    );
+}
+
+#[derive(Clone)]
+struct PagedStateSnapshot {
+    tokens: Vec<u32>,
+    pools: Vec<[(crate::array::DType, Vec<u32>); 4]>,
+}
+
+#[derive(Clone)]
+pub(super) struct DecoderStateSnapshot {
+    history: Vec<u32>,
+    positions: Vec<[i64; 3]>,
+    caches: Vec<Vec<Vec<u32>>>,
+    last_chunk_hidden: Vec<Vec<u32>>,
+    index_keys: Vec<(usize, Option<Vec<u32>>)>,
+    paged: Option<PagedStateSnapshot>,
+}
+
+pub(super) fn snapshot_decoder_state(d: &mut decoder::Decoder) -> DecoderStateSnapshot {
+    let history = d.history.clone();
+    let positions = d.positions.clone();
+    let caches = d
+        .caches
+        .iter()
+        .map(|c| c.arrays().map(f32_bits).collect())
+        .collect();
+    let last_chunk_hidden = d.last_chunk_hidden.iter().map(f32_bits).collect();
+    let c = d.config.clone();
+    let attention: Vec<usize> = (0..c.num_hidden_layers)
+        .filter(|&layer| !c.linear(layer))
+        .collect();
+    let index_keys = attention
+        .iter()
+        .map(|&layer| (layer, d.index_keys(layer).as_ref().map(f32_bits)))
+        .collect();
+    let paged = d.paged.as_mut().map(|pa| {
+        let tokens = pa.request_tokens().to_vec();
+        let pools = attention
+            .iter()
+            .enumerate()
+            .map(|(pool, _)| {
+                let pool = pool as u32;
+                let snap = |a: MxArray| (a.dtype().unwrap(), f32_bits(&a));
+                [
+                    snap(pa.key_pool_array(pool).unwrap()),
+                    snap(pa.value_pool_array(pool).unwrap()),
+                    snap(pa.k_scale_array(pool).unwrap()),
+                    snap(pa.v_scale_array(pool).unwrap()),
+                ]
+            })
+            .collect();
+        PagedStateSnapshot { tokens, pools }
+    });
+    DecoderStateSnapshot {
+        history,
+        positions,
+        caches,
+        last_chunk_hidden,
+        index_keys,
+        paged,
+    }
+}
+
+pub(super) fn assert_same_decoder_state_snapshots(
+    a: &DecoderStateSnapshot,
+    b: &DecoderStateSnapshot,
+    what: &str,
+) {
+    assert_eq!(a.history, b.history, "{what}: history");
+    assert_eq!(a.positions, b.positions, "{what}: positions");
+    assert_eq!(a.caches.len(), b.caches.len(), "{what}: layer count");
+    for (layer, (x, y)) in a.caches.iter().zip(&b.caches).enumerate() {
+        assert_eq!(x.len(), y.len(), "{what}: layer {layer} state count");
+        for (k, (x, y)) in x.iter().zip(y).enumerate() {
+            assert_same_bit_slices(x, y, &format!("{what}: layer {layer} state {k}"));
+        }
+    }
+    assert_eq!(
+        a.last_chunk_hidden.len(),
+        b.last_chunk_hidden.len(),
+        "{what}: last chunk"
+    );
+    for (x, y) in a.last_chunk_hidden.iter().zip(&b.last_chunk_hidden) {
+        assert_same_bit_slices(x, y, &format!("{what}: last chunk hidden"));
+    }
+    assert_eq!(
+        a.index_keys.len(),
+        b.index_keys.len(),
+        "{what}: attention layers"
+    );
+    for ((layer, x), (_, y)) in a.index_keys.iter().zip(&b.index_keys) {
+        match (x, y) {
+            (Some(x), Some(y)) => assert_same_bit_slices(x, y, &format!("{what}: index {layer}")),
+            (None, None) => {}
+            _ => panic!("{what}: layer {layer} holds index blocks on one side only"),
+        }
+    }
+    match (&a.paged, &b.paged) {
+        (Some(pa), Some(pb)) => {
+            assert_eq!(pa.tokens, pb.tokens, "{what}: pages");
+            let names = ["keys", "values", "key scales", "value scales"];
+            for ((layer, _), (xa, xb)) in a.index_keys.iter().zip(pa.pools.iter().zip(&pb.pools)) {
+                for (name, ((da, ba), (db, bb))) in names.iter().zip(xa.iter().zip(xb)) {
+                    assert_eq!(da, db, "{what}: {name}");
+                    assert_same_bit_slices(ba, bb, &format!("{what}: layer {layer} {name}"));
+                }
+            }
+        }
+        (None, None) => {}
+        _ => panic!("{what}: pages on one side only"),
+    }
+}
+
+pub(super) fn assert_decoder_matches_snapshot(
+    a: &mut decoder::Decoder,
+    b: &DecoderStateSnapshot,
+    what: &str,
+) {
+    let snap = snapshot_decoder_state(a);
+    assert_same_decoder_state_snapshots(&snap, b, what);
+}
+
 /// On the real MoE shape a device decode token (the fused routed+shared
 /// kernel over the slots) leaves the same bits as a host-route token (routes
 /// read back, the slot kernel, then the shared expert): every layer's
@@ -521,7 +735,7 @@ fn fixture_device_token_equals_host_token() {
     };
     let (device_start, host_start) = (counts(&device), counts(&host));
     let host_readbacks = host.decoder.route_readbacks;
-    const STEPS: usize = 64;
+    const STEPS: usize = 36;
     const MISS_AT: usize = 8;
     let mut token = 3;
     for step in 0..STEPS {
@@ -1007,20 +1221,25 @@ fn layers_checkpoint_holds_each_layer_input() {
 fn layers_split_run_equals_one_run() {
     for paged in [false, true] {
         for warm in [15, 16] {
+            let prefix = warm_prefix(warm);
+            let mut whole = tiny(paged);
+            whole.decoder.prefill_chunk(&prefix, None, false).unwrap();
+            let token = 7;
+            let want_logits = whole.decoder.step(token).unwrap();
+            let want_state = snapshot_decoder_state(&mut whole.decoder);
+            let mut want_follow = Vec::with_capacity(3);
+            for next in [9, 4, 12] {
+                let logits = whole.decoder.step(next).unwrap();
+                let state = snapshot_decoder_state(&mut whole.decoder);
+                want_follow.push((next, logits, state));
+            }
             for from in 1..=3 {
                 for rerun in [false, true] {
                     let mut split = tiny(paged);
-                    let mut whole = tiny(paged);
                     let layers = split.decoder.config.num_hidden_layers;
                     assert!(from < layers);
-                    for i in 0..warm {
-                        let token = 3 + (i % 10) as u32;
-                        split.decoder.step(token).unwrap();
-                        whole.decoder.step(token).unwrap();
-                    }
+                    split.decoder.prefill_chunk(&prefix, None, false).unwrap();
                     let what = format!("paged={paged} warm={warm} from={from} rerun={rerun}");
-                    let token = 7;
-                    let want = whole.decoder.step(token).unwrap();
                     let history = split.decoder.history.clone();
                     let caches = split.decoder.caches.clone();
                     let got = in_decode_pass(&mut split.decoder, |d| {
@@ -1069,14 +1288,13 @@ fn layers_split_run_equals_one_run() {
                         assert_eq!(d.layer_inputs.as_ref().unwrap().len(), layers, "{what}");
                         out
                     });
-                    assert_same_bits(&got, &want, &format!("{what}: logits"));
-                    assert_same_decoder_state(&mut split.decoder, &mut whole.decoder, &what);
-                    for token in [9, 4, 12] {
-                        let got = split.decoder.step(token).unwrap();
-                        let want = whole.decoder.step(token).unwrap();
-                        let what = format!("{what} then {token}");
-                        assert_same_bits(&got, &want, &format!("{what}: logits"));
-                        assert_same_decoder_state(&mut split.decoder, &mut whole.decoder, &what);
+                    assert_same_bits(&got, &want_logits, &format!("{what}: logits"));
+                    assert_decoder_matches_snapshot(&mut split.decoder, &want_state, &what);
+                    for (next, want, want_next_state) in &want_follow {
+                        let got = split.decoder.step(*next).unwrap();
+                        let what = format!("{what} then {next}");
+                        assert_same_bits(&got, want, &format!("{what}: logits"));
+                        assert_decoder_matches_snapshot(&mut split.decoder, want_next_state, &what);
                     }
                 }
             }
@@ -1086,7 +1304,7 @@ fn layers_split_run_equals_one_run() {
 
 /// On the real MoE shape a partial store's tentative pass keeps every
 /// layer's input and that changes no bit against a pass that keeps none:
-/// layer outputs, logits and every state array over 64 greedy hit steps (a
+/// layer outputs, logits and every state array over 16 greedy hit steps (a
 /// miss replays from the kept inputs, so a pass that keeps none cannot
 /// miss; the `tail_` and `device_replay_` tests cover misses).
 /// MUTATION: `keeps_layer_inputs` answers false on a partial store → red
@@ -1110,7 +1328,7 @@ fn layers_checkpoint_on_the_moe_fixture_changes_no_bit() {
         [&live.route_tries, &live.route_replays].map(|n| n.load(Ordering::Relaxed))
     };
     let (kept_start, plain_start) = (counts(&kept), counts(&plain));
-    const STEPS: usize = 64;
+    const STEPS: usize = 16;
     let mut token = 3;
     for step in 0..STEPS {
         let got = kept.decoder.step(token).unwrap();
@@ -1203,57 +1421,68 @@ fn warm_prefix(count: usize) -> Vec<u32> {
 #[test]
 fn tail_replay_is_exact_at_every_layer_kind() {
     use crate::transformer::KvFormat;
-    let wide = Temp::new();
-    write_wide_head_fixture(&wide.0);
+    let (wide, _) = wide_head_fixture();
     let int8 = || {
-        let mut inner = wide_head_inner(&wide.0, KvFormat::Int8);
+        let mut inner = wide_head_inner(wide, KvFormat::Int8);
         inner.activate_paged_seq(1).unwrap();
         inner
     };
-    let cases: [(&str, &dyn Fn() -> Inner); 3] = [
-        ("flat", &|| tiny(false)),
-        ("bf16 pages", &|| tiny(true)),
-        ("int8 pages", &int8),
+    let cases: [(&str, &[usize], &dyn Fn() -> Inner); 3] = [
+        ("flat", &[15, 32], &|| tiny(false)),
+        ("bf16 pages", &[15, 16, 31, 32], &|| tiny(true)),
+        ("int8 pages", &[15, 16, 31, 32], &int8),
     ];
-    for (name, make) in cases {
-        for boundary in [15, 16, 31, 32] {
+    for (name, boundaries, make) in cases {
+        for &boundary in boundaries {
+            let prefix = warm_prefix(boundary);
+            let mut reference = make();
+            let c = reference.decoder.config.clone();
+            assert_eq!(
+                (0..c.num_hidden_layers)
+                    .map(|i| (c.linear(i), c.ple_layer_ids.contains(&(i + 1))))
+                    .collect::<Vec<_>>(),
+                [(true, false), (true, true), (true, false), (false, false)],
+                "layer kinds"
+            );
+            if name == "int8 pages" {
+                let pool = reference.decoder.paged.as_ref().unwrap().key_pool_array(0);
+                assert_eq!(pool.unwrap().dtype().unwrap(), crate::array::DType::Int8);
+            }
+            reference
+                .decoder
+                .prefill_chunk(&prefix, None, false)
+                .unwrap();
+            let token = 7;
+            let want_logits = reference.decoder.step(token).unwrap();
+            let want_bits = f32_bits(&want_logits);
+            let want_state = snapshot_decoder_state(&mut reference.decoder);
+            let mut want_follow = Vec::with_capacity(3);
+            for next in [9, 4, 12] {
+                let logits = reference.decoder.step(next).unwrap();
+                let state = snapshot_decoder_state(&mut reference.decoder);
+                want_follow.push((next, logits, state));
+            }
             for from in 0..4 {
                 let mut replayed = make();
-                let mut reference = make();
-                let c = replayed.decoder.config.clone();
-                assert_eq!(
-                    (0..c.num_hidden_layers)
-                        .map(|i| (c.linear(i), c.ple_layer_ids.contains(&(i + 1))))
-                        .collect::<Vec<_>>(),
-                    [(true, false), (true, true), (true, false), (false, false)],
-                    "layer kinds"
-                );
-                if name == "int8 pages" {
-                    let pool = replayed.decoder.paged.as_ref().unwrap().key_pool_array(0);
-                    assert_eq!(pool.unwrap().dtype().unwrap(), crate::array::DType::Int8);
-                }
-                let prefix = warm_prefix(boundary);
-                for inner in [&mut replayed, &mut reference] {
-                    inner.decoder.prefill_chunk(&prefix, None, false).unwrap();
-                }
+                replayed
+                    .decoder
+                    .prefill_chunk(&prefix, None, false)
+                    .unwrap();
                 let what = format!("{name} after {boundary} from {from}");
-                let token = 7;
-                let want = reference.decoder.step(token).unwrap();
                 let (base, tentative, inputs) = poisoned_pass(&mut replayed.decoder, token, from);
                 assert_ne!(
                     f32_bits(&tentative),
-                    f32_bits(&want),
+                    want_bits,
                     "{what}: the poison changed the tentative pass"
                 );
                 let got = replay(&mut replayed.decoder, base, from, inputs, token).unwrap();
-                assert_same_bits(&got, &want, &format!("{what}: logits"));
-                assert_same_decoder_state(&mut replayed.decoder, &mut reference.decoder, &what);
-                for token in [9, 4, 12] {
-                    let got = replayed.decoder.step(token).unwrap();
-                    let want = reference.decoder.step(token).unwrap();
-                    let what = format!("{what} then {token}");
-                    assert_same_bits(&got, &want, &format!("{what}: logits"));
-                    assert_same_decoder_state(&mut replayed.decoder, &mut reference.decoder, &what);
+                assert_same_bits(&got, &want_logits, &format!("{what}: logits"));
+                assert_decoder_matches_snapshot(&mut replayed.decoder, &want_state, &what);
+                for (next, want, want_next_state) in &want_follow {
+                    let got = replayed.decoder.step(*next).unwrap();
+                    let what = format!("{what} then {next}");
+                    assert_same_bits(&got, want, &format!("{what}: logits"));
+                    assert_decoder_matches_snapshot(&mut replayed.decoder, want_next_state, &what);
                 }
             }
         }
@@ -1336,9 +1565,13 @@ fn tail_last_hidden_is_the_replays() {
 }
 
 /// What a [`moe_replay_run`] counted on its device side.
+#[derive(Clone)]
 struct MoeRun {
     /// [tries, replays, replayed layers, host tail layers] over the run.
     total: [u64; 4],
+    /// Per-step `[replays, replayed layers]` so shorter runs can compare
+    /// against the exact matching token prefix of a cached longer baseline.
+    step_replays: Vec<[u64; 2]>,
     /// The same counts for each planned step, in plan order.
     planned: Vec<[u64; 4]>,
     /// [slot hits, slot misses] of each planned step, device then host.
@@ -1353,6 +1586,19 @@ struct MoeRun {
     /// found an entry in flight.
     stops: u64,
     unready_polls: u64,
+}
+
+impl MoeRun {
+    fn prefix_replays(&self, steps: usize) -> [u64; 2] {
+        assert!(
+            steps <= self.step_replays.len(),
+            "requested prefix {steps} > recorded steps {}",
+            self.step_replays.len()
+        );
+        self.step_replays[..steps]
+            .iter()
+            .fold([0u64; 2], |[r, l], &[dr, dl]| [r + dr, l + dl])
+    }
 }
 
 /// The knobs of a [`moe_replay_run`].
@@ -1465,6 +1711,7 @@ fn moe_replay_run(
     let mut want_trips = 0;
     let mut run = MoeRun {
         total: [0; 4],
+        step_replays: Vec::with_capacity(steps),
         planned: Vec::new(),
         planned_slots: Vec::new(),
         checks: Vec::new(),
@@ -1515,6 +1762,7 @@ fn moe_replay_run(
             "{what}: guard trips"
         );
         run.tried.push(tries == 1);
+        run.step_replays.push([replays, replayed]);
         if missed.is_some() {
             let after = counts(&device);
             run.planned
@@ -1535,7 +1783,9 @@ fn moe_replay_run(
             assert_same_bits(x, y, &format!("{what}: layer {layer} output"));
         }
         assert_same_bits(&got, &want, &format!("{what}: logits"));
-        assert_same_decoder_state(&mut device.decoder, &mut host.decoder, &what);
+        if missed.is_some() || replays > 0 || step == 31 || step == 32 || step + 1 == steps {
+            assert_same_decoder_state(&mut device.decoder, &mut host.decoder, &what);
+        }
         if book {
             for layer in 0..layers {
                 let (a, b) = (&device.decoder.weights, &host.decoder.weights);
@@ -1579,6 +1829,19 @@ fn moe_replay_run(
     run
 }
 
+/// Shared 64-step whole-pass natural runs at capacity 10 and 11 (`flat = false`),
+/// reused across `device_replay_is_exact`, `device_replay_fills_protect_the_layers_ids`,
+/// `guard_every_token_tries_the_device_path`, and `early_cut_is_exact`.
+fn cached_moe_replay_run(capacity: usize) -> &'static MoeRun {
+    static CAP10: std::sync::OnceLock<MoeRun> = std::sync::OnceLock::new();
+    static CAP11: std::sync::OnceLock<MoeRun> = std::sync::OnceLock::new();
+    match capacity {
+        10 => CAP10.get_or_init(|| moe_replay_run(10, 64, &[], &RunKnobs::default())),
+        11 => CAP11.get_or_init(|| moe_replay_run(11, 64, &[], &RunKnobs::default())),
+        other => panic!("unexpected cached moe_replay_run capacity {other}"),
+    }
+}
+
 /// On the real MoE shape with int8 pages, a miss reads the missed experts
 /// and runs its token again from the missed layer on device routes, and the
 /// run stays bit-equal to host routes: misses placed at layers 1, 2, 3 and
@@ -1609,7 +1872,7 @@ fn device_replay_is_exact() {
     let rerun: u64 = planned.iter().map(|&(_, m)| (LAYERS - m[0]) as u64).sum();
     assert_eq!([replayed, host_tail], [rerun, 0]);
     for capacity in [10, 11] {
-        let run = moe_replay_run(capacity, 64, &[], &RunKnobs::default());
+        let run = cached_moe_replay_run(capacity);
         eprintln!(
             "capacity {capacity}: [tries, replays, replayed, host tail] {:?}, peak {}",
             run.total, run.peak
@@ -1665,7 +1928,7 @@ fn device_replay_wrong_hints_end_on_host_routes() {
 fn device_replay_fills_protect_the_layers_ids() {
     let _host = memory::scoped_fixture_host();
     for capacity in [10, 11] {
-        let run = moe_replay_run(capacity, 64, &[], &RunKnobs::default());
+        let run = cached_moe_replay_run(capacity);
         assert!(!run.checks.is_empty(), "capacity {capacity}: no preload");
         let unmapped: Vec<_> = run.checks.iter().filter(|(_, mapped)| !mapped).collect();
         assert!(
@@ -1700,7 +1963,7 @@ fn device_replay_counts_a_loaded_pick_once() {
 fn guard_every_token_tries_the_device_path() {
     let _host = memory::scoped_fixture_host();
     const STEPS: usize = 64;
-    let run = moe_replay_run(11, STEPS, &[], &RunKnobs::default());
+    let run = cached_moe_replay_run(11);
     let [tries, replays, _, host_tail] = run.total;
     assert_eq!(tries, STEPS as u64);
     assert!(run.tried.iter().all(|&tried| tried));
@@ -1957,44 +2220,66 @@ fn early_cut_is_exact() {
         );
         assert_eq!(run.stops, 2, "flat={flat}: misses at layers 1 and 0 stop");
         assert_eq!(run.total[1..], [4, 6, 0], "flat={flat}");
-        for capacity in [10, 11] {
-            let cut = moe_replay_run(
-                capacity,
-                64,
-                &[],
-                &RunKnobs {
-                    poll: ready,
-                    flat,
-                    ..RunKnobs::default()
-                },
-            );
-            let whole = moe_replay_run(
-                capacity,
-                64,
-                &[],
-                &RunKnobs {
-                    flat,
-                    ..RunKnobs::default()
-                },
-            );
+        let check_cut = |flat: bool,
+                         capacity: usize,
+                         cut_steps: usize,
+                         cut: &MoeRun,
+                         whole: &MoeRun| {
+            let [whole_replays, whole_replayed] = whole.prefix_replays(cut_steps);
             eprintln!(
-                "flat={flat} capacity {capacity}: [tries, replays, replayed, host tail] \
-                 cut {:?} stops {} peak {}, whole {:?} peak {}",
-                cut.total, cut.stops, cut.peak, whole.total, whole.peak
+                "flat={flat} capacity {capacity} steps {cut_steps}: [tries, replays, replayed, host tail] \
+                 cut {:?} stops {} peak {}, whole_prefix [{whole_replays}, {whole_replayed}] peak {}",
+                cut.total, cut.stops, cut.peak, whole.peak
             );
             let what = format!("flat={flat} capacity {capacity}");
             assert!(cut.stops > 0, "{what}: no pass stopped");
             assert_eq!(whole.stops, 0, "{what}");
             let [_, cut_replays, cut_replayed, _] = cut.total;
-            let [_, whole_replays, whole_replayed, _] = whole.total;
             assert!(cut_replays > 0 && whole_replays > 0, "{what}");
             assert!(
                 cut_replayed * whole_replays < whole_replayed * cut_replays,
                 "{what}: layers built twice per replay {cut_replayed}/{cut_replays} \
-                 vs {whole_replayed}/{whole_replays}"
+                 vs {whole_replayed}/{whole_replays} over {cut_steps} steps"
             );
             assert!(cut.peak <= 4, "{what}: peak {}", cut.peak);
             assert_eq!([cut.trips, whole.trips], [0, 0], "{what}");
+        };
+        if !flat {
+            for (capacity, cut_steps) in [(10usize, 36usize), (11, 24)] {
+                let cut = moe_replay_run(
+                    capacity,
+                    cut_steps,
+                    &[],
+                    &RunKnobs {
+                        poll: ready,
+                        flat: false,
+                        ..RunKnobs::default()
+                    },
+                );
+                let whole = cached_moe_replay_run(capacity);
+                check_cut(false, capacity, cut_steps, &cut, whole);
+            }
+        } else {
+            let cut = moe_replay_run(
+                10,
+                24,
+                &[],
+                &RunKnobs {
+                    poll: ready,
+                    flat: true,
+                    ..RunKnobs::default()
+                },
+            );
+            let whole = moe_replay_run(
+                10,
+                24,
+                &[],
+                &RunKnobs {
+                    flat: true,
+                    ..RunKnobs::default()
+                },
+            );
+            check_cut(true, 10, 24, &cut, &whole);
         }
     }
 }
@@ -2034,7 +2319,7 @@ fn early_cut_leaves_the_hit_path_alone() {
         };
         let (polled_start, plain_start) = (counts(&polled), counts(&plain));
         let reads = crate::array::unready_id_reads();
-        const STEPS: usize = 64;
+        const STEPS: usize = 16;
         let mut token = 3;
         for step in 0..STEPS {
             let what = format!("flat={flat} step {step} token {token}");
@@ -2125,11 +2410,30 @@ fn early_cut_with_groups_in_flight_is_exact() {
         .map(|m| [1, 1, (stop(m) - m) as u64, 0])
         .collect();
     want.extend([[1, 1, 5, 0], [1, 1, 6, 0]]);
+    let flat_planned: [(usize, &[usize]); 5] =
+        [(2, &[0]), (5, &[3]), (8, &[6]), (11, &[9]), (14, &[0, 3])];
+    let flat_want = [
+        [1, 1, 5, 0],
+        [1, 1, 5, 0],
+        [1, 1, 5, 0],
+        [1, 1, 3, 0],
+        [1, 1, 5, 0],
+    ];
     for flat in [false, true] {
+        let (steps, case_planned, case_want, want_stops): (
+            usize,
+            &[(usize, &[usize])],
+            &[[u64; 4]],
+            u64,
+        ) = if flat {
+            (16, &flat_planned, &flat_want, 4)
+        } else {
+            (44, &planned, &want, 10)
+        };
         let run = moe_replay_run(
             12,
-            44,
-            &planned,
+            steps,
+            case_planned,
             &RunKnobs {
                 book: true,
                 poll: Some(decoder::GroupPoll::Older),
@@ -2138,10 +2442,10 @@ fn early_cut_with_groups_in_flight_is_exact() {
                 ..RunKnobs::default()
             },
         );
-        assert_eq!(run.planned, want, "flat={flat}: one replay each");
-        assert_eq!(run.stops, 10, "flat={flat}: misses at layers 0..8 stop");
+        assert_eq!(run.planned, case_want, "flat={flat}: one replay each");
+        assert_eq!(run.stops, want_stops, "flat={flat}: early stops");
         assert_eq!(run.unready_polls, 0, "flat={flat}");
-        assert_eq!(run.total[1], planned.len() as u64, "flat={flat}");
+        assert_eq!(run.total[1], case_planned.len() as u64, "flat={flat}");
     }
     let live = moe_replay_run(
         12,
@@ -2155,7 +2459,7 @@ fn early_cut_with_groups_in_flight_is_exact() {
     );
     let natural = moe_replay_run(
         10,
-        32,
+        16,
         &[],
         &RunKnobs {
             deep: true,

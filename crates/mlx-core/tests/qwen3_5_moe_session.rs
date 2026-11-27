@@ -11,7 +11,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MOE_MODEL_PATH=./.cache/models/qwen3.5-moe-mlx-bf16 \
-//!     cargo test -p mlx-core --test qwen3_5_moe_session -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_moe_session -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_MOE_MODEL_PATH` the test early-returns and passes

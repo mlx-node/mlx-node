@@ -11,6 +11,15 @@ const hub = vi.hoisted(() => ({
   revisions: [] as (string | undefined)[],
   failPath: undefined as string | undefined,
 }));
+// Only safetensors files appear in this suite; guard against unexpected GGUF addon hits.
+vi.mock('../../packages/cli/src/commands/download-gguf-check.js', () => ({
+  checkGgufTargets: async ({ paths }: { paths: readonly string[] }) => {
+    if (paths.some((path) => path.toLowerCase().endsWith('.gguf'))) {
+      throw new Error(`unexpected GGUF target in download-tts test: ${paths.join(', ')}`);
+    }
+    return { targets: [], headerBytes: 0 };
+  },
+}));
 vi.mock('@huggingface/hub', () => ({
   modelInfo: async () => ({ sha: hub.sha }),
   listFiles: async function* (p: { revision?: string }) {

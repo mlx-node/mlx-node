@@ -3,8 +3,8 @@
 //! and a restart that drops the model and builds a new one over the same
 //! namespace reopened.
 use super::prefix_reuse::{
-    GRID, cold_on, cycles, finish, fork, greedy, prompt, reuse_inner, reuse_over, speculative_turn,
-    turn,
+    GRID, cold_logits_on, cold_on, cycles, finish, fork, greedy, prompt, reuse_inner, reuse_over,
+    speculative_turn, turn,
 };
 use super::*;
 use crate::disk_tier::DiskTierOptions;
@@ -79,6 +79,15 @@ impl Root {
         let mut namespaces = self.namespaces();
         assert_eq!(namespaces.len(), 1, "{namespaces:?}");
         namespaces.remove(0)
+    }
+
+    /// Populates `namespace` under this root's cache directory with `files`.
+    pub(super) fn seed_namespace(&self, namespace: &str, files: &[(String, Vec<u8>)]) {
+        let dir = self.cache.0.join(namespace);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
     }
 
     fn temp_is_empty(&self) -> bool {
@@ -296,6 +305,18 @@ fn first_conversation(root: &Root, make: &dyn Fn() -> Inner) -> Vec<u32> {
     first_conversation_as(root, make, "fixture")
 }
 
+fn copy_namespace(from: &Root, to: &Root) {
+    let src = from.namespace();
+    let dst = to.cache.0.join(src.file_name().unwrap());
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap().flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".safetensors") {
+            std::fs::copy(entry.path(), dst.join(&name)).unwrap();
+        }
+    }
+}
+
 /// The keys of `tokens`' first `blocks` blocks in `group`, as the fixture's
 /// plain 32-row passes key them.
 fn keys_of(
@@ -328,12 +349,11 @@ fn keys_of(
 fn a_restart_resumes_from_the_disk_state_and_matches_cold() {
     use crate::transformer::KvFormat;
     let _host = memory::scoped_fixture_host();
-    let wide = Temp::new();
-    write_wide_head_fixture(&wide.0);
+    let (wide, _) = wide_head_fixture();
     let cases: [(&str, &dyn Fn() -> Inner); 2] = [
         ("bf16", &reuse_inner),
         ("int8", &|| {
-            reuse_over(wide_head_inner(&wide.0, KvFormat::Int8))
+            reuse_over(wide_head_inner(wide, KvFormat::Int8))
         }),
     ];
     for (name, make) in cases {
@@ -401,9 +421,13 @@ fn a_restarted_draft_turn_matches_cold() {
 #[test]
 fn a_corrupt_or_foreign_state_is_refused_and_removed() {
     let _host = memory::scoped_fixture_host();
+    let template = Root::new();
+    let a = first_conversation(&template, &reuse_inner);
+    let b = fork(&a, 98, 110, 2);
+    let want_logits = cold_logits_on(reuse_inner(), &b);
     for case in ["truncated", "checksum", "identity"] {
         let root = Root::new();
-        let a = first_conversation(&root, &reuse_inner);
+        copy_namespace(&template, &root);
         let state = files(&root, "dflash2_state").remove(0);
         let mut bytes = std::fs::read(&state).unwrap();
         match case {
@@ -420,12 +444,11 @@ fn a_corrupt_or_foreign_state_is_refused_and_removed() {
         }
         std::fs::write(&state, &bytes).unwrap();
         let mut inner = on_disk(reuse_inner(), &root);
-        let b = fork(&a, 98, 110, 2);
         let (cached, logits) = turn(&mut inner, 1, &b);
         assert_eq!(cached, 0, "{case}");
         assert_eq!(count(&inner.telemetry.disk_restored), 0, "{case}");
         assert!(!state.exists(), "{case}: the refused object is removed");
-        assert_eq!(logits, cold_on(reuse_inner(), &b).0, "{case}");
+        assert_eq!(logits, want_logits, "{case}");
     }
 }
 
@@ -841,7 +864,7 @@ fn dispose_keeps_what_the_writer_holds() {
     let kv = keys_of(&inner, &a, ColdGroup::Kv, 3);
     assert!(kv.iter().all(|key| !manager.contains(key)));
     let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
         let _ = release.send(());
     });
     inner.disk = None;
@@ -974,7 +997,7 @@ fn a_reopen_under_a_lower_quota_trims_at_once() {
     let mut inner = inner;
     let b = fork(&a, 98, 110, 2);
     let (_, logits) = turn(&mut inner, 1, &b);
-    assert_eq!(logits, cold_on(reuse_inner(), &b).0);
+    assert_eq!(logits, cold_logits_on(reuse_inner(), &b));
 }
 
 /// Overlapping closes share one outcome: a close that comes while another
@@ -995,8 +1018,15 @@ fn overlapping_closes_share_one_outcome() {
         let closer = Arc::clone(&closer);
         std::thread::spawn(move || closer.close(Instant::now() + Duration::from_secs(20)))
     };
-    std::thread::sleep(Duration::from_millis(200));
-    let second = closer.close(Instant::now() + Duration::from_millis(300));
+    let wait_start = Instant::now();
+    while !closer.is_close_started() {
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(5),
+            "first closer did not claim ownership in time"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = closer.close(Instant::now() + Duration::from_millis(80));
     let landed = kv.iter().all(|key| manager.contains(key));
     assert!(!landed, "the writer is stalled");
     assert!(!second, "a close reported true before its copies landed");
@@ -1020,12 +1050,20 @@ fn close_cache_during_a_dispose_shares_its_outcome() {
     let _host = memory::scoped_fixture_host();
     let root = Root::new();
     let mut inner = on_disk_with(reuse_inner(), &root, "fixture", (64, 0));
+    disk(&inner).set_slot_wait(Duration::from_millis(250));
     let manager = store(&inner);
     let release = stall_writer(&inner);
     let kv = queued_behind_a_stall(&mut inner, &prompt(100, 1));
     let closer = disk(&inner).closer().upgrade().unwrap();
     let late = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
+        let wait_start = Instant::now();
+        while !closer.is_close_started() {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(5),
+                "dispose closer did not claim ownership in time"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         closer.close(Instant::now() + Duration::from_secs(20))
     });
     inner.disk = None;
@@ -1051,6 +1089,7 @@ fn close_cache_before_a_dispose_reports_a_state_left_unwritten() {
     let _host = memory::scoped_fixture_host();
     let root = Root::new();
     let mut inner = on_disk_with(reuse_inner(), &root, "fixture", (64, 0));
+    disk(&inner).set_slot_wait(Duration::from_millis(150));
     let prompts = [prompt(100, 1), prompt(100, 2)];
     for (seq, tokens) in [1, 2].into_iter().zip(&prompts) {
         turn(&mut inner, seq, tokens);
@@ -1060,15 +1099,15 @@ fn close_cache_before_a_dispose_reports_a_state_left_unwritten() {
     let older = keys_of(&inner, &prompts[0], ColdGroup::DFlash2State, 3)[2];
     let manager = store(&inner);
     let release = stall_writer(&inner);
-    let (woke, _wakes) = std::sync::mpsc::channel::<()>();
+    let (woke, wakes) = std::sync::mpsc::channel::<()>();
     let closer = disk(&inner).closer().upgrade().unwrap();
     closer.set_wake(Arc::new(move || {
         let _ = woke.send(());
     }));
-    let closing = std::thread::spawn(move || closer.close(Instant::now() + Duration::from_secs(8)));
-    std::thread::sleep(Duration::from_millis(300));
+    let closing = std::thread::spawn(move || closer.close(Instant::now() + Duration::from_secs(4)));
+    wakes.recv_timeout(Duration::from_secs(5)).unwrap();
     let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(350));
         let _ = release.send(());
     });
     drop(inner);
@@ -1247,7 +1286,7 @@ fn a_temporary_tier_writes_only_on_demand() {
     let (cached, logits) = turn(&mut inner, 3, &b);
     assert_eq!(cached, 96);
     assert_eq!(count(&inner.telemetry.disk_restored), 1);
-    assert_eq!(logits, cold_on(reuse_inner(), &b).0);
+    assert_eq!(logits, cold_logits_on(reuse_inner(), &b));
 }
 
 /// `closeCache` on a temporary tier writes nothing and removes its
@@ -1460,7 +1499,7 @@ fn a_state_is_durable_only_with_its_chain() {
         let (cached, logits) = turn(&mut after, 1, &b);
         assert_eq!(cached, 0);
         assert_eq!(count(&after.telemetry.disk_restored), 0);
-        assert_eq!(logits, cold_on(reuse_inner(), &b).0);
+        assert_eq!(logits, cold_logits_on(reuse_inner(), &b));
     }
     disk(&inner).hold(false);
     drive(&mut inner, |inner| count(&inner.telemetry.durable) == 1);
@@ -1485,6 +1524,7 @@ fn a_state_keeps_its_copy_while_its_chain_is_queued() {
     assert_eq!(files(&root, "dflash2_state").len(), 1);
     assert_eq!(count(&inner.telemetry.refused), 0);
     assert!(entry_at(&inner, 96).disk().is_some());
+    disk(&inner).hold(false);
 }
 
 /// A chain that can no longer land drops its state: with the queued copies
@@ -1622,9 +1662,9 @@ fn close_cache_writes_waiting_points_newest_first() {
     let closer = disk(&inner).closer().upgrade().unwrap();
     closer.set_wake(Arc::new(|| {}));
     let started = Instant::now();
-    let reported = closer.close(started + Duration::from_secs(2));
+    let reported = closer.close(started + Duration::from_millis(200));
     assert!(
-        started.elapsed() < Duration::from_millis(2500),
+        started.elapsed() < Duration::from_millis(500),
         "{:?}",
         started.elapsed()
     );
@@ -1834,7 +1874,7 @@ fn memory_takes_the_ram_copy_and_keeps_the_disk_state() {
     let (cached, logits) = turn(&mut inner, 3, &b);
     assert_eq!(cached, 96);
     assert_eq!(count(&inner.telemetry.disk_restored), 1);
-    assert_eq!(logits, cold_on(reuse_inner(), &b).0);
+    assert_eq!(logits, cold_logits_on(reuse_inner(), &b));
     finish(&mut inner);
     inner.prefix_states.reset(true);
     let left = inner.prefix_states.store.bytes().entries;
@@ -1935,7 +1975,7 @@ fn a_state_without_its_draft_segments_is_not_adopted() {
     let b = fork(&a, 98, 110, 2);
     let (cached, logits) = turn(&mut inner, 1, &b);
     assert_eq!(cached, 0);
-    assert_eq!(logits, cold_on(reuse_inner(), &b).0);
+    assert_eq!(logits, cold_logits_on(reuse_inner(), &b));
 }
 
 /// A crash between a write and its landing leaves nothing that is read: a
@@ -1948,12 +1988,16 @@ fn a_state_without_its_draft_segments_is_not_adopted() {
 #[test]
 fn a_half_written_state_is_never_read() {
     let _host = memory::scoped_fixture_host();
+    let template = Root::new();
+    let a = first_conversation(&template, &reuse_inner);
+    let fixture = reuse_inner();
+    let state = keys_of(&fixture, &a, ColdGroup::DFlash2State, 3)[2];
+    let kv = keys_of(&fixture, &a, ColdGroup::Kv, 3);
+    let b = fork(&a, 98, 110, 2);
+    let want_logits = cold_logits_on(reuse_inner(), &b);
     for case in ["writer temp", "cut short", "last block"] {
         let root = Root::new();
-        let a = first_conversation(&root, &reuse_inner);
-        let fixture = reuse_inner();
-        let state = keys_of(&fixture, &a, ColdGroup::DFlash2State, 3)[2];
-        let kv = keys_of(&fixture, &a, ColdGroup::Kv, 3);
+        copy_namespace(&template, &root);
         let namespace = root.namespace();
         let state_file = files(&root, "dflash2_state").remove(0);
         let bytes = std::fs::read(&state_file).unwrap();
@@ -1979,10 +2023,9 @@ fn a_half_written_state_is_never_read() {
         if case == "cut short" {
             assert!(!state_file.exists(), "{case}");
         }
-        let b = fork(&a, 98, 110, 2);
         let (cached, logits) = turn(&mut inner, 1, &b);
         assert_eq!(cached, if want == 1 { 96 } else { 0 }, "{case}");
-        assert_eq!(logits, cold_on(reuse_inner(), &b).0, "{case}");
+        assert_eq!(logits, want_logits, "{case}");
     }
 }
 
@@ -2133,7 +2176,7 @@ fn an_evicted_state_leaves_the_store() {
             let (cached, logits) = turn(&mut inner, 3, &b);
             assert!(cached < 96, "{case}: {cached}");
             assert_eq!(count(&inner.telemetry.disk_restored), 0, "{case}");
-            assert_eq!(logits, cold_on(reuse_inner(), &b).0, "{case}");
+            assert_eq!(logits, cold_logits_on(reuse_inner(), &b), "{case}");
         }
     }
 }

@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+// No test invokes the production first-run download wizard.
+vi.mock('../src/commands/download-model.js', () => ({
+  run: async () => {
+    throw new Error('unexpected production wizard download in delegate test');
+  },
+}));
+
 import type { AgentRunDeps } from '../src/commands/agent/index.js';
 import {
   DELEGATE_DEFAULT_ARGS,

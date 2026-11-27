@@ -2,8 +2,9 @@
 //! numpy `.npz` dumps.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::array::MxArray;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf};
@@ -21,11 +22,19 @@ pub(super) fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+struct TinyGgufBytes {
+    bytes: Vec<u8>,
+    index: HashMap<String, usize>,
+}
+
+static TINY_GGUF_BYTES: OnceLock<TinyGgufBytes> = OnceLock::new();
+static ORACLE_NPZ: OnceLock<Npz> = OnceLock::new();
+
 /// `tiny-q8_0.gguf` dense tensors (F32, Q8_0) dequantized to f32 on the
 /// host (`d * q` is exact in f32), torch order.
 pub(super) struct TinyGguf {
-    path: PathBuf,
     pub gguf: GgufFile,
+    cached: &'static TinyGgufBytes,
 }
 
 impl TinyGguf {
@@ -33,23 +42,30 @@ impl TinyGguf {
         exact_f32();
         let path = fixture("tiny-q8_0.gguf");
         let gguf = parse_gguf(&path).unwrap();
-        Self { path, gguf }
+        let cached = TINY_GGUF_BYTES.get_or_init(|| {
+            let bytes = std::fs::read(&path).unwrap();
+            let index = gguf
+                .tensors
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.name.clone(), i))
+                .collect();
+            TinyGgufBytes { bytes, index }
+        });
+        Self { gguf, cached }
     }
 
     /// A tensor's header and its data bytes as stored.
     pub fn raw(&self, name: &str) -> (&GgufTensorInfo, Vec<u8>) {
-        let t = self
-            .gguf
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
+        let &idx = self
+            .cached
+            .index
+            .get(name)
             .unwrap_or_else(|| panic!("{name} not in the tiny GGUF"));
-        let mut f = std::fs::File::open(&self.path).unwrap();
-        f.seek(SeekFrom::Start(self.gguf.data_offset + t.offset))
-            .unwrap();
-        let mut raw = vec![0u8; t.data_size().unwrap() as usize];
-        f.read_exact(&mut raw).unwrap();
-        (t, raw)
+        let t = &self.gguf.tensors[idx];
+        let start = (self.gguf.data_offset + t.offset) as usize;
+        let len = t.data_size().unwrap() as usize;
+        (t, self.cached.bytes[start..start + len].to_vec())
     }
 
     pub fn dense(&self, name: &str) -> napi::Result<MxArray> {
@@ -80,6 +96,11 @@ impl TinyGguf {
 pub(super) struct Npz(pub HashMap<String, (Vec<i64>, Vec<f32>)>);
 
 impl Npz {
+    pub fn oracle() -> &'static Self {
+        exact_f32();
+        ORACLE_NPZ.get_or_init(|| Self::open("oracle.npz"))
+    }
+
     pub fn open(name: &str) -> Self {
         exact_f32();
         let f = std::fs::File::open(fixture(name)).unwrap();

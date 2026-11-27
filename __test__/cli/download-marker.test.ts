@@ -23,6 +23,16 @@ const hub = vi.hoisted(() => ({
   snapshotDir: '',
 }));
 
+// Only safetensors files appear in this suite; guard against unexpected GGUF addon hits.
+vi.mock('../../packages/cli/src/commands/download-gguf-check.js', () => ({
+  checkGgufTargets: async ({ paths }: { paths: readonly string[] }) => {
+    if (paths.some((path) => path.toLowerCase().endsWith('.gguf'))) {
+      throw new Error(`unexpected GGUF target in download-marker test: ${paths.join(', ')}`);
+    }
+    return { targets: [], headerBytes: 0 };
+  },
+}));
+
 // Only `run` below reaches the hub: the upstream is `hub.manifest` at `hub.sha`.
 vi.mock('@huggingface/hub', () => ({
   downloadFile: async () => new Blob(['{}']),

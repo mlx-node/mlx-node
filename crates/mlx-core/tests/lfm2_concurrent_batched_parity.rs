@@ -7,7 +7,7 @@
 //! checkpoints and can flip near-tied greedy tokens).
 //!
 //! Run with:
-//! `MLX_TEST_LFM2_MODEL_PATH=/abs/lfm2 cargo test -p mlx-core --test lfm2_concurrent_batched_parity -- --ignored --nocapture`
+//! `MLX_TEST_LFM2_MODEL_PATH=/abs/lfm2 cargo test -p mlx-core --features e2e-tests --test lfm2_concurrent_batched_parity -- --ignored --nocapture`
 
 use std::path::PathBuf;
 

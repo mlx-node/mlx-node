@@ -13,8 +13,8 @@
 //! `MLX_METAL_GPU_ARCH` set to each of applegpu_g17d, applegpu_g17g,
 //! applegpu_g17p, applegpu_g16s, applegpu_g14s and applegpu_g14d:
 //!
-//!   cargo test -p mlx-core --release --test kquant_golden_gate -- --ignored
-//!   MLX_METAL_GPU_ARCH=applegpu_g17d cargo test -p mlx-core --release --test kquant_golden_gate -- --ignored
+//!   cargo test -p mlx-core --release --features e2e-tests --test kquant_golden_gate -- --ignored
+//!   MLX_METAL_GPU_ARCH=applegpu_g17d cargo test -p mlx-core --release --features e2e-tests --test kquant_golden_gate -- --ignored
 //!
 //! The native run (gen 17 with NAX) reaches qmm_t_nax and qmv_sg8; g17p keeps
 //! sg8 without NAX; g16s turns both off; g14s/g14d also turn qmv_wide off, so

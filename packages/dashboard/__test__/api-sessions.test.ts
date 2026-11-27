@@ -109,6 +109,7 @@ beforeEach(() => {
   cpSync(FIXTURE_HOME, home, { recursive: true });
   setMtimes(home, Date.now() - DAY);
   runtime = createDashboardRuntime({
+    inProcessWorker: true,
     dbPath: ':memory:',
     tracesDir: join(base, 'traces'),
     modelsDir: join(base, 'models'),
@@ -222,6 +223,7 @@ describe('GET /api/sessions/:id', () => {
     const rel = relative(process.cwd(), home);
     expect(rel.startsWith('/')).toBe(false);
     const relRuntime = createDashboardRuntime({
+      inProcessWorker: true,
       dbPath: ':memory:',
       tracesDir: join(base, 'traces'),
       modelsDir: join(base, 'models'),
@@ -614,8 +616,21 @@ describe('DELETE /api/sessions/:id', () => {
 
 describe('Sessions API over the RPC port', () => {
   it('lists, renames and refuses over a real MessageChannel', async () => {
+    // Keep a real Worker thread here so MessageChannel + Worker IPC stay exercised end-to-end.
+    const threadedRuntime = createDashboardRuntime({
+      dbPath: ':memory:',
+      tracesDir: join(base, 'traces'),
+      modelsDir: join(base, 'models'),
+      agentHome: home,
+      chat: {
+        tempRoots: [],
+        root: join(base, 'chat'),
+        readEndpoint: async () => null,
+        secrets: new MemorySecretStore(),
+      },
+    });
     const { port1, port2 } = new MessageChannel();
-    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    const dispose = serveRuntimeOverPort(threadedRuntime, bindEventTargetPort(port2));
     const client = createRpcClient(bindEventTargetPort(port1));
     const rpc = createTestClient(client);
     try {
@@ -635,6 +650,7 @@ describe('Sessions API over the RPC port', () => {
     } finally {
       client.close();
       dispose();
+      await threadedRuntime.close();
     }
   });
 });

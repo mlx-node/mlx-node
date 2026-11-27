@@ -24,7 +24,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
-//!     cargo test -p mlx-core --test qwen3_paged_vs_flat_parity \
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_paged_vs_flat_parity \
 //!     -- --ignored --nocapture
 //! ```
 //!

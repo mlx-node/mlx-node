@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import * as core from '@mlx-node/core';
-import { ResponseStore } from '@mlx-node/core';
+import type { ResponseStore } from '@mlx-node/core';
 
 import { AudioService, type AudioServiceOptions } from './audio-service.js';
 import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
@@ -42,9 +42,9 @@ const MEMORY_GOVERNOR_POLL_MS = 2000;
  * A binding without the export reads as none.
  */
 function readMemoryGovernor(): MemoryGovernorHealth | null {
-  const read = (core as { memoryGovernorStatus?: typeof core.memoryGovernorStatus }).memoryGovernorStatus;
-  if (typeof read !== 'function') return null;
   try {
+    const read = (core as { memoryGovernorStatus?: typeof core.memoryGovernorStatus }).memoryGovernorStatus;
+    if (typeof read !== 'function') return null;
     const status = read();
     return status ? toMemoryGovernorHealth(status) : null;
   } catch {
@@ -529,6 +529,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     const storePath = config?.storePath ?? join(homedir(), '.mlx-node', 'responses.db');
     const storeDir = join(storePath, '..');
     await mkdir(storeDir, { recursive: true });
+    const { ResponseStore } = await import('@mlx-node/core');
     store = await ResponseStore.open(storePath);
   }
 

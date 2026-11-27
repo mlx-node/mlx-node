@@ -1,5 +1,11 @@
-import { getDefaultSFTConfig, mergeSFTConfig, applySFTOverrides, SFTConfigError } from '@mlx-node/trl';
 import { describe, expect, it } from 'vite-plus/test';
+
+import {
+  getDefaultSFTConfig,
+  mergeSFTConfig,
+  applySFTOverrides,
+  SFTConfigError,
+} from '../../packages/trl/src/trainers/sft-config.js';
 
 describe('SFT configuration', () => {
   it('returns a mutable copy of the default configuration', () => {

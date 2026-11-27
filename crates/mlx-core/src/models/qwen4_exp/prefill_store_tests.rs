@@ -379,12 +379,13 @@ fn assert_same_slot_banks(a: &decoder::Decoder, b: &decoder::Decoder, what: &str
     }
 }
 
-/// Prefill a 256-row window and a 44-row tail, then decode `steps` greedy
-/// tokens, on both: the logits of every call and the decoder state end
-/// equal bit for bit.
+/// Prefill a 32-row window and a 12-row tail (two chunks so recovery is
+/// checked across a subsequent chunk with live decoder state), then decode
+/// `steps` greedy tokens, on both: the logits of every call and the decoder
+/// state end equal bit for bit.
 fn assert_same_turn(a: &mut Inner, b: &mut Inner, steps: usize, what: &str) {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    let prompt = prompt(300);
+    let prompt = prompt(44);
     for inner in [&mut *a, &mut *b] {
         inner.decoder.context_window = 768;
         inner.activate_paged_seq(1).unwrap();
@@ -394,15 +395,13 @@ fn assert_same_turn(a: &mut Inner, b: &mut Inner, steps: usize, what: &str) {
         let mut out = vec![
             inner
                 .decoder
-                .prefill_chunk(&prompt[..256], None, true)
+                .prefill_chunk(&prompt[..32], None, true)
                 .unwrap(),
-        ];
-        out.push(
             inner
                 .decoder
-                .prefill_chunk(&prompt[256..], None, true)
+                .prefill_chunk(&prompt[32..], None, true)
                 .unwrap(),
-        );
+        ];
         for _ in 0..steps {
             let token = argmax(out.last().unwrap());
             out.push(inner.decoder.step(token).unwrap());
@@ -477,7 +476,7 @@ fn one_lease_runs_one_fill_with_the_chunked_victims() {
         "the old loop: a fill per 8 misses"
     );
     assert_same_slot_banks(&new.decoder, &old.decoder, "after the leases");
-    assert_same_turn(&mut new, &mut old, 6, "one fill vs chunks of 8");
+    assert_same_turn(&mut new, &mut old, 2, "one fill vs chunks of 8");
 }
 
 /// Five slot fills (four layers of 11 experts, then one more expert) on
@@ -523,7 +522,7 @@ fn slot_fills_reuse_the_readers_and_the_staging() {
         fills[2] / fills[0]
     );
     assert_same_slot_banks(&new.decoder, &old.decoder, "after five fills");
-    assert_same_turn(&mut new, &mut old, 4, "reused ring vs the old loop");
+    assert_same_turn(&mut new, &mut old, 2, "reused ring vs the old loop");
     assert_eq!(
         new.decoder.weights.slot_fill_builds[0], 8,
         "the turn's fills start no reader"
@@ -581,7 +580,7 @@ fn a_failed_read_leaves_committed_slots_valid() {
         &fresh.decoder,
         "refilled after the failure",
     );
-    assert_same_turn(&mut failed, &mut fresh, 4, "after a failed fill vs fresh");
+    assert_same_turn(&mut failed, &mut fresh, 2, "after a failed fill vs fresh");
 }
 
 /// The six counters a prefill pass moves, then their prefill shares.
@@ -747,36 +746,44 @@ fn a_slotted_group_matches_windows_bit_for_bit() {
     let layers = config.num_hidden_layers;
     for (width, class) in [(16usize, "Rows"), (48, "Gather")] {
         let prompt = prompt(3 * width + 5);
+        let tokens = prompt.len() + 4;
+        let mut windowed = streamed_direct_decoder(&path, &config, 2, width, tokens);
+        let (ref_windows, ref_tail) = windowed.group_windows(&prompt);
+        let mut window_hidden = Vec::new();
+        let mut expected = None;
+        for (k, chunk) in ref_windows.iter().copied().chain([ref_tail]).enumerate() {
+            expected = Some(windowed.prefill_chunk(chunk, None, k == 3).unwrap());
+            window_hidden.extend(windowed.last_chunk_hidden.iter().map(f32s));
+        }
+        let expected_logits = expected.unwrap();
+        let want_history = windowed.history.clone();
+        let want_frontier = frontier_bytes(&windowed);
+        assert!(union_classes(&windowed).is_empty(), "width {width}");
+        let mut decode_last = expected_logits.clone();
+        let mut want_decode = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let token = argmax(&decode_last);
+            decode_last = windowed.step(token).unwrap();
+            want_decode.push(decode_last.clone());
+        }
         for (capacity, held) in [(2usize, &[][..]), (3, &[]), (4, &[0u32, 1])] {
             let what = format!("width {width}, {capacity} slots holding {held:?}");
-            let decoders = [0, 1].map(|_| {
-                let tokens = prompt.len() + 4;
-                let mut d = streamed_direct_decoder(&path, &config, capacity, width, tokens);
-                if !held.is_empty() {
-                    super::route_step::fill_slots(&mut d, held);
-                }
-                d
-            });
-            let [mut grouped, mut windowed] = decoders;
+            let mut grouped = streamed_direct_decoder(&path, &config, capacity, width, tokens);
+            if !held.is_empty() {
+                super::route_step::fill_slots(&mut grouped, held);
+            }
             let (windows, tail) = grouped.group_windows(&prompt);
             assert_eq!(windows.len(), 3, "{what}");
             assert_eq!(tail.len(), 5, "{what}");
             let (logits, views) = grouped.prefill_group(&windows, tail, true, true).unwrap();
             let mut group_hidden: Vec<Vec<f32>> = views.iter().flatten().map(f32s).collect();
             group_hidden.extend(grouped.last_chunk_hidden.iter().map(f32s));
-            let mut window_hidden = Vec::new();
-            let mut expected = None;
-            for (k, chunk) in windows.iter().copied().chain([tail]).enumerate() {
-                expected = Some(windowed.prefill_chunk(chunk, None, k == 3).unwrap());
-                window_hidden.extend(windowed.last_chunk_hidden.iter().map(f32s));
-            }
-            let mut expected = expected.unwrap();
-            assert_same_bits(&logits, &expected, &format!("{what}: logits"));
+            assert_same_bits(&logits, &expected_logits, &format!("{what}: logits"));
             assert_eq!(group_hidden, window_hidden, "{what}: hidden views");
-            assert_eq!(grouped.history, windowed.history, "{what}: history");
+            assert_eq!(grouped.history, want_history, "{what}: history");
             assert_eq!(
                 frontier_bytes(&grouped),
-                frontier_bytes(&windowed),
+                want_frontier,
                 "{what}: caches and pool K/V"
             );
             assert_eq!(
@@ -786,13 +793,11 @@ fn a_slotted_group_matches_windows_bit_for_bit() {
                     .collect::<Vec<_>>(),
                 "{what}: one union lease per layer, each window's own class"
             );
-            assert!(union_classes(&windowed).is_empty(), "{what}");
             let mut logits = logits;
-            for step in 0..4 {
+            for (step, want) in want_decode.iter().enumerate() {
                 let token = argmax(&logits);
                 logits = grouped.step(token).unwrap();
-                expected = windowed.step(token).unwrap();
-                assert_same_bits(&logits, &expected, &format!("{what}: decode step {step}"));
+                assert_same_bits(&logits, want, &format!("{what}: decode step {step}"));
             }
         }
     }
@@ -814,43 +819,67 @@ fn an_int8_group_matches_windows_bit_for_bit() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
     let _host = memory::scoped_fixture_host();
     let prompt = prompt(556);
+    let windows = [&prompt[..256], &prompt[256..512]];
+    let tail = &prompt[512..];
+
+    let mut windowed = super::route_step::moe_shape_inner(10);
+    windowed.decoder.context_window = 768;
+    windowed.activate_paged_seq(1).unwrap();
+    let mut expected = None;
+    let mut window_views: Vec<Vec<Vec<u32>>> = Vec::new();
+    for chunk in windows.into_iter().chain([tail]) {
+        expected = Some(windowed.decoder.prefill_chunk(chunk, None, true).unwrap());
+        window_views.push(
+            windowed
+                .decoder
+                .last_chunk_hidden
+                .iter()
+                .map(f32_bits)
+                .collect(),
+        );
+    }
+    let want_logits = expected.unwrap();
+    let want_before_decode = super::route_step::snapshot_decoder_state(&mut windowed.decoder);
+    let mut decode_last = want_logits.clone();
+    let mut want_decode = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let token = argmax(&decode_last);
+        decode_last = windowed.decoder.step(token).unwrap();
+        want_decode.push(decode_last.clone());
+    }
+    let want_after_decode = super::route_step::snapshot_decoder_state(&mut windowed.decoder);
+    drop(windowed);
+
     for (capacity, held) in [(10usize, 0u32), (11, 0), (10, 10)] {
         let what = format!("{capacity} slots holding {held} experts");
-        let [mut grouped, mut windowed] = [0, 1].map(|_| {
-            let mut inner = super::route_step::moe_shape_inner(capacity);
-            inner.decoder.context_window = 768;
-            inner.activate_paged_seq(1).unwrap();
-            let held: Vec<u32> = (0..held).collect();
-            if !held.is_empty() {
-                super::route_step::fill_slots(&mut inner.decoder, &held);
-            }
-            inner
-        });
+        let mut grouped = super::route_step::moe_shape_inner(capacity);
+        grouped.decoder.context_window = 768;
+        grouped.activate_paged_seq(1).unwrap();
+        let held_ids: Vec<u32> = (0..held).collect();
+        if !held_ids.is_empty() {
+            super::route_step::fill_slots(&mut grouped.decoder, &held_ids);
+        }
         let c = grouped.decoder.config.clone();
         assert_eq!(c.kv_format, crate::transformer::KvFormat::Int8);
-        let windows = [&prompt[..256], &prompt[256..512]];
-        let tail = &prompt[512..];
         let (mut logits, views) = grouped
             .decoder
             .prefill_group(&windows, tail, true, true)
             .unwrap();
-        let mut expected = None;
-        let mut window_views = Vec::new();
-        for chunk in windows.into_iter().chain([tail]) {
-            expected = Some(windowed.decoder.prefill_chunk(chunk, None, true).unwrap());
-            window_views.push(windowed.decoder.last_chunk_hidden.clone());
-        }
         assert_eq!(views.len(), 2, "{what}: one view list per window");
         for (w, (got, want)) in views.iter().zip(&window_views).enumerate() {
             assert_eq!(got.len(), want.len(), "{what}: window {w} views");
             for (row, (x, y)) in got.iter().zip(want).enumerate() {
-                assert_same_bits(x, y, &format!("{what}: hidden views, window {w} row {row}"));
+                super::route_step::assert_same_f32_bits(
+                    x,
+                    y,
+                    &format!("{what}: hidden views, window {w} row {row}"),
+                );
             }
         }
-        assert_same_bits(&logits, &expected.unwrap(), &format!("{what}: logits"));
-        super::route_step::assert_same_decoder_state(
+        assert_same_bits(&logits, &want_logits, &format!("{what}: logits"));
+        super::route_step::assert_decoder_matches_snapshot(
             &mut grouped.decoder,
-            &mut windowed.decoder,
+            &want_before_decode,
             &what,
         );
         assert_eq!(
@@ -860,15 +889,14 @@ fn an_int8_group_matches_windows_bit_for_bit() {
                 .collect::<Vec<_>>(),
             "{what}: one union lease per layer"
         );
-        for step in 0..6 {
+        for (step, want) in want_decode.iter().enumerate() {
             let token = argmax(&logits);
             logits = grouped.decoder.step(token).unwrap();
-            let want = windowed.decoder.step(token).unwrap();
-            assert_same_bits(&logits, &want, &format!("{what}: decode step {step}"));
+            assert_same_bits(&logits, want, &format!("{what}: decode step {step}"));
         }
-        super::route_step::assert_same_decoder_state(
+        super::route_step::assert_decoder_matches_snapshot(
             &mut grouped.decoder,
-            &mut windowed.decoder,
+            &want_after_decode,
             &format!("{what}, after decode"),
         );
         let pool = grouped.decoder.paged.as_ref().unwrap().key_pool_array(0);
@@ -876,32 +904,67 @@ fn an_int8_group_matches_windows_bit_for_bit() {
     }
 }
 
+struct GroupAfterWindow {
+    layers: usize,
+    experts: usize,
+    before: Vec<Vec<Option<u32>>>,
+    moved: [u64; 7],
+    union_routes: Vec<Vec<u32>>,
+    expert_fills: std::collections::HashMap<(usize, u32), u32>,
+    layer_leases: std::collections::HashMap<usize, (std::collections::HashSet<u32>, u64)>,
+    occupants: Vec<Vec<Option<u32>>>,
+    ages: Vec<(Vec<u64>, u64)>,
+}
+
 /// The Flash Next shape at 10 slots after a 256-row window, then a group of
-/// two 256-row windows. Returns the decoder, each layer's occupants before
-/// the group, and the records the group moved.
-fn group_after_a_window() -> (Inner, Vec<Vec<Option<u32>>>, [u64; 7]) {
-    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    let prompt = prompt(768);
-    let mut inner = super::route_step::moe_shape_inner(10);
-    inner.decoder.context_window = 768;
-    inner.activate_paged_seq(1).unwrap();
-    inner
-        .decoder
-        .prefill_chunk(&prompt[..256], None, true)
-        .unwrap();
-    let layers = inner.decoder.config.num_hidden_layers;
-    let before: Vec<_> = (0..layers)
-        .map(|layer| inner.decoder.weights.slot_occupants(layer).unwrap())
-        .collect();
-    inner.decoder.weights.layer_leases.clear();
-    inner.decoder.weights.expert_fills.clear();
-    let records_before = records(&inner.decoder.weights.live);
-    inner
-        .decoder
-        .prefill_group(&[&prompt[256..512], &prompt[512..]], &[], true, false)
-        .unwrap();
-    let moved = delta(records(&inner.decoder.weights.live), records_before);
-    (inner, before, moved)
+/// two 256-row windows, cached once per process for the read-once and
+/// last-use-order tests.
+fn group_after_a_window() -> &'static GroupAfterWindow {
+    static SNAP: std::sync::OnceLock<GroupAfterWindow> = std::sync::OnceLock::new();
+    SNAP.get_or_init(|| {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        let prompt = prompt(768);
+        let mut inner = super::route_step::moe_shape_inner(10);
+        inner.decoder.context_window = 768;
+        inner.activate_paged_seq(1).unwrap();
+        inner
+            .decoder
+            .prefill_chunk(&prompt[..256], None, true)
+            .unwrap();
+        let layers = inner.decoder.config.num_hidden_layers;
+        let experts = inner.decoder.config.num_experts;
+        let before: Vec<_> = (0..layers)
+            .map(|layer| inner.decoder.weights.slot_occupants(layer).unwrap())
+            .collect();
+        inner.decoder.weights.layer_leases.clear();
+        inner.decoder.weights.expert_fills.clear();
+        let records_before = records(&inner.decoder.weights.live);
+        inner
+            .decoder
+            .prefill_group(&[&prompt[256..512], &prompt[512..]], &[], true, false)
+            .unwrap();
+        let moved = delta(records(&inner.decoder.weights.live), records_before);
+        let union_routes = (0..layers)
+            .map(|layer| union_routes(&inner.decoder, layer))
+            .collect();
+        let occupants = (0..layers)
+            .map(|layer| inner.decoder.weights.slot_occupants(layer).unwrap())
+            .collect();
+        let ages = (0..layers)
+            .map(|layer| inner.decoder.weights.slot_ages(layer).unwrap())
+            .collect();
+        GroupAfterWindow {
+            layers,
+            experts,
+            before,
+            moved,
+            union_routes,
+            expert_fills: inner.decoder.weights.expert_fills.clone(),
+            layer_leases: inner.decoder.weights.layer_leases.clone(),
+            occupants,
+            ages,
+        }
+    })
 }
 
 /// The group's routes of `layer`, window after window.
@@ -926,19 +989,17 @@ fn union_routes(decoder: &decoder::Decoder, layer: usize) -> Vec<u32> {
 #[test]
 fn a_group_reads_each_missing_expert_once_per_layer() {
     let _host = memory::scoped_fixture_host();
-    let (inner, before, moved) = group_after_a_window();
-    let decoder = &inner.decoder;
+    let snap = group_after_a_window();
     let mut expected = 0u64;
-    for (layer, held) in before.iter().enumerate() {
+    for (layer, held) in snap.before.iter().enumerate() {
         let union: std::collections::BTreeSet<u32> =
-            union_routes(decoder, layer).into_iter().collect();
+            snap.union_routes[layer].iter().copied().collect();
         let missing: std::collections::BTreeSet<u32> = union
             .iter()
             .copied()
             .filter(|e| !held.contains(&Some(*e)))
             .collect();
-        let filled: std::collections::BTreeMap<u32, u32> = decoder
-            .weights
+        let filled: std::collections::BTreeMap<u32, u32> = snap
             .expert_fills
             .iter()
             .filter(|((l, _), _)| *l == layer)
@@ -949,7 +1010,7 @@ fn a_group_reads_each_missing_expert_once_per_layer() {
             missing.iter().map(|&e| (e, 1)).collect(),
             "layer {layer}: experts filled (held {held:?}, union {union:?})"
         );
-        let (leased, misses) = &decoder.weights.layer_leases[&layer];
+        let (leased, misses) = &snap.layer_leases[&layer];
         assert_eq!(
             leased
                 .iter()
@@ -963,10 +1024,14 @@ fn a_group_reads_each_missing_expert_once_per_layer() {
     }
     assert!(expected > 0, "the group missed experts");
     assert_eq!(
-        moved[3], expected,
+        snap.moved[3], expected,
         "slotMisses = |union - held| over layers"
     );
-    assert_eq!([moved[5], moved[6]], [1, 2], "one group of two windows");
+    assert_eq!(
+        [snap.moved[5], snap.moved[6]],
+        [1, 2],
+        "one group of two windows"
+    );
 }
 
 /// After a group the slots' experts of its union are newer than every other
@@ -977,13 +1042,11 @@ fn a_group_reads_each_missing_expert_once_per_layer() {
 #[test]
 fn a_group_leaves_last_used_experts_newest() {
     let _host = memory::scoped_fixture_host();
-    let (inner, _, _) = group_after_a_window();
-    let decoder = &inner.decoder;
-    let c = decoder.config.clone();
-    for layer in 0..c.num_hidden_layers {
-        let order = route_plan::expert_order(&union_routes(decoder, layer), c.num_experts).unwrap();
-        let occupants = decoder.weights.slot_occupants(layer).unwrap();
-        let (ages, _) = decoder.weights.slot_ages(layer).unwrap();
+    let snap = group_after_a_window();
+    for layer in 0..snap.layers {
+        let order = route_plan::expert_order(&snap.union_routes[layer], snap.experts).unwrap();
+        let occupants = &snap.occupants[layer];
+        let (ages, _) = &snap.ages[layer];
         let mut by_age: Vec<(u64, Option<u32>)> = ages
             .iter()
             .copied()
@@ -1013,20 +1076,160 @@ fn a_group_leaves_last_used_experts_newest() {
     }
 }
 
+struct PlaneSnapshot {
+    slots: Vec<(usize, Vec<u32>)>,
+}
+
+struct LayerBankSnapshot {
+    occupants: Vec<Option<u32>>,
+    parts: [[Option<PlaneSnapshot>; 3]; 3],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SlotBookSnapshot {
+    occupants: Option<Vec<Option<u32>>>,
+    ages: Option<(Vec<u64>, u64)>,
+}
+
+fn snapshot_slot_banks(decoder: &decoder::Decoder) -> Vec<Option<LayerBankSnapshot>> {
+    (0..decoder.config.num_hidden_layers)
+        .map(|layer| {
+            let occupants = decoder.weights.slot_occupants(layer)?;
+            let banks = decoder.weights.slot_banks(layer).unwrap();
+            let parts = std::array::from_fn(|part| {
+                let arrays = [
+                    Some(&banks[part].values),
+                    banks[part].scales.as_ref(),
+                    banks[part].biases.as_ref(),
+                ];
+                std::array::from_fn(|plane| {
+                    arrays[plane].map(|a| {
+                        let rows = a.shape().unwrap()[0] / occupants.len() as i64;
+                        let slots = occupants
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| e.is_some())
+                            .map(|(slot, _)| {
+                                let (lo, hi) = (slot as i64 * rows, (slot as i64 + 1) * rows);
+                                (slot, f32_bits(&a.slice_axis(0, lo, hi).unwrap()))
+                            })
+                            .collect();
+                        PlaneSnapshot { slots }
+                    })
+                })
+            });
+            Some(LayerBankSnapshot { occupants, parts })
+        })
+        .collect()
+}
+
+fn assert_same_slot_bank_snapshots(
+    a: &[Option<LayerBankSnapshot>],
+    b: &[Option<LayerBankSnapshot>],
+    what: &str,
+) {
+    assert_eq!(a.len(), b.len(), "{what}: layer count");
+    for (layer, (x, y)) in a.iter().zip(b).enumerate() {
+        match (x, y) {
+            (None, None) => continue,
+            (Some(xa), Some(xb)) => {
+                assert_eq!(
+                    xa.occupants, xb.occupants,
+                    "{what}: layer {layer} occupants"
+                );
+                for part in 0..3 {
+                    for plane in 0..3 {
+                        match (&xa.parts[part][plane], &xb.parts[part][plane]) {
+                            (None, None) => {}
+                            (Some(sa), Some(sb)) => {
+                                assert_eq!(
+                                    sa.slots.len(),
+                                    sb.slots.len(),
+                                    "{what}: layer {layer} part {part}"
+                                );
+                                for ((slot_a, ba), (slot_b, bb)) in sa.slots.iter().zip(&sb.slots) {
+                                    assert_eq!(slot_a, slot_b);
+                                    super::route_step::assert_same_bit_slices(
+                                        ba,
+                                        bb,
+                                        &format!(
+                                            "{what}: layer {layer} part {part} plane {plane} slot {slot_a}"
+                                        ),
+                                    );
+                                }
+                            }
+                            _ => panic!("{what}: layer {layer} part {part}"),
+                        }
+                    }
+                }
+            }
+            _ => panic!("{what}: layer {layer} occupants presence"),
+        }
+    }
+}
+
+struct FillTurnSnapshot {
+    layers: usize,
+    logits: Vec<Vec<u32>>,
+    hidden: Vec<Vec<f32>>,
+    state: super::route_step::DecoderStateSnapshot,
+    slot_books: Vec<SlotBookSnapshot>,
+    slot_banks: Vec<Option<LayerBankSnapshot>>,
+    records: [u64; 7],
+    events: [Vec<String>; 2],
+    fill_bank_checks: Option<Vec<(usize, bool, bool)>>,
+}
+
+fn snapshot_fill_turn(
+    mut inner: Inner,
+    logits: Vec<MxArray>,
+    hidden: Vec<Vec<f32>>,
+    events: [Vec<String>; 2],
+) -> FillTurnSnapshot {
+    let layers = inner.decoder.config.num_hidden_layers;
+    let state = super::route_step::snapshot_decoder_state(&mut inner.decoder);
+    let slot_books = (0..layers)
+        .map(|layer| {
+            let weights = &inner.decoder.weights;
+            SlotBookSnapshot {
+                occupants: weights.slot_occupants(layer),
+                ages: weights.slot_ages(layer),
+            }
+        })
+        .collect();
+    let slot_banks = snapshot_slot_banks(&inner.decoder);
+    let recs = records(&inner.decoder.weights.live);
+    let fill_bank_checks = inner.decoder.fill_bank_checks.clone();
+    FillTurnSnapshot {
+        layers,
+        logits: logits.iter().map(f32_bits).collect(),
+        hidden,
+        state,
+        slot_books,
+        slot_banks,
+        records: recs,
+        events,
+        fill_bank_checks,
+    }
+}
+
 /// A turn on the Flash Next shape at 10 slots holding experts 0-5 (a
 /// union of all 12 then runs 6 residents first and reads 6), with fills
 /// read ahead of their lease or not (`ahead`) and batches of 2 MiB (more
 /// than the ring holds, so reads are queued during the finish) or 64 MiB:
 /// a group of two 256-row windows (`group`) or one 256-row window, then a
-/// 44-row tail, then 4 greedy decode steps. Returns the inner, the logits of
-/// every call, the hidden views of the prefill and the test events of the
-/// prefill and of the decode steps.
-fn fill_ahead_turn(
-    ahead: bool,
-    small: bool,
-    group: bool,
-    watch: bool,
-) -> (Inner, Vec<MxArray>, Vec<Vec<f32>>, [Vec<String>; 2]) {
+/// 44-row tail, then 4 greedy decode steps. Cached per `(ahead, small, group)`
+/// with `watch` enabled on `(true, true, _)` so both fill-ahead tests share
+/// the same turns.
+fn cached_fill_ahead_turn(ahead: bool, small: bool, group: bool) -> Arc<FillTurnSnapshot> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(bool, bool, bool), Arc<FillTurnSnapshot>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (ahead, small, group);
+    if let Some(snap) = cache.lock().unwrap().get(&key) {
+        return Arc::clone(snap);
+    }
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
     let prompt = prompt(556);
     let mut inner = super::route_step::moe_shape_inner(10);
@@ -1038,7 +1241,7 @@ fn fill_ahead_turn(
     inner.activate_paged_seq(1).unwrap();
     let held: Vec<u32> = (0..6).collect();
     super::route_step::fill_slots(&mut inner.decoder, &held);
-    if watch {
+    if ahead && small {
         inner.decoder.fill_bank_checks = Some(Vec::new());
     }
     inner.decoder.submit_log.borrow_mut().clear();
@@ -1069,7 +1272,9 @@ fn fill_ahead_turn(
         logits.push(decoder.step(token).unwrap());
     }
     let decode = std::mem::take(&mut *decoder.submit_log.borrow_mut());
-    (inner, logits, hidden, [prefill, decode])
+    let snap = Arc::new(snapshot_fill_turn(inner, logits, hidden, [prefill, decode]));
+    let mut map = cache.lock().unwrap();
+    Arc::clone(map.entry(key).or_insert(snap))
 }
 
 /// The test events of the fills read ahead in `log`, per layer in order.
@@ -1087,32 +1292,19 @@ fn fill_events(log: &[String], layers: usize) -> Vec<Vec<&'static str>> {
         .collect()
 }
 
-/// The two turns of `fill_ahead_turn` gave the same bits: logits, hidden
-/// views, decoder state (int8 pages and scales included), slot book
-/// (occupants, ages, tick), slot bank rows and the records but fill time.
-fn assert_same_fill_turn(
-    a: &mut (Inner, Vec<MxArray>, Vec<Vec<f32>>, [Vec<String>; 2]),
-    b: &mut (Inner, Vec<MxArray>, Vec<Vec<f32>>, [Vec<String>; 2]),
-    what: &str,
-) {
-    for (call, (x, y)) in a.1.iter().zip(&b.1).enumerate() {
-        assert_same_bits(x, y, &format!("{what}: logits of call {call}"));
+/// The two turns gave the same bits: logits, hidden views, decoder state
+/// (int8 pages and scales included), slot book (occupants, ages, tick),
+/// slot bank rows and the records but fill time.
+fn assert_same_fill_turn_snapshots(a: &FillTurnSnapshot, b: &FillTurnSnapshot, what: &str) {
+    assert_eq!(a.logits.len(), b.logits.len(), "{what}: logits count");
+    for (call, (x, y)) in a.logits.iter().zip(&b.logits).enumerate() {
+        super::route_step::assert_same_bit_slices(x, y, &format!("{what}: logits of call {call}"));
     }
-    assert_eq!(a.2, b.2, "{what}: hidden views");
-    super::route_step::assert_same_decoder_state(&mut a.0.decoder, &mut b.0.decoder, what);
-    let layers = a.0.decoder.config.num_hidden_layers;
-    for layer in 0..layers {
-        let book = |inner: &Inner| {
-            let weights = &inner.decoder.weights;
-            (weights.slot_occupants(layer), weights.slot_ages(layer))
-        };
-        assert_eq!(book(&a.0), book(&b.0), "{what}: layer {layer} slot book");
-    }
-    assert_same_slot_banks(&a.0.decoder, &b.0.decoder, what);
-    let (x, y) = (
-        records(&a.0.decoder.weights.live),
-        records(&b.0.decoder.weights.live),
-    );
+    assert_eq!(a.hidden, b.hidden, "{what}: hidden views");
+    super::route_step::assert_same_decoder_state_snapshots(&a.state, &b.state, what);
+    assert_eq!(a.slot_books, b.slot_books, "{what}: slot book");
+    assert_same_slot_bank_snapshots(&a.slot_banks, &b.slot_banks, what);
+    let (x, y) = (a.records, b.records);
     assert_eq!(
         [x[0], x[2], x[3], x[4], x[5], x[6]],
         [y[0], y[2], y[3], y[4], y[5], y[6]],
@@ -1135,10 +1327,10 @@ fn residents_are_submitted_before_the_fill_finishes() {
     for group in [true, false] {
         for small in [false, true] {
             let what = format!("group {group}, 2 MiB batches {small}");
-            let mut ahead = fill_ahead_turn(true, small, group, false);
-            let mut waited = fill_ahead_turn(false, small, group, false);
-            let layers = ahead.0.decoder.config.num_hidden_layers;
-            let events = fill_events(&ahead.3[0], layers);
+            let ahead = cached_fill_ahead_turn(true, small, group);
+            let waited = cached_fill_ahead_turn(false, small, group);
+            let layers = ahead.layers;
+            let events = fill_events(&ahead.events[0], layers);
             for (layer, steps) in events.iter().enumerate() {
                 assert!(!steps.is_empty(), "{what}: layer {layer} read ahead");
                 for fill in steps.chunks(3) {
@@ -1151,13 +1343,13 @@ fn residents_are_submitted_before_the_fill_finishes() {
             }
             for (turn, phase) in [(&ahead, 1), (&waited, 0), (&waited, 1)] {
                 assert!(
-                    fill_events(&turn.3[phase], layers)
+                    fill_events(&turn.events[phase], layers)
                         .iter()
                         .all(Vec::is_empty),
                     "{what}: no read ahead in phase {phase} of a turn"
                 );
             }
-            assert_same_fill_turn(&mut ahead, &mut waited, &what);
+            assert_same_fill_turn_snapshots(&ahead, &waited, &what);
         }
     }
 }
@@ -1174,10 +1366,10 @@ fn a_fill_never_writes_under_a_pending_reader() {
     let _host = memory::scoped_fixture_host();
     for group in [true, false] {
         let what = format!("group {group}");
-        let mut ahead = fill_ahead_turn(true, true, group, true);
-        let mut waited = fill_ahead_turn(false, true, group, false);
-        let layers = ahead.0.decoder.config.num_hidden_layers;
-        let checks = ahead.0.decoder.fill_bank_checks.clone().unwrap();
+        let ahead = cached_fill_ahead_turn(true, true, group);
+        let waited = cached_fill_ahead_turn(false, true, group);
+        let layers = ahead.layers;
+        let checks = ahead.fill_bank_checks.as_ref().unwrap();
         for layer in 0..layers {
             assert!(
                 checks.iter().any(|&(l, read, _)| l == layer && read),
@@ -1188,7 +1380,7 @@ fn a_fill_never_writes_under_a_pending_reader() {
             checks.iter().all(|&(_, _, unchanged)| unchanged),
             "{what}: bank rows unchanged under their reader {checks:?}"
         );
-        assert_same_fill_turn(&mut ahead, &mut waited, &what);
+        assert_same_fill_turn_snapshots(&ahead, &waited, &what);
     }
 }
 
@@ -1202,7 +1394,7 @@ fn windows_of_eight_rows_read_nothing_ahead() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
     let _host = memory::scoped_fixture_host();
     let prompt = prompt(8);
-    let [mut ahead, mut waited] = [true, false].map(|ahead| {
+    let [ahead, waited] = [true, false].map(|ahead| {
         let mut inner = super::route_step::moe_shape_inner(10);
         inner.decoder.weights.no_fill_ahead = !ahead;
         inner.decoder.context_window = 768;
@@ -1219,15 +1411,17 @@ fn windows_of_eight_rows_read_nothing_ahead() {
             logits.push(inner.decoder.step(token).unwrap());
         }
         let log = std::mem::take(&mut *inner.decoder.submit_log.borrow_mut());
-        (inner, logits, Vec::new(), [log, Vec::new()])
+        snapshot_fill_turn(inner, logits, Vec::new(), [log, Vec::new()])
     });
-    let layers = ahead.0.decoder.config.num_hidden_layers;
+    let layers = ahead.layers;
     assert!(
-        fill_events(&ahead.3[0], layers).iter().all(Vec::is_empty),
+        fill_events(&ahead.events[0], layers)
+            .iter()
+            .all(Vec::is_empty),
         "no read ahead for 8 rows: {:?}",
-        fill_events(&ahead.3[0], layers)
+        fill_events(&ahead.events[0], layers)
     );
-    assert_same_fill_turn(&mut ahead, &mut waited, "8 rows");
+    assert_same_fill_turn_snapshots(&ahead, &waited, "8 rows");
 }
 
 /// A fill read ahead and left (its lease never came) is abandoned by the

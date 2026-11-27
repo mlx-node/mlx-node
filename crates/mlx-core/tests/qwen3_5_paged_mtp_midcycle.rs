@@ -27,7 +27,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/<qwen3.5-dense-mtp-ckpt> \
-//!     cargo test -p mlx-core --test qwen3_5_paged_mtp_midcycle -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_paged_mtp_midcycle -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_MODEL_PATH` (or on an unsuitable checkpoint) every test

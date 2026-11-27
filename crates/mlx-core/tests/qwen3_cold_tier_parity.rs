@@ -30,7 +30,7 @@
 //! ```shell
 //! MLX_COLD_CACHE_DIR=$(mktemp -d) \
 //!     MLX_TEST_MODEL_PATH=~/.mlx-node/models/qwen3-0.6b-mlx-bf16 \
-//!     cargo test -p mlx-core --test qwen3_cold_tier_parity \
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_cold_tier_parity \
 //!     -- --ignored --test-threads=1 --nocapture
 //! ```
 

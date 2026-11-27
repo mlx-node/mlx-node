@@ -18,9 +18,11 @@ import {
   isImageProcessingError,
   retryableErrorCode,
   validateRequestImagesAsync,
-} from '@mlx-node/lm';
-import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
-import { ToolCallTagBuffer } from '@mlx-node/lm';
+  type ChatSession,
+  type ChatStreamEvent,
+  type SessionCapableModel,
+} from '@mlx-node/lm/chat-session';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tool-call-buffer';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {

@@ -41,51 +41,95 @@ mod tests {
         }
     }
 
+    /// Inspect a tensor on CPU in a single pass without launching extra GPU
+    /// reduction or cast kernels (`isnan`/`isinf`/`abs`/`max`/`sum`).
+    fn tensor_stats(arr: &MxArray) -> (bool, bool, f32) {
+        arr.eval();
+        let (mut nan, mut inf, mut max_abs) = (false, false, 0.0f32);
+        match arr.dtype().unwrap() {
+            DType::Float32 => {
+                let data = arr.to_float32().unwrap();
+                for &v in data.iter() {
+                    if v.is_nan() {
+                        nan = true;
+                    } else if v.is_infinite() {
+                        inf = true;
+                    } else {
+                        max_abs = max_abs.max(v.abs());
+                    }
+                }
+            }
+            DType::BFloat16 => {
+                let data = arr.to_uint16_native().unwrap();
+                for &b in &data {
+                    let mag = b & 0x7fff;
+                    if mag > 0x7f80 {
+                        nan = true;
+                    } else if mag == 0x7f80 {
+                        inf = true;
+                    } else {
+                        let v = f32::from_bits(u32::from(mag) << 16);
+                        if v > max_abs {
+                            max_abs = v;
+                        }
+                    }
+                }
+            }
+            DType::Float16 => {
+                let data = arr.to_uint16_native().unwrap();
+                for &b in &data {
+                    let v = half::f16::from_bits(b).to_f32();
+                    if v.is_nan() {
+                        nan = true;
+                    } else if v.is_infinite() {
+                        inf = true;
+                    } else {
+                        max_abs = max_abs.max(v.abs());
+                    }
+                }
+            }
+            _ => {
+                let data = arr.astype(DType::Float32).unwrap().to_float32().unwrap();
+                for &v in data.iter() {
+                    if v.is_nan() {
+                        nan = true;
+                    } else if v.is_infinite() {
+                        inf = true;
+                    } else {
+                        max_abs = max_abs.max(v.abs());
+                    }
+                }
+            }
+        }
+        (nan, inf, max_abs)
+    }
+
     /// Helper to check if any element in a tensor is NaN
     fn has_nan(arr: &MxArray) -> bool {
-        arr.eval();
-        let nan_mask = arr.isnan().unwrap();
-        nan_mask.eval();
-        // Sum the boolean mask - if > 0, there are NaNs
-        let sum = nan_mask.sum(None, None).unwrap();
-        sum.eval();
-        let count = sum.to_int32().unwrap()[0];
-        count > 0
+        tensor_stats(arr).0
     }
 
     /// Helper to check if any element in a tensor is Inf (positive or negative infinity)
     fn has_inf(arr: &MxArray) -> bool {
-        arr.eval();
-        let inf_mask = arr.isinf().unwrap();
-        inf_mask.eval();
-        let sum = inf_mask.sum(None, None).unwrap();
-        sum.eval();
-        let count = sum.to_int32().unwrap()[0];
-        count > 0
+        tensor_stats(arr).1
     }
 
     /// Helper to check if all elements are zero
     fn all_zeros(arr: &MxArray) -> bool {
-        arr.eval();
-        let abs_arr = arr.abs().unwrap();
-        let max_val = abs_arr.max(None, None).unwrap();
-        max_val.eval();
-        // Convert to float32 for comparison
-        let max_f32 = max_val.astype(DType::Float32).unwrap();
-        max_f32.eval();
-        let val = max_f32.to_float32().unwrap()[0];
-        val == 0.0
+        let (nan, inf, max_abs) = tensor_stats(arr);
+        !nan && !inf && max_abs == 0.0
     }
 
     /// Helper to get max absolute value (for magnitude check)
     fn max_abs(arr: &MxArray) -> f32 {
-        arr.eval();
-        let abs_arr = arr.abs().unwrap();
-        let max_val = abs_arr.max(None, None).unwrap();
-        // Convert to float32 for extraction
-        let max_f32 = max_val.astype(DType::Float32).unwrap();
-        max_f32.eval();
-        max_f32.to_float32().unwrap()[0]
+        let (nan, inf, max_abs) = tensor_stats(arr);
+        if nan {
+            f32::NAN
+        } else if inf {
+            f32::INFINITY
+        } else {
+            max_abs
+        }
     }
 
     /// Test attention VJP with bfloat16 (the failing case from the bug)
@@ -116,9 +160,7 @@ mod tests {
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
         // Ensure tensors are evaluated
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Verify inputs are valid (no NaN)
         assert!(!has_nan(&q), "Q input contains NaN");
@@ -147,10 +189,7 @@ mod tests {
         let dv = &grads[2];
 
         // Evaluate gradients
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Diagnostic: count NaN positions
         let dk_data = dk.astype(DType::Float32).unwrap();
@@ -274,9 +313,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -294,10 +331,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ gradient contains NaN in float32");
         assert!(!has_nan(dk), "dK gradient contains NaN in float32");
@@ -327,9 +361,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -348,10 +380,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ gradient contains NaN in causal bfloat16");
         assert!(
@@ -398,9 +427,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -418,10 +445,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ gradient contains NaN in causal float32");
         assert!(!has_nan(dk), "dK gradient contains NaN in causal float32");
@@ -447,9 +471,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -467,10 +489,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ gradient contains NaN with head_dim=64");
         assert!(
@@ -501,9 +520,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -562,9 +579,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -582,10 +597,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Check for NaN
         assert!(!has_nan(dq), "dQ gradient contains NaN with f32 bf16-dims");
@@ -614,9 +626,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -672,9 +682,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -748,91 +756,15 @@ mod tests {
         shape_arr.iter().copied().collect()
     }
 
-    /// Helper to compute numerical gradient via finite differences for a single parameter element
-    /// Returns the approximate gradient at position idx
-    fn finite_diff_single(
-        q: &MxArray,
-        k: &MxArray,
-        v: &MxArray,
-        param_idx: usize, // 0=Q, 1=K, 2=V
-        flat_idx: usize,  // flattened index into the parameter
-        epsilon: f32,
-        scale: f64,
-        causal: bool,
-    ) -> f32 {
+    /// Helper to build a lazy scalar loss `sum(sdpa(q, k, v))` cast to f32.
+    fn sdpa_loss_f32(q: &MxArray, k: &MxArray, v: &MxArray, scale: f64, causal: bool) -> MxArray {
         use crate::array::scaled_dot_product_attention_causal;
-
-        let shape: Vec<i64> = match param_idx {
-            0 => get_shape(q),
-            1 => get_shape(k),
-            2 => get_shape(v),
-            _ => panic!("Invalid param_idx"),
-        };
-
-        let dtype = q.dtype().unwrap();
-
-        // Get the parameter as float32 for manipulation
-        let param = match param_idx {
-            0 => q.astype(DType::Float32).unwrap(),
-            1 => k.astype(DType::Float32).unwrap(),
-            2 => v.astype(DType::Float32).unwrap(),
-            _ => panic!("Invalid param_idx"),
-        };
-        param.eval();
-        let data_arr = param.to_float32().unwrap();
-        let mut data: Vec<f32> = data_arr.iter().cloned().collect();
-
-        // f(x + epsilon)
-        let original_val = data[flat_idx];
-        data[flat_idx] = original_val + epsilon;
-        let param_plus = MxArray::from_float32(&data, &shape).unwrap();
-        let param_plus = param_plus.astype(dtype).unwrap();
-        param_plus.eval();
-
-        let (q_plus, k_plus, v_plus) = match param_idx {
-            0 => (param_plus, k.copy().unwrap(), v.copy().unwrap()),
-            1 => (q.copy().unwrap(), param_plus, v.copy().unwrap()),
-            2 => (q.copy().unwrap(), k.copy().unwrap(), param_plus),
-            _ => panic!("Invalid param_idx"),
-        };
-
-        let out_plus = if causal {
-            scaled_dot_product_attention_causal(&q_plus, &k_plus, &v_plus, scale).unwrap()
+        let out = if causal {
+            scaled_dot_product_attention_causal(q, k, v, scale).unwrap()
         } else {
-            scaled_dot_product_attention(&q_plus, &k_plus, &v_plus, scale, None).unwrap()
+            scaled_dot_product_attention(q, k, v, scale, None).unwrap()
         };
-        let loss_plus = out_plus.sum(None, None).unwrap();
-        loss_plus.eval();
-        let loss_plus_f32 = loss_plus.astype(DType::Float32).unwrap();
-        loss_plus_f32.eval();
-        let l_plus = loss_plus_f32.to_float32().unwrap()[0];
-
-        // f(x - epsilon)
-        data[flat_idx] = original_val - epsilon;
-        let param_minus = MxArray::from_float32(&data, &shape).unwrap();
-        let param_minus = param_minus.astype(dtype).unwrap();
-        param_minus.eval();
-
-        let (q_minus, k_minus, v_minus) = match param_idx {
-            0 => (param_minus, k.copy().unwrap(), v.copy().unwrap()),
-            1 => (q.copy().unwrap(), param_minus, v.copy().unwrap()),
-            2 => (q.copy().unwrap(), k.copy().unwrap(), param_minus),
-            _ => panic!("Invalid param_idx"),
-        };
-
-        let out_minus = if causal {
-            scaled_dot_product_attention_causal(&q_minus, &k_minus, &v_minus, scale).unwrap()
-        } else {
-            scaled_dot_product_attention(&q_minus, &k_minus, &v_minus, scale, None).unwrap()
-        };
-        let loss_minus = out_minus.sum(None, None).unwrap();
-        loss_minus.eval();
-        let loss_minus_f32 = loss_minus.astype(DType::Float32).unwrap();
-        loss_minus_f32.eval();
-        let l_minus = loss_minus_f32.to_float32().unwrap()[0];
-
-        // Central difference: (f(x+e) - f(x-e)) / (2*e)
-        (l_plus - l_minus) / (2.0 * epsilon)
+        out.sum(None, None).unwrap().astype(DType::Float32).unwrap()
     }
 
     /// Helper to compare analytical and numerical gradients
@@ -850,28 +782,94 @@ mod tests {
         causal: bool,
     ) -> (bool, Vec<String>) {
         let q_shape = get_shape(q);
+        let k_shape = get_shape(k);
+        let v_shape = get_shape(v);
+        let dtype = q.dtype().unwrap();
         let scale = 1.0 / (q_shape[3] as f64).sqrt();
         let mut errors = Vec::new();
         let mut rng = SimpleRng::new(42);
 
-        // Get analytical gradients as float32
+        // Read inputs and analytical gradients in one batched GPU evaluation.
+        let q_f32 = q.astype(DType::Float32).unwrap();
+        let k_f32 = k.astype(DType::Float32).unwrap();
+        let v_f32 = v.astype(DType::Float32).unwrap();
         let dq_f32 = dq.astype(DType::Float32).unwrap();
         let dk_f32 = dk.astype(DType::Float32).unwrap();
         let dv_f32 = dv.astype(DType::Float32).unwrap();
-        dq_f32.eval();
-        dk_f32.eval();
-        dv_f32.eval();
+        MxArray::eval_arrays(&[&q_f32, &k_f32, &v_f32, &dq_f32, &dk_f32, &dv_f32]).unwrap();
+        let mut q_buf: Vec<f32> = q_f32.to_float32().unwrap().to_vec();
+        let mut k_buf: Vec<f32> = k_f32.to_float32().unwrap().to_vec();
+        let mut v_buf: Vec<f32> = v_f32.to_float32().unwrap().to_vec();
         let dq_data = dq_f32.to_float32().unwrap();
         let dk_data = dk_f32.to_float32().unwrap();
         let dv_data = dv_f32.to_float32().unwrap();
 
         let total_size = dq_data.len();
 
+        let make_perturbed = |buf: &mut [f32], shape: &[i64], idx: usize, delta: f32| {
+            let orig = buf[idx];
+            buf[idx] = orig + delta;
+            let arr = MxArray::from_float32(buf, shape)
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            buf[idx] = orig;
+            arr
+        };
+
         for _ in 0..num_samples {
-            // Check Q gradient
-            let idx = rng.gen_range(0..total_size);
-            let numerical_dq = finite_diff_single(q, k, v, 0, idx, epsilon, scale, causal);
-            let analytical_dq = dq_data[idx];
+            let q_idx = rng.gen_range(0..total_size);
+            let k_idx = rng.gen_range(0..dk_data.len());
+            let v_idx = rng.gen_range(0..dv_data.len());
+
+            // Build all 6 perturbed losses lazily and evaluate them in one GPU sync.
+            let lq_p = sdpa_loss_f32(
+                &make_perturbed(&mut q_buf, &q_shape, q_idx, epsilon),
+                k,
+                v,
+                scale,
+                causal,
+            );
+            let lq_m = sdpa_loss_f32(
+                &make_perturbed(&mut q_buf, &q_shape, q_idx, -epsilon),
+                k,
+                v,
+                scale,
+                causal,
+            );
+            let lk_p = sdpa_loss_f32(
+                q,
+                &make_perturbed(&mut k_buf, &k_shape, k_idx, epsilon),
+                v,
+                scale,
+                causal,
+            );
+            let lk_m = sdpa_loss_f32(
+                q,
+                &make_perturbed(&mut k_buf, &k_shape, k_idx, -epsilon),
+                v,
+                scale,
+                causal,
+            );
+            let lv_p = sdpa_loss_f32(
+                q,
+                k,
+                &make_perturbed(&mut v_buf, &v_shape, v_idx, epsilon),
+                scale,
+                causal,
+            );
+            let lv_m = sdpa_loss_f32(
+                q,
+                k,
+                &make_perturbed(&mut v_buf, &v_shape, v_idx, -epsilon),
+                scale,
+                causal,
+            );
+            MxArray::eval_arrays(&[&lq_p, &lq_m, &lk_p, &lk_m, &lv_p, &lv_m]).unwrap();
+
+            let numerical_dq =
+                (lq_p.to_float32().unwrap()[0] - lq_m.to_float32().unwrap()[0]) / (2.0 * epsilon);
+            let analytical_dq = dq_data[q_idx];
             let rel_error_q = if analytical_dq.abs() > 1e-6 {
                 ((numerical_dq - analytical_dq) / analytical_dq).abs()
             } else {
@@ -880,14 +878,13 @@ mod tests {
             if rel_error_q > tolerance {
                 errors.push(format!(
                     "dQ[{}]: numerical={:.6e}, analytical={:.6e}, rel_error={:.4e}",
-                    idx, numerical_dq, analytical_dq, rel_error_q
+                    q_idx, numerical_dq, analytical_dq, rel_error_q
                 ));
             }
 
-            // Check K gradient
-            let idx = rng.gen_range(0..dk_data.len());
-            let numerical_dk = finite_diff_single(q, k, v, 1, idx, epsilon, scale, causal);
-            let analytical_dk = dk_data[idx];
+            let numerical_dk =
+                (lk_p.to_float32().unwrap()[0] - lk_m.to_float32().unwrap()[0]) / (2.0 * epsilon);
+            let analytical_dk = dk_data[k_idx];
             let rel_error_k = if analytical_dk.abs() > 1e-6 {
                 ((numerical_dk - analytical_dk) / analytical_dk).abs()
             } else {
@@ -896,14 +893,13 @@ mod tests {
             if rel_error_k > tolerance {
                 errors.push(format!(
                     "dK[{}]: numerical={:.6e}, analytical={:.6e}, rel_error={:.4e}",
-                    idx, numerical_dk, analytical_dk, rel_error_k
+                    k_idx, numerical_dk, analytical_dk, rel_error_k
                 ));
             }
 
-            // Check V gradient
-            let idx = rng.gen_range(0..dv_data.len());
-            let numerical_dv = finite_diff_single(q, k, v, 2, idx, epsilon, scale, causal);
-            let analytical_dv = dv_data[idx];
+            let numerical_dv =
+                (lv_p.to_float32().unwrap()[0] - lv_m.to_float32().unwrap()[0]) / (2.0 * epsilon);
+            let analytical_dv = dv_data[v_idx];
             let rel_error_v = if analytical_dv.abs() > 1e-6 {
                 ((numerical_dv - analytical_dv) / analytical_dv).abs()
             } else {
@@ -912,7 +908,7 @@ mod tests {
             if rel_error_v > tolerance {
                 errors.push(format!(
                     "dV[{}]: numerical={:.6e}, analytical={:.6e}, rel_error={:.4e}",
-                    idx, numerical_dv, analytical_dv, rel_error_v
+                    v_idx, numerical_dv, analytical_dv, rel_error_v
                 ));
             }
         }
@@ -953,9 +949,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -972,9 +966,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Finite difference check - use larger epsilon for numerical stability
         let epsilon = 1e-2_f32;
@@ -1049,9 +1041,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1068,9 +1058,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         let epsilon = 1e-2_f32;
         let tolerance = 0.5_f32;
@@ -1129,9 +1117,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1148,9 +1134,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // For BFloat16, we primarily verify gradients are computed and non-NaN
         // Finite differences in bf16 are too noisy for precise numerical checks
@@ -1207,9 +1191,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1226,9 +1208,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // For BFloat16, we primarily verify gradients are computed and non-NaN
         assert!(
@@ -1300,9 +1280,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // For GQA, we need to broadcast K/V
         // Each KV head is shared by q_heads/kv_heads = 4 Q heads
@@ -1332,9 +1310,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify gradients are not NaN or zeros
         assert!(!has_nan(dq), "dQ contains NaN in GQA");
@@ -1377,9 +1353,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, q_seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, kv_seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, kv_seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1396,9 +1370,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -1439,9 +1411,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1458,9 +1428,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify gradients are not NaN
         assert!(!has_nan(dq), "dQ contains NaN with batch>1");
@@ -1504,9 +1472,7 @@ mod tests {
             let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
             let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
             let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-            q.eval();
-            k.eval();
-            v.eval();
+            MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
             let q_clone = q.copy().unwrap();
             let k_clone = k.copy().unwrap();
@@ -1523,9 +1489,7 @@ mod tests {
             let dq = &grads[0];
             let dk = &grads[1];
             let dv = &grads[2];
-            dq.eval();
-            dk.eval();
-            dv.eval();
+            MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
             assert!(!has_nan(dq), "dQ contains NaN with head_dim={}", head_dim);
             assert!(!has_nan(dk), "dK contains NaN with head_dim={}", head_dim);
@@ -1583,9 +1547,7 @@ mod tests {
             Some(DType::BFloat16),
         )
         .unwrap();
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_max = max_abs(&q);
         let k_max = max_abs(&k);
@@ -1606,10 +1568,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Check for NaN and Inf
         assert!(!has_nan(&loss), "Loss contains NaN with large scale inputs");
@@ -1669,9 +1628,7 @@ mod tests {
             Some(DType::Float32),
         )
         .unwrap();
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         println!(
             "Small scale test: Q max={:.6e}, K max={:.6e}",
@@ -1694,10 +1651,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         assert!(!has_nan(&loss), "Loss contains NaN with small scale inputs");
         assert!(!has_nan(dq), "dQ contains NaN with small scale inputs");
@@ -1747,9 +1701,7 @@ mod tests {
         }
 
         let k = MxArray::from_float32(&k_modified, &[batch, heads, seq_len, head_dim]).unwrap();
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1766,9 +1718,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN with peaked attention");
         assert!(!has_nan(dk), "dK contains NaN with peaked attention");
@@ -1819,9 +1769,7 @@ mod tests {
 
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1838,9 +1786,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN with uniform attention");
         assert!(!has_nan(dk), "dK contains NaN with uniform attention");
@@ -1883,9 +1829,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -1902,9 +1846,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         let dq_max = max_abs(dq);
         let dk_max = max_abs(dk);
@@ -1992,9 +1934,7 @@ mod tests {
             Some(DType::BFloat16),
         )
         .unwrap();
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Add a bias to create attention scores near the edge of precision
         // This tests if exp2 clamping handles edge cases
@@ -2022,9 +1962,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN at bf16 precision edge");
         assert!(
@@ -2057,9 +1995,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         println!(
             "Long sequence stability test: seq_len={}, total elements={}",
@@ -2082,9 +2018,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Check for NaN - long sequences can accumulate errors
         assert!(
@@ -2155,9 +2089,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -2184,9 +2116,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -2251,9 +2181,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -2280,9 +2208,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify shapes - K/V gradients should have original shape (1 head)
         let dk_shape = get_shape(dk);
@@ -2341,9 +2267,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -2371,9 +2295,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify gradients are valid
         assert!(!has_nan(dq), "dQ contains NaN in GQA with causal");
@@ -2407,9 +2329,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -2435,9 +2355,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -2516,9 +2434,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Method 1: GQA with broadcast (autograd handles aggregation)
         let q_clone1 = q.copy().unwrap();
@@ -2679,9 +2595,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -2698,9 +2612,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(
             !has_nan(dq),
@@ -2770,9 +2682,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Create mask that heavily masks rows 0 and 1 (but leave one position unmasked)
         // Note: Fully masking a row causes NaN in flash attention (expected behavior)
@@ -2813,9 +2723,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // dQ[0] and dQ[1] can only attend to K[0], so they have limited gradient paths
         let dq_f32 = dq.to_float32().unwrap();
@@ -2874,9 +2782,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Create sparse mask with ~30% positions masked
         let total_mask_elements = (heads * seq_len * seq_len) as usize;
@@ -2921,9 +2827,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN with sparse mask 30%");
         assert!(!has_nan(dk), "dK contains NaN with sparse mask 30%");
@@ -2954,9 +2858,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Create sparse mask with ~70% positions masked
         let total_mask_elements = (heads * seq_len * seq_len) as usize;
@@ -3001,9 +2903,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN with sparse mask 70%");
         assert!(!has_nan(dk), "dK contains NaN with sparse mask 70%");
@@ -3040,9 +2940,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, max_seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, max_seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, max_seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Create causal-style padding mask
         // For each Q position i, it can attend to K positions 0..=min(i, seq_len-1)
@@ -3092,9 +2990,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         assert!(!has_nan(dq), "dQ contains NaN with variable length padding");
         assert!(!has_nan(dk), "dK contains NaN with variable length padding");
@@ -3154,9 +3050,7 @@ mod tests {
         let q = random_tensor(&[batch, heads, q_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, heads, kv_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, heads, kv_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Create causal-like mask for cross-attention
         // Q[i] can attend to K[j] where j <= i + offset
@@ -3198,9 +3092,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -3266,9 +3158,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Verify inputs are valid
         assert!(!has_nan(&q), "Q input contains NaN");
@@ -3295,10 +3185,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Test 1: No NaN
         assert!(
@@ -3389,9 +3276,7 @@ mod tests {
             let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
             let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-            q.eval();
-            k.eval();
-            v.eval();
+            MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
             // Verify inputs
             assert!(
@@ -3441,10 +3326,7 @@ mod tests {
             let dk = &grads[1];
             let dv = &grads[2];
 
-            loss.eval();
-            dq.eval();
-            dk.eval();
-            dv.eval();
+            MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
             // Test NaN
             assert!(
@@ -3547,9 +3429,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -3567,10 +3447,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Test NaN
         assert!(
@@ -3640,9 +3517,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::BFloat16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -3660,10 +3535,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Test NaN
         assert!(
@@ -3733,9 +3605,7 @@ mod tests {
         let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float16);
         let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float16);
 
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Verify inputs
         assert!(!has_nan(&q), "Q input contains NaN");
@@ -3761,10 +3631,7 @@ mod tests {
         let dk = &grads[1];
         let dv = &grads[2];
 
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Test NaN
         assert!(!has_nan(dq), "dQ contains NaN with head_dim=96 f16 STEEL");
@@ -3808,9 +3675,7 @@ mod tests {
             let k = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float16);
             let v = random_tensor(&[batch, heads, seq_len, head_dim], DType::Float16);
 
-            q.eval();
-            k.eval();
-            v.eval();
+            MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
             let q_clone = q.copy().unwrap();
             let k_clone = k.copy().unwrap();
@@ -3828,10 +3693,7 @@ mod tests {
             let dk = &grads[1];
             let dv = &grads[2];
 
-            loss.eval();
-            dq.eval();
-            dk.eval();
-            dv.eval();
+            MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
             // Test NaN
             assert!(
@@ -3924,9 +3786,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Verify inputs are valid
         assert!(!has_nan(&q), "Q input contains NaN");
@@ -3950,10 +3810,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify dK and dV shapes match kv_heads (not q_heads)
         let dq_shape = get_shape(dq);
@@ -4044,9 +3901,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -4063,10 +3918,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify dK and dV shapes match kv_heads=1
         let dk_shape = get_shape(dk);
@@ -4131,9 +3983,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -4151,10 +4001,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -4218,9 +4065,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::BFloat16);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::BFloat16);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::BFloat16);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // Verify inputs are valid
         assert!(!has_nan(&q), "Q input contains NaN in bf16");
@@ -4242,10 +4087,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify shapes match original inputs
         let dq_shape = get_shape(dq);
@@ -4380,9 +4222,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -4399,10 +4239,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dq_shape = get_shape(dq);
@@ -4459,9 +4296,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         let q_clone = q.copy().unwrap();
         let k_clone = k.copy().unwrap();
@@ -4478,10 +4313,7 @@ mod tests {
         let dq = &grads[0];
         let dk = &grads[1];
         let dv = &grads[2];
-        loss.eval();
-        dq.eval();
-        dk.eval();
-        dv.eval();
+        MxArray::eval_arrays(&[&loss, dq, dk, dv]).unwrap();
 
         // Verify shapes
         let dk_shape = get_shape(dk);
@@ -4539,9 +4371,7 @@ mod tests {
         let q = random_tensor(&[batch, q_heads, seq_len, head_dim], DType::Float32);
         let k = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
         let v = random_tensor(&[batch, kv_heads, seq_len, head_dim], DType::Float32);
-        q.eval();
-        k.eval();
-        v.eval();
+        MxArray::eval_arrays(&[&q, &k, &v]).unwrap();
 
         // --- True GQA path ---
         let q_clone1 = q.copy().unwrap();

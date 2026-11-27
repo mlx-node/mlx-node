@@ -798,6 +798,141 @@ impl Store {
         self.fixture = false;
     }
 
+    /// Independent test clone of an identity-ready direct store: shares the
+    /// read-only fixed and expert bank handles while resetting every mutable
+    /// cache, counter, reader, and `Live` handle so tests cannot leak state.
+    #[cfg(test)]
+    pub(in super::super) fn clone_direct_for_test(&self) -> Self {
+        assert!(
+            self.plan.direct
+                && self.direct_fill.is_none()
+                && self.direct_error.is_none()
+                && self.cache.is_empty()
+                && !self.slots.is_empty(),
+            "clone_direct_for_test requires a finished, clean direct store"
+        );
+        let slots: HashMap<usize, expert_slots::ExpertSlots> = self
+            .slots
+            .iter()
+            .map(|(&layer, slot)| {
+                (
+                    layer,
+                    slot.clone_identity_for_test()
+                        .expect("direct test template slots must be identity-ready"),
+                )
+            })
+            .collect();
+        self.clone_for_test(slots, None)
+    }
+
+    /// Independent test clone of a partial/streamed store whose fixed banks are
+    /// loaded and whose expert slots are empty, optionally overriding the
+    /// partial slot capacity.
+    #[cfg(test)]
+    pub(in super::super) fn clone_partial_for_test(&self, slot_capacity: Option<usize>) -> Self {
+        assert!(
+            !self.plan.direct
+                && self.direct_fill.is_none()
+                && self.slots.is_empty()
+                && self.cache.is_empty(),
+            "clone_partial_for_test requires a clean partial store with empty slots"
+        );
+        self.clone_for_test(HashMap::new(), slot_capacity)
+    }
+
+    #[cfg(test)]
+    fn clone_for_test(
+        &self,
+        slots: HashMap<usize, expert_slots::ExpertSlots>,
+        slot_capacity: Option<usize>,
+    ) -> Self {
+        let direct = !slots.is_empty();
+        let mut plan = self.plan.clone();
+        plan.resident_bank_bytes = Arc::new(AtomicU64::new(
+            self.plan.resident_bank_bytes.load(Ordering::Relaxed),
+        ));
+        if let Some(capacity) = slot_capacity {
+            plan.partial_expert_slots = capacity;
+        }
+        let live = Arc::new(Live::default());
+        live.store(&plan);
+        if let Some(fallback) = self.live.fallback() {
+            live.set_fallback(fallback);
+        }
+        live.bytes_read.store(self.bytes_read, Ordering::Release);
+        if direct {
+            live.direct_filled_layers
+                .store(plan.direct_layers as u64, Ordering::Release);
+            live.direct_fill_in_progress.store(false, Ordering::Release);
+        }
+        Self {
+            fixture: self.fixture,
+            tensors: self.tensors.clone(),
+            gguf: self.gguf,
+            metadata: self.metadata.clone(),
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            recency: HashMap::new(),
+            clock: 0,
+            protected: HashSet::new(),
+            protected_bytes: 0,
+            cache_bytes: self.cache_bytes,
+            cache_limit: self.cache_limit,
+            plan,
+            banks: self.banks.clone(),
+            bank_bytes: self.bank_bytes,
+            mtp_banks_declined: self.mtp_banks_declined,
+            draft_bank_budget: self.draft_bank_budget,
+            paired_banks: HashMap::new(),
+            dense_cache: HashMap::new(),
+            cuda_raw_rows: HashMap::new(),
+            cuda_raw_rows_order: VecDeque::new(),
+            cuda_raw_rows_bytes: 0,
+            file_paths: HashMap::new(),
+            slots,
+            direct_fill: None,
+            direct_fill_remaining: 0,
+            direct_error: None,
+            direct_fill_pass: false,
+            preloaded: HashMap::new(),
+            deferred_reduction_layer: None,
+            slot_capacity: slot_capacity.or(self.slot_capacity),
+            slot_bank_budget: self.slot_bank_budget,
+            store_plan: self.store_plan,
+            active_ceiling: self.active_ceiling,
+            slot_bytes: if direct { self.slot_bytes } else { 0 },
+            slot_upload_bytes: if direct { self.slot_upload_bytes } else { 0 },
+            slot_hits: 0,
+            slot_misses: 0,
+            growth_bytes: 0,
+            bytes_read: self.bytes_read,
+            peak_cache_bytes: self.peak_cache_bytes,
+            gguf_source: self.gguf_source.clone(),
+            slot_fill: None,
+            pending_fill: None,
+            no_fill_ahead: false,
+            old_slot_fill: false,
+            fill_batch_bytes: None,
+            fail_fill_batch: None,
+            slot_fill_builds: [0; 2],
+            direct_gguf: self.direct_gguf,
+            direct_read_windows: Vec::new(),
+            layer_leases: HashMap::new(),
+            expert_fills: HashMap::new(),
+            files: HashMap::new(),
+            rows: None,
+            rows_pending: Arc::default(),
+            row_readers: self.row_readers,
+            single_row_projections: 0,
+            vector_windows: Vec::new(),
+            lookup: Arc::default(),
+            live,
+            window_banks: HashMap::new(),
+            row_bank: HashMap::new(),
+            next_window_bank: 0,
+        }
+    }
+
     /// `open_metadata`'s `None` resolves the user's real pack cache, whose
     /// sweep deletes idle packs of other builds and processes; a unit test
     /// must never reach it. The root is never created.

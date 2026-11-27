@@ -1,0 +1,63 @@
+name: Rust Lib Test Shard
+
+# Reusable shard runner called by `.github/workflows/ci.yml` under distinct job
+# IDs (`rust-lib-test-1`..`6`) instead of a single matrix job. GitHub Actions'
+# matrix aggregator can leave `needs.<matrix>.result == 'success'` when a
+# `macos-26` leg is cancelled before acquiring a runner; distinct job IDs let
+# `done` and `publish` gate explicitly on every shard's success.
+on:
+  workflow_call:
+    inputs:
+      shard:
+        description: '1-based shard index'
+        required: true
+        type: number
+      shard-count:
+        description: 'Total number of shards'
+        required: true
+        type: number
+
+jobs:
+  test:
+    name: run
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: mlx-core-lib-test
+          path: ${{ runner.temp }}/mlx-core-lib-test
+
+      - name: Run mlx-core --lib shard ${{ inputs.shard }}/${{ inputs.shard-count }}
+        env:
+          SHARD: ${{ inputs.shard }}
+          SHARD_COUNT: ${{ inputs.shard-count }}
+          RUST_BACKTRACE: '1'
+          # Running the binary directly bypasses `.cargo/config.toml`, so set
+          # `RUST_TEST_THREADS=1` explicitly alongside `--test-threads=1` to
+          # keep Metal stream access and env-mutating tests serialized.
+          RUST_TEST_THREADS: '1'
+          # This leg runs on a Metal runner, so a test that self-skips because
+          # it found no GPU has not passed — it reported a green it never
+          # earned. `metal_device_absent` withdraws the skip licence when this
+          # is set, turning that case into a failure instead.
+          #
+          # The `model-test` leg sets the same var, but only around its `--lib`
+          # filter step, which names a few tests. Every OTHER Metal-gated test in
+          # the crate runs here or in `rust-int` — including the ladder-retention
+          # pair, which became skippable when arming the ladder started requiring
+          # a paged adapter. Scoping this to the leg rather than to a name list
+          # means a test that grows a Metal dependency later is covered on the
+          # day it does, without anyone remembering to add it.
+          MLX_TEST_REQUIRE_METAL: '1'
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/mlx-core-lib-test"
+          built_ws="$(cat "$bundle/build-workspace.txt")"
+          if [ "$built_ws" != "$GITHUB_WORKSPACE" ]; then
+            echo "::error::Workspace path mismatch: built at '$built_ws' but shard checked out at '$GITHUB_WORKSPACE' (baked CARGO_MANIFEST_DIR fixtures would fail)."
+            exit 1
+          fi
+          chmod +x "$bundle/mlx_core_test"
+          python3 scripts/run-rust-lib-shard.py "$bundle/mlx_core_test" "$SHARD" "$SHARD_COUNT"

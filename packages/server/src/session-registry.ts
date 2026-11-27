@@ -78,7 +78,7 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 
 import type { ChatConfig } from '@mlx-node/core';
-import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, type SessionCapableModel } from '@mlx-node/lm/chat-session';
 
 import { noteQueueRejection } from './queue-rejections.js';
 import { TurnTraceModel, type LiveTurn, type ModelIdentity, type TurnTraceDeps } from './turn-trace.js';

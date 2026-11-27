@@ -164,12 +164,12 @@ change to the K-quant, mixed-affine or segmented SDPA kernels.
 ```sh
 # "" = this machine (g17s); g17d / g17g = the other segmented SDPA classes
 for a in "" applegpu_g17d applegpu_g17g; do
-  MLX_METAL_GPU_ARCH=$a cargo test -p mlx-core --release --test kquant_golden_gate \
+  MLX_METAL_GPU_ARCH=$a cargo test -p mlx-core --release --features e2e-tests --test kquant_golden_gate \
     --test affine_mixed_golden_gate --test segmented_sdpa_golden_gate -- --include-ignored
 done
 # routes with K-quant and mixed-affine fixtures only
 for a in applegpu_g17p applegpu_g16s applegpu_g14s applegpu_g14d; do
-  MLX_METAL_GPU_ARCH=$a cargo test -p mlx-core --release --test kquant_golden_gate \
+  MLX_METAL_GPU_ARCH=$a cargo test -p mlx-core --release --features e2e-tests --test kquant_golden_gate \
     --test affine_mixed_golden_gate -- --include-ignored
 done
 ```

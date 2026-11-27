@@ -13,8 +13,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChatResult, ChatStreamProgress, ColdCacheStats, ColdSidecarStats } from '@mlx-node/core';
-import { ChatSession, type ChatStreamControl, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
+import {
+  ChatSession,
+  type ChatStreamControl,
+  type ChatStreamEvent,
+  type SessionCapableModel,
+} from '@mlx-node/lm/chat-session';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 import {
   MetricsTrace,

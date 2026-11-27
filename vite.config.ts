@@ -136,14 +136,23 @@ export default defineConfig({
     testTimeout: 120000, // 2 minutes
     // A `beforeAll` that loads a checkpoint needs the same budget as a test: the 10 s default is too short on a slow CI runner.
     hookTimeout: 120000,
-    // Two lanes that never overlap: `sequence.groupOrder` makes Vitest finish
-    // every pure-TS file (parallel) before the first addon file (serial).
+    // Three lanes where parallel work never overlaps GPU work: `sequence.groupOrder`
+    // makes Vitest finish `pure-ts` (OS-agnostic, runnable on Linux CI) and
+    // `darwin-ts` (macOS-specific pure-TS) before the first `addon` file (serial).
     projects: [
       {
         extends: true,
         test: {
           name: 'pure-ts',
           include: LANES.pureTs,
+          sequence: { groupOrder: 0 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'darwin-ts',
+          include: LANES.darwinTs,
           sequence: { groupOrder: 0 },
         },
       },

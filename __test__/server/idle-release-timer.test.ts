@@ -1,6 +1,8 @@
 import { __createIdleSweeper as createIdleSweeper } from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import {
   createWeightResidency,
   trackWeights,

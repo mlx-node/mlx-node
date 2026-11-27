@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { ggufLoadEntries, ggufNextSteps } from '../../packages/cli/src/commands/download-model.js';
+import { ggufLoadEntries, ggufNextSteps } from '../../packages/cli/src/commands/download-model-helpers.js';
 
 /** A v3 GGUF header with no tensors; `architecture` undefined models shards 2..N of a llama.cpp split. */
 function writeGguf(path: string, architecture?: string): void {

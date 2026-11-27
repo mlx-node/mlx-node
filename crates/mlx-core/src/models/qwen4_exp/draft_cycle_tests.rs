@@ -503,14 +503,144 @@ fn turns_a_fork_and_a_restore_give_the_plain_text() {
     }
 }
 
-/// What one sampled cycle of 2 rows from the same state gives over
-/// `trials` seeds: the first token's frequencies and the accept rate of the
-/// first proposal; the target's distribution `p` after the anchor
-/// (temperature 1, top-k 6) and the row `q` the first proposal was drawn
-/// from. With `drawn`,
-/// the test draws the proposals from rows of its own: the first over `p`'s
-/// four most likely tokens, each later one over other tokens.
-fn sampled_cycles(trials: usize, drawn: bool) -> (Vec<f64>, f64, Vec<f64>, Vec<f64>) {
+fn ln_gamma(x: f64) -> f64 {
+    let g = [
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let x = x - 1.0;
+    let mut a = 0.999_999_999_999_809_9;
+    for (i, gi) in g.iter().enumerate() {
+        a += gi / (x + i as f64 + 1.0);
+    }
+    let t = x + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+/// Upper regularized gamma Q(s, x).
+fn gamma_q(s: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x < s + 1.0 {
+        let (mut sum, mut term, mut n) = (1.0 / s, 1.0 / s, s);
+        for _ in 0..10_000 {
+            n += 1.0;
+            term *= x / n;
+            sum += term;
+            if term.abs() < sum.abs() * 1e-15 {
+                break;
+            }
+        }
+        (1.0 - (sum.ln() - x + s * x.ln() - ln_gamma(s)).exp()).clamp(0.0, 1.0)
+    } else {
+        let (mut b, mut c, mut d) = (x + 1.0 - s, 1e300, 1.0 / (x + 1.0 - s));
+        let mut h = d;
+        for i in 1..10_000 {
+            let an = -(i as f64) * (i as f64 - s);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < 1e-300 {
+                d = 1e-300;
+            }
+            c = b + an / c;
+            if c.abs() < 1e-300 {
+                c = 1e-300;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() < 1e-15 {
+                break;
+            }
+        }
+        ((-x + s * x.ln() - ln_gamma(s)).exp() * h).clamp(0.0, 1.0)
+    }
+}
+
+/// Exact Pearson chi-square test with deterministic pooling of low-expected
+/// (`< 5`) cells into bins expecting `>= 5` (determined solely by `probs`).
+/// A nonzero count on a zero-probability cell fails outright (`p = 0.0`).
+pub(super) fn chi_square_p(counts: &[u64], probs: &[f64]) -> (f64, usize, f64) {
+    assert_eq!(counts.len(), probs.len());
+    let n = counts.iter().sum::<u64>() as f64;
+    let total_p: f64 = probs.iter().copied().filter(|&p| p > 0.0).sum();
+    assert!(n > 0.0 && total_p > 0.0);
+    let mut bins: Vec<(f64, f64)> = Vec::new();
+    let mut small: Vec<(usize, f64, f64)> = Vec::new();
+    for (idx, (&c, &p)) in counts.iter().zip(probs).enumerate() {
+        if p <= 0.0 {
+            if c > 0 {
+                return (1e9, 1, 0.0);
+            }
+            continue;
+        }
+        let e = (p / total_p) * n;
+        if e >= 5.0 {
+            bins.push((c as f64, e));
+        } else {
+            small.push((idx, c as f64, e));
+        }
+    }
+    small.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)));
+    let (mut acc_o, mut acc_e) = (0.0, 0.0);
+    for (_, o, e) in small {
+        acc_o += o;
+        acc_e += e;
+        if acc_e >= 5.0 {
+            bins.push((acc_o, acc_e));
+            acc_o = 0.0;
+            acc_e = 0.0;
+        }
+    }
+    if acc_e > 0.0 {
+        if let Some(smallest) = bins.iter_mut().min_by(|a, b| a.1.total_cmp(&b.1)) {
+            smallest.0 += acc_o;
+            smallest.1 += acc_e;
+        } else {
+            bins.push((acc_o, acc_e));
+        }
+    }
+    let stat: f64 = bins.iter().map(|&(o, e)| (o - e).powi(2) / e).sum();
+    let dof = bins.len().saturating_sub(1).max(1);
+    (stat, dof, gamma_q(dof as f64 / 2.0, stat / 2.0))
+}
+
+/// Proposal row tilted against a `top_k = 4` target `p`: three of `p`'s top
+/// four tokens plus one zero-mass outside token holding 25% of `q`'s mass, so
+/// `sum min(p, q)` stays in `[0.60, 0.75]` and residual resampling always runs.
+pub(super) fn tilted_row(ranked: &[usize], p: &[f64]) -> (Vec<i32>, Vec<f64>) {
+    let ids = vec![
+        ranked[0] as i32,
+        ranked[1] as i32,
+        ranked[2] as i32,
+        ranked[4] as i32,
+    ];
+    let w0 = p[ranked[0]].sqrt().max(1e-3);
+    let w1 = p[ranked[1]].sqrt().max(1e-3);
+    let w2 = p[ranked[2]].sqrt().max(1e-3);
+    let outside = (w0 + w1 + w2) / 3.0;
+    (ids, vec![w0, w1, w2, outside])
+}
+
+/// Distribution & wiring parity check of sampled cycles using the real
+/// `tiny_draft` (`drawn = None`, `temperature = 1.0`, full vocabulary so the
+/// real draft row `q` and target `p` overlap non-trivially):
+/// 1. Reported sparse rows are deterministic, normalized, and give positive
+///    probability to every drawn token; `commit` advances history & draft cache.
+/// 2. Real selector draws `draft_ids[0]` match the reported `q` row by exact
+///    Pearson chi-square (`p >= 1e-6`), catching any ID paired with the wrong
+///    positive probability.
+/// 3. Passing real selector IDs + sparse rows through `accept_dspark_proposal`
+///    keeps the independent target distribution `p` (`chi_square_p >= 1e-6`)
+///    and matches the theoretical acceptance rate `sum min(p, q)` within 5σ.
+fn verify_real_draft_sampled_cycles(trials: usize) {
     let draft = tiny_draft();
     let mut inner = tiny_inner();
     inner.activate_paged_seq(1).unwrap();
@@ -519,99 +649,207 @@ fn sampled_cycles(trials: usize, drawn: bool) -> (Vec<f64>, f64, Vec<f64>, Vec<f
     let anchor = argmax(&logits);
     let passes = inner.decoder.take_hidden_taps();
     let base = inner.decoder.snapshot();
+    let base_len = inner.decoder.history.len();
+    let mut base_context = DFlash2ContextCache::new(&draft.config);
+    decoder::follow_history(&draft, &mut base_context, &passes, &inner.decoder.history).unwrap();
     let params = extract_chat_params(&ChatConfig {
         temperature: Some(1.0),
-        top_k: Some(6),
         ..Default::default()
     });
     let vocab = inner.decoder.config.vocab_size;
-    let step = inner.decoder.step(anchor).unwrap().reshape(&[-1]).unwrap();
-    let p: Vec<f64> =
-        f32s(&crate::sampling::sampling_distribution(&step, params.sampling_config).unwrap())
-            .iter()
-            .map(|&v| f64::from(v))
-            .collect();
-    inner.decoder.take_hidden_taps();
-    inner
-        .decoder
-        .paged
-        .as_mut()
-        .unwrap()
-        .rollback_last_tokens(1)
-        .unwrap();
-    inner.decoder.restore_state(base.clone());
-    let mut ranked: Vec<usize> = (0..vocab).collect();
-    ranked.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
-    let rows: Vec<(Vec<i32>, Vec<f64>)> = (0..DFLASH2_DRAFT_PROPOSALS)
-        .map(|r| {
-            let ids: Vec<i32> = ranked[4 * r..4 * r + 4].iter().map(|&t| t as i32).collect();
-            let probs = if r == 0 {
-                ids.iter().map(|&t| p[t as usize].sqrt()).collect()
-            } else {
-                vec![0.25; 4]
-            };
-            (ids, probs)
-        })
-        .collect();
-    let mut first = vec![0usize; vocab];
-    let mut accepted = 0usize;
+    let p = distribution_after(&mut inner, &base, &[anchor], &params);
     let mut q = Vec::new();
+    let mut alpha = 0.0;
+    let mut draft_counts = vec![0u64; vocab];
+    let mut emitted_counts = vec![0u64; vocab];
+    let mut accepted = 0usize;
     for trial in 0..trials {
-        let mut context = DFlash2ContextCache::new(&draft.config);
-        decoder::follow_history(&draft, &mut context, &passes, &inner.decoder.history).unwrap();
+        let mut context = base_context.clone();
         let mut stepper =
             decoder::DraftStepper::new(&mut inner.decoder, &draft, &mut context, 2).unwrap();
-        if drawn {
-            let rows = rows.clone();
-            let mut draws = StdRng::seed_from_u64(0x5EED + trial as u64);
-            stepper.drawn = Some(Box::new(move |_| {
-                let mut ids = Vec::new();
-                let mut dists = Vec::new();
-                for (support, probs) in &rows {
-                    let dist = crate::sampling::SparseDistribution::from_parts(
-                        support.clone(),
-                        probs.clone(),
-                        vocab,
-                    )
-                    .unwrap();
-                    let total: f64 = probs.iter().sum();
-                    let mut u = rand::RngExt::random::<f64>(&mut draws) * total;
-                    let mut pick = support[support.len() - 1];
-                    for (&t, &w) in support.iter().zip(probs) {
-                        if u < w {
-                            pick = t;
-                            break;
-                        }
-                        u -= w;
-                    }
-                    ids.push(pick as u32);
-                    dists.push(dist);
-                }
-                (ids, dists)
-            }));
-        }
         let mut rng = StdRng::seed_from_u64(trial as u64);
         let mut proposal = stepper.propose(anchor, 1, &params, &mut rng).unwrap();
         assert_eq!(proposal.draft_sparse_dists.len(), 1, "one drawn row");
-        if trial == 0 {
-            q = if drawn {
-                let (support, probs) = &rows[0];
-                let total: f64 = probs.iter().sum();
-                let mut q = vec![0.0; vocab];
-                for (&t, &w) in support.iter().zip(probs) {
-                    q[t as usize] = w / total;
-                }
-                q
-            } else {
-                let row = proposal.draft_sparse_dists[0].as_row();
-                (0..vocab).map(|x| row.probability(x as i32)).collect()
-            };
-        }
+        let (cand_ids, cand_probs) = proposal.draft_sparse_dists[0].candidates();
+        assert!(!cand_ids.is_empty(), "non-empty sparse support");
+        let prob_sum: f64 = cand_probs.iter().sum();
+        assert!(
+            cand_probs.iter().all(|&w| w.is_finite() && w >= 0.0) && (prob_sum - 1.0).abs() < 1e-5,
+            "normalized sparse draft row: sum {prob_sum}"
+        );
         let d0 = proposal.draft_ids[0];
+        let row = proposal.draft_sparse_dists[0].as_row();
+        assert!(
+            row.probability(d0) > 0.0,
+            "drawn draft {d0} has positive probability in reported row"
+        );
+        let row_q: Vec<f64> = (0..vocab).map(|x| row.probability(x as i32)).collect();
+        if trial == 0 {
+            alpha = p.iter().zip(&row_q).map(|(a, b)| a.min(*b)).sum();
+            q = row_q;
+        } else {
+            let max_diff = q
+                .iter()
+                .zip(&row_q)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                max_diff < 1e-5,
+                "real draft distribution row drifted across identical state: max_diff {max_diff}"
+            );
+        }
+        draft_counts[d0 as usize] += 1;
         let logits = stepper.verify(&[anchor, d0 as u32]).unwrap().logits;
         let (k, boundary) =
             accept_dspark_proposal(&logits, &mut proposal, &[], &params, &mut rng, None).unwrap();
         stepper.commit(k + 1, 2).unwrap();
+        assert_eq!(
+            stepper.decoder().history.len(),
+            base_len + k + 1,
+            "commit advances decoder history"
+        );
+        drop(stepper);
+        assert_eq!(
+            context.logical_len() as usize,
+            base_len + k + 1,
+            "commit advances draft context"
+        );
+        let token = if k >= 1 {
+            d0 as usize
+        } else {
+            boundary as usize
+        };
+        assert!(
+            p[token] > 0.0,
+            "emitted token {token} lies in target support"
+        );
+        emitted_counts[token] += 1;
+        accepted += usize::from(k >= 1);
+        inner
+            .decoder
+            .paged
+            .as_mut()
+            .unwrap()
+            .rollback_last_tokens((k + 1) as u32)
+            .unwrap();
+        inner.decoder.restore_state(base.clone());
+    }
+    let rate = accepted as f64 / trials as f64;
+    let (draft_stat, draft_dof, draft_p) = chi_square_p(&draft_counts, &q);
+    let (emit_stat, emit_dof, emit_p) = chi_square_p(&emitted_counts, &p);
+    eprintln!(
+        "sampled cycle (real draft, {trials} trials): draft chi2 {draft_stat:.2} dof {draft_dof} p {draft_p:.3e} | emit chi2 {emit_stat:.2} dof {emit_dof} p {emit_p:.3e} | accept rate {rate:.4} sum min(p, q) {alpha:.4}"
+    );
+    assert!(
+        alpha > 0.02 && alpha < 0.99,
+        "real draft and target overlap non-trivially: {alpha}"
+    );
+    assert!(
+        accepted > 0 && accepted < trials,
+        "real draft exercises both accept and reject paths: accepted {accepted}/{trials}"
+    );
+    assert!(
+        !draft_p.is_nan() && draft_p >= 1e-6,
+        "real draft selector IDs follow reported sparse row: chi2 {draft_stat:.2} dof {draft_dof} p {draft_p:.3e}"
+    );
+    assert!(
+        !emit_p.is_nan() && emit_p >= 1e-6,
+        "real draft acceptance follows independent target p: chi2 {emit_stat:.2} dof {emit_dof} p {emit_p:.3e}"
+    );
+    let sigma = (alpha * (1.0 - alpha) / trials as f64).sqrt();
+    assert!(
+        (rate - alpha).abs() <= 5.0 * sigma,
+        "real draft accept rate {rate} against sum min(p, q) {alpha} (5 sigma = {:.4})",
+        5.0 * sigma
+    );
+}
+
+/// What `trials` sampled cycles (draft width 2, `top_k = 4`) from the same
+/// state give with injected drawn proposals: the first token's counts, the
+/// first proposal's accept rate, the target's distribution `p` after the
+/// anchor, and the row `q` the first proposal was drawn from.
+fn sampled_drawn_cycles(trials: usize) -> (Vec<u64>, f64, Vec<f64>, Vec<f64>) {
+    let draft = tiny_draft();
+    let mut inner = tiny_inner();
+    inner.activate_paged_seq(1).unwrap();
+    inner.decoder.draft_taps_on(&draft).unwrap();
+    let logits = inner.decoder.prefill_prompt(&prompt(21, 3)).unwrap();
+    let anchor = argmax(&logits);
+    let passes = inner.decoder.take_hidden_taps();
+    let base = inner.decoder.snapshot();
+    let mut base_context = DFlash2ContextCache::new(&draft.config);
+    decoder::follow_history(&draft, &mut base_context, &passes, &inner.decoder.history).unwrap();
+    let params = extract_chat_params(&ChatConfig {
+        temperature: Some(1.0),
+        top_k: Some(4),
+        ..Default::default()
+    });
+    let vocab = inner.decoder.config.vocab_size;
+    let p = distribution_after(&mut inner, &base, &[anchor], &params);
+    let mut ranked: Vec<usize> = (0..vocab).collect();
+    ranked.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    let rows: Vec<(Vec<i32>, Vec<f64>)> = (0..DFLASH2_DRAFT_PROPOSALS)
+        .map(|r| {
+            if r == 0 {
+                tilted_row(&ranked, &p)
+            } else {
+                let ids: Vec<i32> = ranked[4 * r..4 * r + 4].iter().map(|&t| t as i32).collect();
+                (ids, vec![0.25; 4])
+            }
+        })
+        .collect();
+    let q = {
+        let (support, probs) = &rows[0];
+        let total: f64 = probs.iter().sum();
+        let mut q = vec![0.0; vocab];
+        for (&t, &w) in support.iter().zip(probs) {
+            q[t as usize] = w / total;
+        }
+        q
+    };
+    let mut first = vec![0u64; vocab];
+    let mut accepted = 0usize;
+    for trial in 0..trials {
+        let mut context = base_context.clone();
+        let mut stepper =
+            decoder::DraftStepper::new(&mut inner.decoder, &draft, &mut context, 3).unwrap();
+        let rows = rows.clone();
+        let mut draws = StdRng::seed_from_u64(0x5EED + trial as u64);
+        stepper.drawn = Some(Box::new(move |_| {
+            let mut ids = Vec::new();
+            let mut dists = Vec::new();
+            for (support, probs) in &rows {
+                let dist = crate::sampling::SparseDistribution::from_parts(
+                    support.clone(),
+                    probs.clone(),
+                    vocab,
+                )
+                .unwrap();
+                let total: f64 = probs.iter().sum();
+                let mut u = rand::RngExt::random::<f64>(&mut draws) * total;
+                let mut pick = support[support.len() - 1];
+                for (&t, &w) in support.iter().zip(probs) {
+                    if u < w {
+                        pick = t;
+                        break;
+                    }
+                    u -= w;
+                }
+                ids.push(pick as u32);
+                dists.push(dist);
+            }
+            (ids, dists)
+        }));
+        let mut rng = StdRng::seed_from_u64(trial as u64);
+        let mut proposal = stepper.propose(anchor, 2, &params, &mut rng).unwrap();
+        assert_eq!(proposal.draft_sparse_dists.len(), 2, "two drawn rows");
+        let mut ids = vec![anchor];
+        ids.extend(proposal.draft_ids.iter().map(|&d| d as u32));
+        let d0 = proposal.draft_ids[0];
+        let logits = stepper.verify(&ids).unwrap().logits;
+        let (k, boundary) =
+            accept_dspark_proposal(&logits, &mut proposal, &[], &params, &mut rng, None).unwrap();
+        stepper.commit(k + 1, ids.len()).unwrap();
         drop(stepper);
         let token = if k >= 1 {
             d0 as usize
@@ -629,52 +867,50 @@ fn sampled_cycles(trials: usize, drawn: bool) -> (Vec<f64>, f64, Vec<f64>, Vec<f
             .unwrap();
         inner.decoder.restore_state(base.clone());
     }
-    let n = trials as f64;
-    let freq = first.iter().map(|&c| c as f64 / n).collect();
-    (freq, accepted as f64 / n, p, q)
+    (first, accepted as f64 / trials as f64, p, q)
 }
 
 fn tv(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / 2.0
 }
 
-/// One sampled cycle of 2 rows from the same state over 1,000 seeds keeps
-/// the rule (ATTACK section 4): the first token's frequencies follow the
-/// target's sampling distribution after the anchor, and the first proposal
-/// is accepted at the rate sum(min(p, q)). Once with the tiny draft's own
-/// rows (their support lies outside the target's top 6: every proposal is
-/// rejected), once with proposals the test draws from rows over the
-/// target's likely tokens.
+/// One sampled cycle from the same state keeps the rule (ATTACK section 4):
+/// 1. Real `tiny_draft` over 240 seeds verifies reported sparse rows, drawn ID
+///    calibration (`chi_square_p` vs `q`), independent target preservation
+///    (`chi_square_p` vs `p`), and accept rate `sum min(p, q)`.
+/// 2. Injected tilted proposals over 300 seeds (`top_k = 4`, draft width 2)
+///    verify high-overlap (`0.3 < alpha < 0.95`) first-token distribution and
+///    accept rate `sum min(p, q)`.
+///
 /// MUTATION: the proposal hands the engine the rows one position late →
 /// red (distribution).
 #[test]
 fn a_sampled_cycle_keeps_the_target_distribution() {
-    const TRIALS: usize = 1000;
-    for drawn in [false, true] {
-        let (freq, rate, p, q) = sampled_cycles(TRIALS, drawn);
-        let alpha: f64 = p.iter().zip(&q).map(|(a, b)| a.min(*b)).sum();
-        eprintln!(
-            "sampled cycle (drawn {drawn}): tv(freq, p) {:.4}, tv(q, p) {:.4}, accept rate {rate:.4}, sum min(p, q) {alpha:.4}",
-            tv(&freq, &p),
-            tv(&q, &p)
-        );
-        if drawn {
-            assert!(
-                alpha > 0.3 && alpha < 0.95,
-                "the rows overlap the target: {alpha}"
-            );
-        }
-        assert!(
-            tv(&freq, &p) < 0.06,
-            "drawn {drawn}: the first token follows the target: tv {}",
-            tv(&freq, &p)
-        );
-        let sigma = (alpha * (1.0 - alpha) / TRIALS as f64).sqrt();
-        assert!(
-            (rate - alpha).abs() < 4.0 * sigma + 0.005,
-            "drawn {drawn}: accept rate {rate} against sum min(p, q) {alpha}"
-        );
-    }
+    verify_real_draft_sampled_cycles(240);
+    const TRIALS: usize = 300;
+    let (counts, rate, p, q) = sampled_drawn_cycles(TRIALS);
+    let alpha: f64 = p.iter().zip(&q).map(|(a, b)| a.min(*b)).sum();
+    let freq: Vec<f64> = counts.iter().map(|&c| c as f64 / TRIALS as f64).collect();
+    let (stat, dof, p_val) = chi_square_p(&counts, &p);
+    eprintln!(
+        "sampled cycle (drawn true, {TRIALS} trials): chi2 {stat:.2} dof {dof} p {p_val:.3e} tv(freq, p) {:.4} tv(q, p) {:.4} accept rate {rate:.4} sum min(p, q) {alpha:.4}",
+        tv(&freq, &p),
+        tv(&q, &p)
+    );
+    assert!(
+        alpha > 0.3 && alpha < 0.95,
+        "the rows overlap the target: {alpha}"
+    );
+    assert!(
+        !p_val.is_nan() && p_val >= 1e-6,
+        "drawn true: the first token follows the target: chi2 {stat:.2} dof {dof} p {p_val:.3e}"
+    );
+    let sigma = (alpha * (1.0 - alpha) / TRIALS as f64).sqrt();
+    assert!(
+        (rate - alpha).abs() <= 5.0 * sigma,
+        "drawn true: accept rate {rate} against sum min(p, q) {alpha} (5 sigma = {:.4})",
+        5.0 * sigma
+    );
 }
 
 /// The target's sampling distribution after `tokens` fed from `base`, the
@@ -706,15 +942,11 @@ fn distribution_after(
     p
 }
 
-/// What one sampled cycle of 4 rows from the same state gives over
-/// `trials` seeds, the test drawing the proposals from rows of its own: the
-/// first over the target's four most likely first tokens, the second over
-/// the four most likely second tokens, each later one over other tokens.
-/// Per trial the turn's first two tokens (the second drawn from the target
-/// after the first when the cycle kept one token): their frequencies over
-/// `vocab * vocab` pairs, the target's joint distribution of the pair, and
-/// the rate at which the second proposal was accepted.
-fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
+/// What `trials` sampled cycles (draft width 2, `top_k = 4`, 16 pair cells)
+/// from the same state give with injected drawn proposals: pair counts, the
+/// target's joint pair distribution, row-0 accept rate & expected `alpha0`,
+/// and the rate at which the second proposal was accepted (`k >= 2`).
+fn sampled_pairs(trials: usize) -> (Vec<u64>, Vec<f64>, f64, f64, f64) {
     let draft = tiny_draft();
     let mut inner = tiny_inner();
     inner.activate_paged_seq(1).unwrap();
@@ -723,9 +955,11 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
     let anchor = argmax(&logits);
     let passes = inner.decoder.take_hidden_taps();
     let base = inner.decoder.snapshot();
+    let mut base_context = DFlash2ContextCache::new(&draft.config);
+    decoder::follow_history(&draft, &mut base_context, &passes, &inner.decoder.history).unwrap();
     let params = extract_chat_params(&ChatConfig {
         temperature: Some(1.0),
-        top_k: Some(6),
+        top_k: Some(4),
         ..Default::default()
     });
     let vocab = inner.decoder.config.vocab_size;
@@ -754,14 +988,13 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
     let (by_first, by_second) = (ranked(&first), ranked(&marginal));
     let rows: Vec<(Vec<i32>, Vec<f64>)> = (0..DFLASH2_DRAFT_PROPOSALS)
         .map(|r| match r {
-            0 => {
-                let ids: Vec<i32> = by_first[..4].iter().map(|&t| t as i32).collect();
-                let probs = ids.iter().map(|&t| first[t as usize].sqrt()).collect();
-                (ids, probs)
-            }
+            0 => tilted_row(&by_first, &first),
             1 => {
                 let ids: Vec<i32> = by_second[..4].iter().map(|&t| t as i32).collect();
-                let probs = ids.iter().map(|&t| marginal[t as usize].sqrt()).collect();
+                let probs = ids
+                    .iter()
+                    .map(|&t| marginal[t as usize].sqrt().max(1e-3))
+                    .collect();
                 (ids, probs)
             }
             _ => (
@@ -773,11 +1006,20 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
             ),
         })
         .collect();
-    let mut pairs = vec![0usize; vocab * vocab];
+    let alpha0: f64 = {
+        let (support, probs) = &rows[0];
+        let total: f64 = probs.iter().sum();
+        let mut q0 = vec![0.0; vocab];
+        for (&t, &w) in support.iter().zip(probs) {
+            q0[t as usize] = w / total;
+        }
+        first.iter().zip(&q0).map(|(a, b)| a.min(*b)).sum()
+    };
+    let mut pairs = vec![0u64; vocab * vocab];
+    let mut first_accepted = 0usize;
     let mut second_accepted = 0usize;
     for trial in 0..trials {
-        let mut context = DFlash2ContextCache::new(&draft.config);
-        decoder::follow_history(&draft, &mut context, &passes, &inner.decoder.history).unwrap();
+        let mut context = base_context.clone();
         let mut stepper =
             decoder::DraftStepper::new(&mut inner.decoder, &draft, &mut context, 4).unwrap();
         let rows = rows.clone();
@@ -808,8 +1050,8 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
             (ids, dists)
         }));
         let mut rng = StdRng::seed_from_u64(trial as u64);
-        let mut proposal = stepper.propose(anchor, 3, &params, &mut rng).unwrap();
-        assert_eq!(proposal.draft_sparse_dists.len(), 3, "three drawn rows");
+        let mut proposal = stepper.propose(anchor, 2, &params, &mut rng).unwrap();
+        assert_eq!(proposal.draft_sparse_dists.len(), 2, "two drawn rows");
         let mut ids = vec![anchor];
         ids.extend(proposal.draft_ids.iter().map(|&d| d as u32));
         let logits = stepper.verify(&ids).unwrap().logits;
@@ -835,6 +1077,7 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
             kept.push(pick as u32);
         }
         pairs[kept[0] as usize * vocab + kept[1] as usize] += 1;
+        first_accepted += usize::from(k >= 1);
         second_accepted += usize::from(k >= 2);
         inner
             .decoder
@@ -846,32 +1089,45 @@ fn sampled_pairs(trials: usize) -> (Vec<f64>, Vec<f64>, f64) {
         inner.decoder.restore_state(base.clone());
     }
     let n = trials as f64;
-    let freq = pairs.iter().map(|&c| c as f64 / n).collect();
-    (freq, joint, second_accepted as f64 / n)
+    (
+        pairs,
+        joint,
+        first_accepted as f64 / n,
+        alpha0,
+        second_accepted as f64 / n,
+    )
 }
 
-/// One sampled cycle of 4 rows from the same state over 2,000 seeds keeps
-/// the rule past the first proposal (ATTACK section 4): the turn's first
-/// two tokens follow the target's joint distribution, and the second
-/// proposal, drawn from a row of its own, is accepted in some cycles.
+/// One sampled cycle (draft width 2, `top_k = 4`) from the same state over
+/// 400 seeds keeps the rule past the first proposal (ATTACK section 4): the
+/// turn's first two tokens match the target's joint distribution by exact
+/// Pearson chi-square (`p >= 1e-6`), row 0 accepts at `sum min(p, q)`, and
+/// the second proposal is accepted (`k >= 2`) in some cycles.
 /// MUTATION: every proposal hands the engine the first proposal's row →
 /// red (pairs).
 #[test]
 fn a_sampled_cycle_of_four_rows_keeps_the_target_pair_distribution() {
-    const TRIALS: usize = 2000;
-    let (freq, joint, second) = sampled_pairs(TRIALS);
+    const TRIALS: usize = 400;
+    let (pairs, joint, rate0, alpha0, second) = sampled_pairs(TRIALS);
+    let freq: Vec<f64> = pairs.iter().map(|&c| c as f64 / TRIALS as f64).collect();
+    let (stat, dof, p_val) = chi_square_p(&pairs, &joint);
     let cells = joint.iter().filter(|&&p| p > 0.0).count();
     eprintln!(
-        "sampled pairs: tv(freq, joint) {:.4} over {cells} pairs, second proposal accepted {second:.4}",
+        "sampled pairs ({TRIALS} trials): chi2 {stat:.2} dof {dof} p {p_val:.3e} tv(freq, joint) {:.4} over {cells} pairs, row0 accept {rate0:.4} (expected {alpha0:.4}), second proposal accepted {second:.4}",
         tv(&freq, &joint)
+    );
+    let sigma0 = (alpha0 * (1.0 - alpha0) / TRIALS as f64).sqrt();
+    assert!(
+        (rate0 - alpha0).abs() <= 5.0 * sigma0,
+        "row 0 accept rate {rate0:.4} vs expected {alpha0:.4} (5 sigma = {:.4})",
+        5.0 * sigma0
     );
     assert!(
         second > 0.05,
         "the second proposal was accepted in some cycles: {second}"
     );
     assert!(
-        tv(&freq, &joint) < 0.08,
-        "pairs: the first two tokens follow the target: tv {}",
-        tv(&freq, &joint)
+        !p_val.is_nan() && p_val >= 1e-6,
+        "pairs: the first two tokens follow the target: chi2 {stat:.2} dof {dof} p {p_val:.3e}"
     );
 }

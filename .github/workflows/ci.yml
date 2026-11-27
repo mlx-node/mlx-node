@@ -26,19 +26,20 @@ concurrency:
 
 # Job graph (PR / push):
 #
-#   lint-ts (ubuntu) ──────────────────────────────────────────┐
-#   clippy  (macos) ───────────────────────────────────────────┤
-#   rust-lib-qwen4 + rust-lib-core (macos) ────────────────────┤
-#   rust-int (macos) ──────────────────────────────────────────┼─▶ publish (ubuntu, main only)
-#   build (macos) ─┬─▶ ts-test (macos) ────────────────────────┤
-#                  └─▶ model-test ×N (macos; main / label) ────┤
-#   build-linux-arm64 (ubuntu-22.04-arm) ──────────────────────┘
+#   lint-ts (ubuntu) ──────────────────────────────────────────────────┐
+#   ts-test-pure (ubuntu) ─────────────────────────────────────────────┤
+#   clippy  (macos) ───────────────────────────────────────────────────┤
+#   rust-lib-build (macos) ─▶ rust-lib-test ×6 (macos) ────────────────┤
+#   rust-int (macos; int + other crates + all --doc) ──────────────────┼─▶ publish (ubuntu, main only)
+#   build (macos) ─┬─▶ ts-test (macos; darwin-ts + addon) ─────────────┤
+#                  └─▶ model-test ×N (macos; main / label) ────────────┤
+#   build-linux-arm64 (ubuntu-22.04-arm) ──────────────────────────────┘
 #   done (ubuntu, always) ◀── every job above; the one required status
 #
-# The Rust test legs do NOT wait for `build`: they need no .node addon, only
-# a tokenizer.json (fetched with curl), so they start at t=0 in parallel with
-# the native build. Each macOS cargo job has its own rust-cache `shared-key`
-# so it restores the dependency set it actually compiles.
+# The Rust test legs and `ts-test-pure` do NOT wait for `build`: they need no
+# `.node` addon, so they start at t=0 in parallel with the native build. Each
+# macOS cargo job has its own rust-cache `shared-key` so it restores the
+# dependency set it actually compiles.
 env:
   CARGO_TERM_COLOR: always
   # rust-cache strips incremental artifacts before saving and every job starts
@@ -504,18 +505,19 @@ jobs:
           chmod 600 ~/.netrc
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        # `--all-features` ensures the 51 `e2e-tests`-gated integration targets
+        # stay clippy-checked on every PR even though `rust-int` does not link
+        # them.
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  # mlx-core's unit tests (`--lib`, ~6k tests, serial under RUST_TEST_THREADS=1)
-  # plus its doc-tests, split into two distinct top-level jobs so `done` and
-  # `publish` require BOTH explicitly (no matrix result aggregation):
-  #   - `rust-lib-qwen4`: `models::qwen4_exp::` (~53% of test runtime)
-  #   - `rust-lib-core`:  everything else (`--skip models::qwen4_exp::`) + `--doc` (~47%)
-  # No native addon, no model checkpoint, no Node: the only fixture any
-  # non-ignored Rust test reads is a tokenizer.json (see
-  # crates/mlx-core/tests/common/mod.rs::find_tokenizer_dir), fetched below.
-  rust-lib-qwen4:
-    name: cargo test (mlx-core lib · qwen4_exp)
+  # Compile mlx-core's `--lib` unit test binary ONCE (~858k LOC), then fan out
+  # its ~6.5k serial tests (`RUST_TEST_THREADS=1`) across 6 parallel macOS
+  # runners in `rust-lib-test-1..6`. Compiling once avoids burning ~17 min of
+  # duplicate rustc work per shard while cutting the `rust-lib` critical path
+  # from ~35 min down to ~21-22 min (below `build + ts-test`). Its doc-tests run
+  # in `rust-int`, reusing the non-test `mlx-core` rlib already built there.
+  rust-lib-build:
+    name: cargo build (mlx-core lib tests)
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
@@ -540,8 +542,10 @@ jobs:
         with:
           cache-bin: false
           prefix-key: v2-rust
-          shared-key: rust-lib
-          cache-on-failure: true
+          # Dedicated key with `cache-on-failure: false` so a cancelled mid-build
+          # PR run never saves an immutable partial cache under the primary key.
+          shared-key: rust-lib-build
+          cache-on-failure: false
 
       - name: Cache prebuilt MLX
         uses: actions/cache@v6
@@ -555,109 +559,161 @@ jobs:
           echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
           chmod 600 ~/.netrc
 
-      - name: cargo test --lib (qwen4_exp)
-        run: 'cargo test --locked -p mlx-core --lib models::qwen4_exp::'
-        env:
-          RUST_BACKTRACE: 1
-          # This leg runs on a Metal runner, so a test that self-skips because
-          # it found no GPU has not passed — it reported a green it never
-          # earned. `metal_device_absent` withdraws the skip licence when this
-          # is set, turning that case into a failure instead.
-          MLX_TEST_REQUIRE_METAL: '1'
-
-  rust-lib-core:
-    name: cargo test (mlx-core lib · core)
-    if: >-
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'model-e2e'
-    runs-on: macos-26
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          toolchain: stable
-          target: aarch64-apple-darwin
-          cache: false
-          rustflags: ''
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          prefix-key: v2-rust
-          shared-key: rust-lib
-          cache-on-failure: true
-
-      - name: Cache prebuilt MLX
-        uses: actions/cache@v6
-        with:
-          path: .mlx-prebuilt
-          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
-
-      - name: Configure GitHub token for CMake downloads
-        run: |
-          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
-          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
-          chmod 600 ~/.netrc
-
-      # tokenizer.json is what `find_tokenizer_dir` keys on; tokenizer_config.json
-      # carries the chat template that the synthetic MoE/MTP session test
-      # (crates/mlx-core/tests/common/mod.rs) copies next to it — without it
-      # that test fails on a missing template instead of skipping.
-      - name: Fetch Qwen3 tokenizer files
-        env:
-          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+      # Compile `--no-run` and stage the standalone test executable alongside
+      # its exact-build metallibs (`mlx.metallib`, `paged_attn.metallib`, and
+      # `gguf_planes_test.metallib`). All three resolve colocated beside the
+      # running binary via dladdr / current_exe(), so shard runners need no
+      # `target/`, `.mlx-prebuilt/`, or Rust toolchain.
+      - name: Build mlx-core --lib test binary and stage metallibs
         run: |
           set -euo pipefail
-          dir=.cache/models/qwen3-0.6b
-          mkdir -p "$dir"
-          for f in tokenizer.json tokenizer_config.json; do
-            url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
-            # Public repo; the token only lifts anonymous rate limits when set.
-            if [ -n "${HUGGINGFACE_TOKEN:-}" ]; then
-              curl -fsSL --retry 3 -H "Authorization: Bearer $HUGGINGFACE_TOKEN" -o "$dir/$f" "$url"
-            else
-              curl -fsSL --retry 3 -o "$dir/$f" "$url"
-            fi
-            test -s "$dir/$f"
+          cargo test --locked -p mlx-core --lib --no-run \
+            --message-format=json-render-diagnostics > /tmp/cargo-rust-lib.json
+
+          bins=()
+          while IFS= read -r path; do
+            [ -n "$path" ] && bins+=("$path")
+          done < <(jq -r '
+            select(
+              .reason == "compiler-artifact"
+              and .target.name == "mlx_core"
+              and .profile.test == true
+              and .executable != null
+            ) | .executable
+          ' /tmp/cargo-rust-lib.json)
+          if [ "${#bins[@]}" -ne 1 ] || [ ! -x "${bins[0]}" ]; then
+            echo "::error::Expected exactly 1 executable mlx_core --lib test binary, found ${#bins[@]}: ${bins[*]:-<none>}"
+            exit 1
+          fi
+          bin="${bins[0]}"
+
+          sys_outs=()
+          while IFS= read -r dir; do
+            [ -n "$dir" ] && sys_outs+=("$dir")
+          done < <(jq -r '
+            select(
+              .reason == "build-script-executed"
+              and (.package_id | test("/mlx-sys[#@]"))
+            ) | .out_dir
+          ' /tmp/cargo-rust-lib.json | sort -u)
+          if [ "${#sys_outs[@]}" -ne 1 ] || [ ! -d "${sys_outs[0]}" ]; then
+            echo "::error::Expected exactly 1 mlx-sys build-script out_dir, found ${#sys_outs[@]}: ${sys_outs[*]:-<none>}"
+            exit 1
+          fi
+          sys_out="${sys_outs[0]}"
+
+          bundle="$RUNNER_TEMP/mlx-core-lib-test"
+          rm -rf "$bundle"
+          mkdir -p "$bundle"
+          cp "$bin" "$bundle/mlx_core_test"
+          cp "$sys_out/paged_attn.metallib" "$bundle/paged_attn.metallib"
+          cp "$sys_out/gguf_planes_test.metallib" "$bundle/gguf_planes_test.metallib"
+          if [ -f "$sys_out/lib/mlx.metallib" ]; then
+            cp "$sys_out/lib/mlx.metallib" "$bundle/mlx.metallib"
+          elif [ -f "$sys_out/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib" ]; then
+            cp "$sys_out/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib" "$bundle/mlx.metallib"
+          else
+            echo "::error::mlx.metallib not found under $sys_out"
+            exit 1
+          fi
+          # Record the build checkout root so `rust-lib-test` fails loudly if a
+          # shard runner ever receives a different workspace path (unit tests
+          # read checked-in fixtures via compile-time `env!("CARGO_MANIFEST_DIR")`).
+          printf '%s\n' "$GITHUB_WORKSPACE" > "$bundle/build-workspace.txt"
+
+          for f in mlx_core_test mlx.metallib paged_attn.metallib gguf_planes_test.metallib build-workspace.txt; do
+            test -s "$bundle/$f"
           done
+          ls -lh "$bundle/"
+          rm -f /tmp/cargo-rust-lib.json
 
-      - name: cargo test --lib (core)
-        run: 'cargo test --locked -p mlx-core --lib -- --skip models::qwen4_exp::'
-        env:
-          RUST_BACKTRACE: 1
-          # This leg runs on a Metal runner, so a test that self-skips because
-          # it found no GPU has not passed — it reported a green it never
-          # earned. `metal_device_absent` withdraws the skip licence when this
-          # is set, turning that case into a failure instead.
-          #
-          # The `model-test` leg sets the same var, but only around its `--lib`
-          # filter step, which names a few tests. Every OTHER Metal-gated test in
-          # the crate runs here, in `rust-lib-qwen4`, or in `rust-int` — including
-          # the ladder-retention pair, which became skippable when arming the
-          # ladder started requiring a paged adapter. Scoping this to the leg
-          # rather than to a name list means a test that grows a Metal dependency
-          # later is covered on the day it does, without anyone remembering to add it.
-          MLX_TEST_REQUIRE_METAL: '1'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-core-lib-test
+          path: ${{ runner.temp }}/mlx-core-lib-test/
+          compression-level: 1
+          # Match GitHub's 30-day failed-job rerun window so a single failed
+          # shard stays retryable without rebuilding `rust-lib-build`.
+          retention-days: 30
+          if-no-files-found: error
 
-      - name: cargo test --doc
-        run: cargo test --locked -p mlx-core --doc
-        env:
-          RUST_BACKTRACE: 1
-          MLX_TEST_REQUIRE_METAL: '1'
+  # Executes mlx-core's `--lib` unit tests in 6 parallel LPT-balanced shards
+  # using the precompiled binary from `rust-lib-build` via `_rust-lib-shard.yml`.
+  # Distinct non-matrix job IDs guarantee that a cancelled or missing shard can
+  # never be hidden by GitHub's matrix result aggregator in `done` / `publish`.
+  rust-lib-test-1:
+    name: cargo test (mlx-core lib 1/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 1
+      shard-count: 6
 
-  # Everything the plain `cargo test` used to run EXCEPT mlx-core's `--lib`
-  # and `--doc` (those are `rust-lib-qwen4` + `rust-lib-core`): every crate's integration-test targets
-  # (`tests/*.rs`, incl. mlx-paged-attn's paged_ops_smoke), the unit tests of
-  # the other crates, and their doc-tests. `--test '*'` is used instead of
-  # `--tests` because `--tests` also selects the lib/bin unit-test harnesses
-  # and would re-run mlx-core's 4k unit tests here.
+  rust-lib-test-2:
+    name: cargo test (mlx-core lib 2/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 2
+      shard-count: 6
+
+  rust-lib-test-3:
+    name: cargo test (mlx-core lib 3/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 3
+      shard-count: 6
+
+  rust-lib-test-4:
+    name: cargo test (mlx-core lib 4/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 4
+      shard-count: 6
+
+  rust-lib-test-5:
+    name: cargo test (mlx-core lib 5/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 5
+      shard-count: 6
+
+  rust-lib-test-6:
+    name: cargo test (mlx-core lib 6/6)
+    needs: rust-lib-build
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    uses: ./.github/workflows/_rust-lib-shard.yml
+    with:
+      shard: 6
+      shard-count: 6
+
+  # Everything plain `cargo test` runs EXCEPT mlx-core's `--lib` (covered by
+  # `rust-lib-build` + `rust-lib-test-1..6`) and the 51 `e2e-tests`-gated real-model/bench integration
+  # binaries (covered by `model-test` and clippy `--all-features`): every
+  # ungated integration target across all crates, the unit tests of all other
+  # crates (excluding `mlx-sys`, which has 0 unit tests), and ALL workspace
+  # doc-tests (including `mlx-core --doc`, which reuses the non-test `mlx-core`
+  # rlib built by Step 1 with zero extra compilation).
   rust-int:
     name: cargo test (integration + other crates)
     if: >-
@@ -721,30 +777,81 @@ jobs:
             test -s "$dir/$f"
           done
 
+      # Query Cargo metadata for every integration test target without
+      # `required-features` (auto-including any newly added `tests/*.rs`),
+      # skipping the 51 `e2e-tests`-gated targets that `--test '*'` would
+      # reject on unmet features.
       - name: cargo test (integration targets, all crates)
-        run: cargo test --locked --workspace --test '*'
+        run: |
+          set -euo pipefail
+          targets=()
+          while IFS= read -r name; do
+            targets+=(--test "$name")
+          done < <(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].targets[] | select((.kind | index("test")) and ((.["required-features"] // []) | length == 0)) | .name')
+          test "${#targets[@]}" -gt 0
+          cargo test --locked --workspace "${targets[@]}"
         env:
           RUST_BACKTRACE: 1
           MLX_TEST_REQUIRE_METAL: '1'
 
       - name: cargo test (unit tests of crates other than mlx-core)
-        run: cargo test --locked --workspace --exclude mlx-core --lib --bins
+        run: cargo test --locked --workspace --exclude mlx-core --exclude mlx-sys --lib --bins
         env:
           RUST_BACKTRACE: 1
           MLX_TEST_REQUIRE_METAL: '1'
 
-      - name: cargo test (doc-tests of crates other than mlx-core)
-        run: cargo test --locked --workspace --exclude mlx-core --doc
+      - name: cargo test (doc-tests, all crates)
+        run: cargo test --locked --workspace --doc
         env:
           RUST_BACKTRACE: 1
           MLX_TEST_REQUIRE_METAL: '1'
 
-  # Vitest suite against the `build` job's addon. Needs the converted bf16
-  # Qwen3-0.6B checkpoint (tokenizer, trainer, batch-generate tests) and the
-  # gsm8k dataset (`__test__/utils/dataset.test.ts`). No Rust toolchain: the
-  # addon arrives as an artifact and nothing under __test__ shells out to cargo.
+  # OS-agnostic pure-TS Vitest lane (`--project pure-ts`, ~332 files). Needs
+  # neither Metal nor the native `.node` addon, so it starts at t=0 on Linux
+  # in parallel with `build` instead of consuming macOS runner time after
+  # `build` finishes.
+  ts-test-pure:
+    name: yarn test (pure-ts)
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'yarn'
+
+      # `packages/dashboard/__test__/chat-auto-shell.test.ts` runs differential
+      # shell checks against both `/bin/bash` and `/bin/zsh`.
+      - name: Ensure zsh is installed
+        run: |
+          if ! command -v zsh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends zsh
+          fi
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # `packages/agent/__test__/catalog-native-free.test.ts` imports the built
+      # `dist/` subpaths to enforce the native-free bundle contract.
+      - name: Build TypeScript and run pure-ts tests
+        run: |
+          set -euo pipefail
+          yarn build:ts
+          yarn test --project pure-ts
+
+  # macOS Vitest legs (`darwin-ts` + `addon`) against the `build` job's addon.
+  # Needs the converted bf16 Qwen3-0.6B checkpoint (qwen3/tokenizer tests) and
+  # the gsm8k dataset (`__test__/utils/dataset.test.ts`). No Rust toolchain:
+  # the addon arrives as an artifact and nothing here shells out to cargo.
   ts-test:
-    name: yarn test
+    name: yarn test (macos addon + darwin-ts)
     # A model-e2e opt-in can replace an active PR run, so it must also finish
     # the required unit/integration checks. Unrelated label events stay idle.
     if: >-
@@ -807,7 +914,7 @@ jobs:
           if [ ! -s data/openai-gsm8k/train.jsonl ] || [ ! -s data/openai-gsm8k/test.jsonl ]; then
             yarn mlx download dataset
           fi
-          yarn test
+          yarn test --project darwin-ts --project addon
         env:
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
 
@@ -1087,7 +1194,7 @@ jobs:
             yarn build:ts
             GEMMA4_QAT_MODEL_PATH="$ckpt" yarn test ${{ matrix.tests }}
             MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_TEST_MODEL_PATH="$ckpt" \
-              cargo test --locked -p mlx-core --test gemma4_grouped_cold_tier_parity \
+              cargo test --locked -p mlx-core --features e2e-tests --test gemma4_grouped_cold_tier_parity \
                 -- --ignored --exact --test-threads=1 --nocapture \
                 gemma4_grouped_cold_tier_restart_parity
           else
@@ -1114,7 +1221,7 @@ jobs:
             # The hosted VM refuses every optional claim: the restart gate's
             # checkpoint must go to disk from the lane and come back.
             if [ "${{ matrix.name }}" = "qwen3_5-dense" ]; then export MLX_E2E_EXPECT_LANE_DISK=1; fi
-            cargo test --locked -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
+            cargo test --locked -p mlx-core --features e2e-tests ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
             # Ignored UNIT tests, selected by name. Empty for legs that set no
             # `lib_tests:`, in which case nothing extra runs. See the comment on
             # that matrix key for why this is not folded into the line above.
@@ -1169,11 +1276,11 @@ jobs:
             fi
             if [ -n "${{ matrix.stage1_rust }}" ]; then
               QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
-                cargo test --locked -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                cargo test --locked -p mlx-core --features e2e-tests --test "${{ matrix.stage1_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
               QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
                 MLX_DISABLE_PERIODIC_CLEAR=1 \
-                cargo test --locked -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                cargo test --locked -p mlx-core --features e2e-tests --test "${{ matrix.stage1_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage1_ts }}" ]; then
@@ -1182,7 +1289,7 @@ jobs:
             fi
             if [ -n "${{ matrix.stage2_rust }}" ]; then
               QWEN35_STAGE2_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=2 \
-                cargo test --locked -p mlx-core --test "${{ matrix.stage2_rust }}" \
+                cargo test --locked -p mlx-core --features e2e-tests --test "${{ matrix.stage2_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage0_ts }}" ]; then
@@ -1216,9 +1323,15 @@ jobs:
       - build
       - build-linux-arm64
       - clippy
-      - rust-lib-qwen4
-      - rust-lib-core
+      - rust-lib-build
+      - rust-lib-test-1
+      - rust-lib-test-2
+      - rust-lib-test-3
+      - rust-lib-test-4
+      - rust-lib-test-5
+      - rust-lib-test-6
       - rust-int
+      - ts-test-pure
       - ts-test
       - model-test
     steps:
@@ -1227,8 +1340,14 @@ jobs:
           ${{ contains(needs.*.result, 'failure') ||
               contains(needs.*.result, 'cancelled') ||
               needs.build-linux-arm64.result != 'success' ||
-              needs.rust-lib-qwen4.result != 'success' ||
-              needs.rust-lib-core.result != 'success' ||
+              needs.rust-lib-build.result != 'success' ||
+              needs.rust-lib-test-1.result != 'success' ||
+              needs.rust-lib-test-2.result != 'success' ||
+              needs.rust-lib-test-3.result != 'success' ||
+              needs.rust-lib-test-4.result != 'success' ||
+              needs.rust-lib-test-5.result != 'success' ||
+              needs.rust-lib-test-6.result != 'success' ||
+              needs.ts-test-pure.result != 'success' ||
               !contains(needs.*.result, 'success') }}
 
   publish:
@@ -1243,9 +1362,15 @@ jobs:
       - build-linux-arm64
       - lint-ts
       - clippy
-      - rust-lib-qwen4
-      - rust-lib-core
+      - rust-lib-build
+      - rust-lib-test-1
+      - rust-lib-test-2
+      - rust-lib-test-3
+      - rust-lib-test-4
+      - rust-lib-test-5
+      - rust-lib-test-6
       - rust-int
+      - ts-test-pure
       - ts-test
       - model-test
     # Only publish from main in the upstream repository once every check
@@ -1259,9 +1384,15 @@ jobs:
       needs.build-linux-arm64.result == 'success' &&
       needs.lint-ts.result == 'success' &&
       needs.clippy.result == 'success' &&
-      needs.rust-lib-qwen4.result == 'success' &&
-      needs.rust-lib-core.result == 'success' &&
+      needs.rust-lib-build.result == 'success' &&
+      needs.rust-lib-test-1.result == 'success' &&
+      needs.rust-lib-test-2.result == 'success' &&
+      needs.rust-lib-test-3.result == 'success' &&
+      needs.rust-lib-test-4.result == 'success' &&
+      needs.rust-lib-test-5.result == 'success' &&
+      needs.rust-lib-test-6.result == 'success' &&
       needs.rust-int.result == 'success' &&
+      needs.ts-test-pure.result == 'success' &&
       needs.ts-test.result == 'success' &&
       needs.model-test.result == 'success'
     steps:

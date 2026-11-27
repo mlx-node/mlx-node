@@ -21,7 +21,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MOE_MTP_MODEL_PATH=/abs/path/to/moe-mtp-checkpoint \
-//!     cargo test -p mlx-core --test qwen3_5_moe_paged_mtp_parity \
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_moe_paged_mtp_parity \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!

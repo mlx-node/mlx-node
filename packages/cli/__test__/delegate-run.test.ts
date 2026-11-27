@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+// Every test injects `deps.wizard`; guard against accidental production download-model loading.
+vi.mock('../src/commands/download-model.js', () => ({
+  run: async () => {
+    throw new Error('unexpected production wizard download in delegate-run test');
+  },
+}));
+
 import { run as runAgentCli, type AgentRunDeps } from '../src/commands/agent/index.js';
 import { delegateAgentArgs, run as runDelegate } from '../src/commands/delegate.js';
 

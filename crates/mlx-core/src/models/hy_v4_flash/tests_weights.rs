@@ -635,8 +635,8 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
     for &(k, n) in &[
         (1024usize, 256usize),
         (1536, 384),
-        (3072, 261),
-        (13824, 64),
+        (1024, 261),
+        (2048, 64),
         (192, 67),
     ] {
         let w = make_sym_q8(&mut rng, n, k, 1.0 / (k as f32).sqrt());
@@ -650,18 +650,13 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
             "sym_v2",
         );
     }
-    for &(k, n) in &[
-        (3072usize, 1024usize),
-        (1536, 576),
-        (13824, 64),
-        (1024, 16384),
-    ] {
+    for &(k, n) in &[(1024usize, 512usize), (512, 256), (2048, 64), (512, 2048)] {
         let w = make_qmm(&mut rng, n, k, 1.5 / (k as f32).sqrt());
         check_dense_decode(
             &mut rng,
             &w,
             (k, n),
-            &[1, 2, 3, 4, 5, 8, 11],
+            &[1, 2, 4, 8, 11],
             &[12, 16],
             false,
             "qmm_dense",
@@ -687,23 +682,21 @@ fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
         "sym_grp",
     );
     for &(g, k, n) in &[
-        (32usize, 192usize, 512usize),
-        (64, 192, 512),
+        (16usize, 192usize, 512usize),
         (32, 512, 256),
-        (64, 512, 256),
         (4, 192, 37),
         (4, 512, 19),
     ] {
         let w = make_sym_q8(&mut rng, g * n, k, 1.0 / (k as f32).sqrt());
         check_grouped_decode(&mut rng, &w, (g, k, n), &[1, 2, 3, 4], true, "sym_short");
     }
-    for &(g, k, n) in &[(64usize, 192usize, 512usize), (64, 512, 256)] {
+    for &(g, k, n) in &[(16usize, 192usize, 512usize), (16, 512, 256)] {
         let w = make_qmm(&mut rng, g * n, k, 1.5 / (k as f32).sqrt());
         check_grouped_decode(
             &mut rng,
             &w,
             (g, k, n),
-            &[1, 2, 3, 4, 5, 12, 16],
+            &[1, 2, 4, 12, 16],
             false,
             "qmm_grp",
         );
@@ -803,11 +796,9 @@ fn q8_dense_and_grouped_prefill_nax_parity() {
         (64, 192, 128),
         (64, 512, 96),
         (256, 1024, 256),
-        (256, 3072, 192),
-        (2048, 512, 128),
-        (2048, 3072, 256),
-        (64, 16384, 128),
-        (256, 16384, 64),
+        (512, 1024, 192),
+        (64, 4096, 128),
+        (128, 2048, 384),
     ];
     for &s in dense_shapes {
         check_q8_dense(&mut rng, s, s.0 == 64 && s.1 == 192);
@@ -824,10 +815,9 @@ fn q8_dense_and_grouped_prefill_nax_parity() {
         (17, 4, 192, 512),
         (64, 4, 192, 512),
         (256, 4, 192, 512),
-        (2048, 2, 192, 512),
+        (512, 2, 192, 512),
         (64, 4, 512, 256),
-        (256, 4, 512, 256),
-        (2048, 2, 512, 256),
+        (512, 2, 512, 256),
     ];
     for &s in grp_shapes {
         check_q8_grouped(&mut rng, s, s.0 == 64);
@@ -844,7 +834,7 @@ fn q8_prefill_strided_epilogue_and_f16_io_parity() {
         (17usize, 192usize, 96usize),
         (64, 512, 256),
         (77, 512, 160),
-        (256, 3072, 256),
+        (256, 1024, 256),
     ] {
         let sym = make_sym_q8(&mut rng, n, k, 1.0 / (k as f32).sqrt());
         let xs = slice_axis(

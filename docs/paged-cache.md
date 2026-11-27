@@ -929,7 +929,7 @@ say so.
 Every `install_*_cold_sidecar` early-return falls through to a full O(prefix) replay
 that produces CORRECT state, so a regression from "restored and used" to "restored and
 silently re-derived" leaves `text`, `num_tokens`, `cached_tokens`, `hits` and
-`corruptions` all unchanged. `cold_tier_parity_harness.rs` asserts `restore_installs >= 1`
+`corruptions` all unchanged. `cold_tier_parity_harness/mod.rs` asserts `restore_installs >= 1`
 natively; `coldSidecarStats()` is the same fact for the dashboard and for `mlx agent`.
 
 The capture counters split a zero-reuse run into its causes without `MLX_INFERENCE_TRACE`:
@@ -954,7 +954,7 @@ build, or any test asserting on the fields that did survive.
 
 ### Restart-parity gate (authorizes an allowlist entry)
 
-A family joins the allowlist only after `crates/mlx-core/tests/cold_tier_parity_harness.rs`
+A family joins the allowlist only after `crates/mlx-core/tests/cold_tier_parity_harness/mod.rs`
 passes on a real checkpoint. The harness runs three instances — persist/capture,
 fresh-instance restore, persist-off baseline — and asserts byte-identical `text`,
 equal `num_tokens`, `hits > 0`, and `corruptions == 0` (so a fail-open restore cannot
@@ -971,16 +971,16 @@ assert nothing at all.
 ```bash
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/qwen3-0.6b-mlx-bf16 \
-  cargo test -p mlx-core --test qwen3_cold_tier_parity -- --ignored --test-threads=1 --nocapture
+  cargo test -p mlx-core --features e2e-tests --test qwen3_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/lfm2.5-1.2b-thinking-mlx \
-  cargo test -p mlx-core --test lfm2_cold_tier_parity -- --ignored --exact \
+  cargo test -p mlx-core --features e2e-tests --test lfm2_cold_tier_parity -- --ignored --exact \
     --test-threads=1 --nocapture lfm2_cold_tier_restart_parity
 
 MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/gemma-4-12b-it-qat-q4_0-mlx \
-  cargo test -p mlx-core --test gemma4_grouped_cold_tier_parity -- --ignored --exact \
+  cargo test -p mlx-core --features e2e-tests --test gemma4_grouped_cold_tier_parity -- --ignored --exact \
     --test-threads=1 --nocapture gemma4_grouped_cold_tier_restart_parity
 ```
 
@@ -1115,7 +1115,7 @@ All Rust tests are `#[ignore]` and skip cleanly without the env var; the TS test
 
 ```bash
 MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
-  cargo test -p mlx-core --test qwen3_paged_vs_flat_parity \
+  cargo test -p mlx-core --features e2e-tests --test qwen3_paged_vs_flat_parity \
   -- --ignored --nocapture
 
 QWEN3_PAGED_PARITY_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \

@@ -34,7 +34,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=/path/to/qwen3.5-0.8b-mlx-bf16 \
-//!     cargo test -p mlx-core --test qwen3_5_state_tier_restart -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_state_tier_restart -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

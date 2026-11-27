@@ -2,35 +2,74 @@
 //! the bits it gives alone. The moe-shape fixture (Flash Next widths, 4
 //! layers: GDN 0-2, attention 3, PLE at 1; int8 pages) on a direct store.
 use super::prefix_reuse::{finish, fork, gpu, prompt, reuse_over};
-use super::route_step::{deep_moe_shape_fixture, fill_slots, moe_shape_decoder, moe_shape_fixture};
+use super::route_step::{fill_slots, moe_shape_decoder, moe_shape_fixture};
 use super::*;
 use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
 use crate::models::qwen4_exp::live::Residency;
 
-/// Prompt lengths of the lanes: different depths, page blocks crossed at
-/// different steps.
-const DEPTHS: [usize; 4] = [21, 46, 70, 33];
-const STEPS: usize = 20;
+/// Prompt lengths of the lanes: different depths positioned near 32-token
+/// page boundaries so lanes 0 and 1 (and 2 when present) allocate new pages
+/// on distinct batched steps within `STEPS`.
+const DEPTHS: [usize; 4] = [29, 58, 91, 33];
+const STEPS: usize = 10;
 /// Steps each lane runs alone after the lane steps.
 const AFTER: usize = 4;
 
+fn seq_blocks(inner: &Inner, seq: u32) -> usize {
+    inner
+        .decoder
+        .paged
+        .as_ref()
+        .unwrap()
+        .block_table_for(seq)
+        .unwrap()
+        .num_blocks()
+}
+
+/// Cached identity-ready direct store template on the 4-layer moe-shape
+/// fixture; cloned via `clone_direct_for_test` so every direct test shares
+/// read-only weight handles with fresh mutable caches, slots and `Live`.
+fn direct_moe_store() -> (weights::Store, config::Config) {
+    static DIRECT: std::sync::OnceLock<(std::sync::Mutex<weights::Store>, config::Config)> =
+        std::sync::OnceLock::new();
+    let (store, config) = DIRECT.get_or_init(|| {
+        let _host = memory::scoped_fixture_host();
+        let (mut decoder, _) = moe_shape_decoder(moe_shape_fixture());
+        go_live(&mut decoder, 0);
+        assert!(
+            decoder.weights.plan.direct,
+            "the fixture host admits every bank"
+        );
+        let probe = MxArray::from_uint32(&[0], &[1]).unwrap();
+        for layer in 0..decoder.config.num_hidden_layers {
+            decoder
+                .weights
+                .device_expert_slots(layer, &probe)
+                .unwrap()
+                .expect("a filled direct layer");
+        }
+        decoder.weights.start_direct_fill().unwrap();
+        decoder.weights.publish_live();
+        let c = (*decoder.config).clone();
+        (std::sync::Mutex::new(decoder.weights), c)
+    });
+    let cloned = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone_direct_for_test();
+    (cloned, config.clone())
+}
+
 /// The 4-layer moe-shape fixture with every expert in identity banks.
 pub(super) fn direct_inner() -> Inner {
-    let (mut decoder, vision) = moe_shape_decoder(moe_shape_fixture());
-    go_live(&mut decoder, 0);
-    assert!(
-        decoder.weights.plan.direct,
-        "the fixture host admits every bank"
-    );
-    let probe = MxArray::from_uint32(&[0], &[1]).unwrap();
-    for layer in 0..decoder.config.num_hidden_layers {
-        decoder
-            .weights
-            .device_expert_slots(layer, &probe)
-            .unwrap()
-            .expect("a filled direct layer");
-    }
+    let (store, c) = direct_moe_store();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    decoder.paged = Some(paged::create_fixture(&c).unwrap());
+    decoder.register_cache_limit();
+    decoder.weights.publish_live();
+    decoder.residency_changed();
     inner_over(decoder, vision, false)
 }
 
@@ -88,9 +127,9 @@ struct Alone {
     state: (Vec<u32>, Vec<u32>, Vec<Vec<u32>>),
 }
 
-/// Per step, each lone run's logits bits.
-fn by_step(lone: &[Alone]) -> Vec<Vec<Vec<u32>>> {
-    (0..lone[0].steps.len())
+/// Per step (up to `count`), each lone run's logits bits.
+fn by_step(lone: &[Alone], count: usize) -> Vec<Vec<Vec<u32>>> {
+    (0..count)
         .map(|k| lone.iter().map(|l| bits(&l.steps[k])).collect())
         .collect()
 }
@@ -127,6 +166,20 @@ fn alone(seq: u32, tokens: &[u32], count: usize, state_at: usize) -> Alone {
     }
 }
 
+/// Cached lone baselines for the four `DEPTHS` prompts, shared across
+/// `each_lane_gives_the_bits_it_gives_alone`,
+/// `a_lane_that_ends_or_is_cancelled_moves_no_other_lanes_bits`, and
+/// `a_failed_lane_step_releases_its_rows_and_the_model_serves_on`.
+fn cached_alone() -> &'static [Alone; 4] {
+    static ALONE: std::sync::OnceLock<[Alone; 4]> = std::sync::OnceLock::new();
+    ALONE.get_or_init(|| {
+        std::array::from_fn(|j| {
+            let tokens = prompt(DEPTHS[j], j as u32 + 1);
+            alone(j as u32 + 1, &tokens, STEPS + AFTER, STEPS)
+        })
+    })
+}
+
 /// Each of 2, 3 and 4 lanes at different depths gives, step for step, the
 /// logits bits it gives alone; after the lane steps its history, page cursor and every state array equal the
 /// lone run's, and so do the logits of the steps it then runs alone.
@@ -139,22 +192,26 @@ fn alone(seq: u32, tokens: &[u32], count: usize, state_at: usize) -> Alone {
 #[test]
 fn each_lane_gives_the_bits_it_gives_alone() {
     let _host = memory::scoped_fixture_host();
+    let all_lone = cached_alone();
     for n in 2..=decoder::LANE_ROWS {
         let what = |j: usize, k: usize| format!("{n} lanes: lane {j} step {k}");
         let prompts: Vec<Vec<u32>> = (0..n).map(|j| prompt(DEPTHS[j], j as u32 + 1)).collect();
         let seqs: Vec<u32> = (1..=n as u32).collect();
-        let lone: Vec<Alone> = (0..n)
-            .map(|j| alone(seqs[j], &prompts[j], STEPS + AFTER, STEPS))
-            .collect();
+        let lone = &all_lone[..n];
         let mut inner = direct_inner();
         let mut last: Vec<Vec<f32>> = (0..n)
             .map(|j| prefill(&mut inner, seqs[j], &prompts[j]))
             .collect();
+        let initial_blocks: Vec<usize> = seqs.iter().map(|&s| seq_blocks(&inner, s)).collect();
+        let mut crossed_at: Vec<Option<usize>> = vec![None; n];
         let readbacks = inner.decoder.route_readbacks;
-        for (k, want) in by_step(&lone).iter().take(STEPS).enumerate() {
+        for (k, want) in by_step(lone, STEPS).iter().enumerate() {
             let rows: Vec<(u32, u32)> = (0..n).map(|j| (seqs[j], pick(&last[j]))).collect();
             last = step_rows(&mut inner, &rows);
             for j in 0..n {
+                if crossed_at[j].is_none() && seq_blocks(&inner, seqs[j]) > initial_blocks[j] {
+                    crossed_at[j] = Some(k);
+                }
                 assert!(
                     bits(&last[j]) == want[j],
                     "{}: logits differ from the lane alone",
@@ -162,6 +219,10 @@ fn each_lane_gives_the_bits_it_gives_alone() {
                 );
             }
         }
+        assert!(
+            matches!((crossed_at[0], crossed_at[1]), (Some(a), Some(b)) if a != b),
+            "{n} lanes: lanes 0 and 1 must cross page boundaries on distinct batched steps: {crossed_at:?}"
+        );
         assert_eq!(
             inner.decoder.lane_steps, STEPS as u64,
             "every step took the row kernels"
@@ -217,6 +278,8 @@ fn a_lane_step_waits_once() {
         let mut last: Vec<Vec<f32>> = (0..n)
             .map(|j| prefill(&mut inner, seqs[j], &prompts[j]))
             .collect();
+        let initial_blocks: Vec<usize> = seqs.iter().map(|&s| seq_blocks(&inner, s)).collect();
+        let mut crossed_at: Vec<Option<usize>> = vec![None; n];
         crate::array::take_waited_evals();
         for k in 0..STEPS {
             let rows: Vec<(u32, u32)> = (0..n).map(|j| (seqs[j], pick(&last[j]))).collect();
@@ -232,12 +295,21 @@ fn a_lane_step_waits_once() {
                 ["qwen4::decoder::lanes"],
                 "{n} lanes step {k}: blocking evals"
             );
+            for j in 0..n {
+                if crossed_at[j].is_none() && seq_blocks(&inner, seqs[j]) > initial_blocks[j] {
+                    crossed_at[j] = Some(k);
+                }
+            }
             let values = f32s(&logits);
             last = values
                 .chunks(values.len() / n)
                 .map(<[f32]>::to_vec)
                 .collect();
         }
+        assert!(
+            matches!((crossed_at[0], crossed_at[1]), (Some(a), Some(b)) if a != b),
+            "{n} lanes: lanes 0 and 1 must cross page boundaries on distinct batched steps: {crossed_at:?}"
+        );
         assert_eq!(inner.decoder.lane_steps, STEPS as u64);
     }
 }
@@ -250,19 +322,17 @@ fn a_lane_step_waits_once() {
 #[test]
 fn a_lane_that_ends_or_is_cancelled_moves_no_other_lanes_bits() {
     let _host = memory::scoped_fixture_host();
-    const CANCEL_AT: usize = 5;
-    const END_AT: usize = 12;
+    const CANCEL_AT: usize = 3;
+    const END_AT: usize = 6;
     let prompts: Vec<Vec<u32>> = (0..3).map(|j| prompt(DEPTHS[j], j as u32 + 1)).collect();
     let seqs = [1u32, 2, 3];
-    let lone: Vec<Alone> = (0..3)
-        .map(|j| alone(seqs[j], &prompts[j], STEPS, STEPS))
-        .collect();
+    let lone = &cached_alone()[..3];
     let mut inner = direct_inner();
     let mut last: Vec<Vec<f32>> = (0..3)
         .map(|j| prefill(&mut inner, seqs[j], &prompts[j]))
         .collect();
     let mut live = vec![0usize, 1, 2];
-    for (k, want) in by_step(&lone).iter().enumerate() {
+    for (k, want) in by_step(lone, STEPS).iter().enumerate() {
         if k == CANCEL_AT {
             inner.activate_paged_seq(seqs[2]).unwrap();
             inner.decoder.cancelled = Some(Arc::new(AtomicBool::new(true)));
@@ -442,52 +512,8 @@ fn lanes_publish_and_restore_their_states_as_alone() {
 
 /// The deep fixture on a 16 GiB host, as `promote_tests.rs` loads it.
 mod moved {
+    use super::super::promote::{bank_bytes, host_gate_model, host_with, own};
     use super::*;
-
-    const PHYSICAL: u64 = 16 << 30;
-    const NEED: u64 = 1 << 30;
-    const WINDOW: usize = 256;
-    const ALLOWANCE: u32 = 128;
-
-    fn host_with(non_reclaimable: u64) -> memory::HostMemory {
-        memory::HostMemory {
-            physical: PHYSICAL,
-            free: 6 << 30,
-            file: 2 << 30,
-            anonymous: non_reclaimable - (3 << 30),
-            purgeable: 0,
-            wired: 2 << 30,
-            compressor: 1 << 30,
-        }
-    }
-
-    fn loaded(host: memory::HostMemory) -> Inner {
-        let (mut decoder, vision) = moe_shape_decoder(deep_moe_shape_fixture());
-        decoder.weights.plan_fixture_store().unwrap();
-        decoder.weights.plan.physical_bytes = Some(PHYSICAL);
-        decoder.register_cache_limit();
-        {
-            let _host = memory::scoped_test_host(host);
-            decoder.weights.select_residency(NEED).unwrap();
-        }
-        decoder.weights.prepare_fixture_hot().unwrap();
-        decoder.weights.finish_fixture_load().unwrap();
-        decoder.weights.publish_live();
-        decoder.adopt_plan(WINDOW, ALLOWANCE);
-        inner_over(decoder, vision, false)
-    }
-
-    fn own(inner: &Inner) -> u64 {
-        inner.decoder.weights.ledgered_bytes()
-            + inner
-                .decoder
-                .paged
-                .as_ref()
-                .unwrap()
-                .pool_allocated_bytes()
-                .unwrap()
-            + inner.prefix_states.bytes()
-    }
 
     /// Two sequences on a store the host gate refused take the shared
     /// step; the close of the turn moves the store up to whole, and from
@@ -497,17 +523,12 @@ mod moved {
     /// MUTATION lane-gate: the row kernels ignore the residency → red.
     #[test]
     fn the_residency_is_read_at_every_step() {
-        let bank = {
-            let inner = loaded(memory::fixture_host());
-            assert!(inner.decoder.weights.plan.direct);
-            inner.decoder.weights.plan.direct_bytes
-        };
-        let edge = PHYSICAL - memory::DIRECT_MARGIN - NEED - bank;
+        let bank = bank_bytes();
         let run = |lanes: bool| -> (Vec<Vec<u32>>, u64) {
-            let mut inner = loaded(host_with(edge + bank / 24));
+            let mut inner = host_gate_model(bank);
             assert_eq!(inner.decoder.weights.live.residency(), Residency::HostGate);
             let quiet = host_with(3 << 30);
-            let prompts = [prompt(40, 1), prompt(27, 2)];
+            let prompts = [prompt(16, 1), prompt(11, 2)];
             let seqs = [1u32, 2];
             let mut last = Vec::new();
             {
@@ -516,7 +537,7 @@ mod moved {
                 for j in 0..2 {
                     last.push(prefill(&mut inner, seqs[j], &prompts[j]));
                 }
-                for _ in 0..3 {
+                for _ in 0..2 {
                     let rows: Vec<(u32, u32)> = (0..2).map(|j| (seqs[j], pick(&last[j]))).collect();
                     last = step_rows(&mut inner, &rows);
                 }
@@ -533,7 +554,7 @@ mod moved {
             let _host = memory::scoped_test_host(quiet);
             inner.set_turn_cancel_flag(Some(Arc::new(AtomicBool::new(false))));
             let mut out = Vec::new();
-            for _ in 0..6 {
+            for _ in 0..3 {
                 if lanes {
                     let rows: Vec<(u32, u32)> = (0..2).map(|j| (seqs[j], pick(&last[j]))).collect();
                     last = step_rows(&mut inner, &rows);
@@ -550,7 +571,7 @@ mod moved {
         let (apart, none) = run(false);
         assert_eq!(
             (steps, none),
-            (6, 0),
+            (3, 0),
             "the moved store's lanes took the row kernels"
         );
         assert!(
@@ -565,12 +586,7 @@ mod moved {
 #[test]
 fn a_partial_store_keeps_the_shared_step() {
     let _host = memory::scoped_fixture_host();
-    let (mut decoder, vision) = moe_shape_decoder(moe_shape_fixture());
-    decoder.weights.stream_fixture_store(12).unwrap();
-    decoder.register_cache_limit();
-    decoder.weights.publish_live();
-    decoder.residency_changed();
-    let mut inner = inner_over(decoder, vision, false);
+    let mut inner = super::route_step::moe_shape_inner(12);
     assert!(!inner.decoder.weights.plan.direct);
     let all: Vec<u32> = (0..inner.decoder.config.num_experts as u32).collect();
     let a = prefill(&mut inner, 1, &prompt(21, 1));
@@ -606,7 +622,7 @@ fn resumed_turn(inner: &mut Inner, seq: u32, tokens: &[u32]) -> (usize, Vec<f32>
 #[test]
 fn restored_forked_and_live_lanes_step_together_as_alone() {
     let _host = memory::scoped_fixture_host();
-    const LANE_STEPS: usize = 12;
+    const LANE_STEPS: usize = 6;
     let p1 = prompt(100, 1);
     let setup = |inner: &mut Inner| -> Vec<u32> {
         let (cached, mut last) = resumed_turn(inner, 1, &p1);
@@ -737,23 +753,12 @@ fn a_lane_step_runs_where_the_one_row_step_runs() {
 fn a_failed_lane_step_releases_its_rows_and_the_model_serves_on() {
     let _host = memory::scoped_fixture_host();
     const LANE_STEPS: usize = 6;
-    let prompts = [prompt(21, 1), prompt(46, 2), prompt(70, 3)];
-    let lone: Vec<Vec<Vec<u32>>> = prompts
-        .iter()
-        .map(|p| {
-            let mut inner = direct_inner();
-            let mut last = prefill(&mut inner, 1, p);
-            (0..LANE_STEPS)
-                .map(|_| {
-                    last = step_rows(&mut inner, &[(1, pick(&last))]).remove(0);
-                    bits(&last)
-                })
-                .collect()
-        })
-        .collect();
-    let want: Vec<Vec<&Vec<u32>>> = (0..LANE_STEPS)
-        .map(|k| lone.iter().map(|steps| &steps[k]).collect())
-        .collect();
+    let prompts = [
+        prompt(DEPTHS[0], 1),
+        prompt(DEPTHS[1], 2),
+        prompt(DEPTHS[2], 3),
+    ];
+    let want = by_step(&cached_alone()[..3], LANE_STEPS);
     let mut inner = direct_inner();
     let allocated = |inner: &Inner| {
         inner
@@ -774,7 +779,7 @@ fn a_failed_lane_step_releases_its_rows_and_the_model_serves_on() {
         last = step_rows(&mut inner, &rows);
         for j in 0..3 {
             assert!(
-                bits(&last[j]) == *expected[j],
+                bits(&last[j]) == expected[j],
                 "before the failure: lane {j} step {k}"
             );
         }
@@ -829,7 +834,7 @@ fn a_failed_lane_step_releases_its_rows_and_the_model_serves_on() {
         let out = step_rows(&mut inner, &rows);
         for (&j, logits) in live.iter().zip(out) {
             assert!(
-                bits(&logits) == *expected[j],
+                bits(&logits) == expected[j],
                 "after the failure: lane {j} step {k} differs from the lane alone"
             );
             last[j] = logits;

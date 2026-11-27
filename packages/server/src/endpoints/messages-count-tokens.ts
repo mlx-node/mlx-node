@@ -2,7 +2,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import { countPromptTokens, isImageProcessingError, validateRequestImagesAsync } from '@mlx-node/lm';
+import { countPromptTokens, isImageProcessingError, validateRequestImagesAsync } from '@mlx-node/lm/chat-session';
 
 import {
   sendAnthropicBadRequest,

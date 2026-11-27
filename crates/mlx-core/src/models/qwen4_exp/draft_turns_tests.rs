@@ -8,7 +8,7 @@
 use super::draft_cycle::{drafted_turn, moe_draft, nothing, tapped};
 use super::draft_switch::{
     ROWS, Reply, Turn, assert_forced_accepts, assert_same_rows, chat_model, drive_all, forced,
-    full_length, start, start_with, turn_of,
+    start, start_with, turn_of,
 };
 use super::lanes::direct_inner;
 use super::prefix_disk_tests::{Root, disk, on_disk, settle};
@@ -217,6 +217,175 @@ fn concat(parts: &[&[u32]]) -> Vec<u32> {
     parts.concat()
 }
 
+/// Finds a prompt of `len` words whose plain greedy turn runs all `max_new`
+/// tokens and returns that prompt together with the `Driver` and `Said` so
+/// callers never re-run the first turn.
+fn full_length_driver(
+    make: impl Fn() -> Inner,
+    len: usize,
+    max_new: i32,
+    seed: u32,
+) -> (Vec<u32>, Driver, Said) {
+    for k in 0..16 {
+        let tokens = prompt(len, seed + 17 * k);
+        let mut driver = Driver::new(make());
+        let said = driver.turn("a", &tokens, max_new, false);
+        if said.turn.finish == "length" {
+            return (tokens, driver, said);
+        }
+    }
+    panic!("no prompt ran {max_new} tokens");
+}
+
+struct LayerRowsSnapshot {
+    shape: Vec<i64>,
+    keys: Vec<u32>,
+    values: Vec<u32>,
+}
+
+struct RowsSnapshot {
+    logical_len: i32,
+    token_history: Vec<u32>,
+    layers: Vec<Option<LayerRowsSnapshot>>,
+}
+
+fn snapshot_rows(cache: &DFlash2ContextCache) -> RowsSnapshot {
+    let bits = |a: &MxArray| -> Vec<u32> { f32s(a).iter().map(|v| v.to_bits()).collect() };
+    let layers = cache
+        .window_views()
+        .into_iter()
+        .map(|opt| {
+            opt.map(|(k, v)| LayerRowsSnapshot {
+                shape: k.shape().unwrap().to_vec(),
+                keys: bits(&k),
+                values: bits(&v),
+            })
+        })
+        .collect();
+    RowsSnapshot {
+        logical_len: cache.logical_len(),
+        token_history: cache.token_history().to_vec(),
+        layers,
+    }
+}
+
+fn assert_rows_match_snapshot(got: &DFlash2ContextCache, want: &RowsSnapshot, what: &str) {
+    assert_eq!(got.logical_len(), want.logical_len, "{what}: length");
+    assert_eq!(
+        got.token_history(),
+        want.token_history.as_slice(),
+        "{what}: tokens"
+    );
+    let bits = |a: &MxArray| -> Vec<u32> { f32s(a).iter().map(|v| v.to_bits()).collect() };
+    let got_views = got.window_views();
+    assert_eq!(got_views.len(), want.layers.len(), "{what}: layers");
+    for (layer, (got, want)) in got_views.iter().zip(&want.layers).enumerate() {
+        let same = match (got, want) {
+            (Some((gk, gv)), Some(want_layer)) => {
+                gk.shape().unwrap().as_ref() == want_layer.shape.as_slice()
+                    && bits(gk) == want_layer.keys
+                    && bits(gv) == want_layer.values
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        assert!(same, "{what}: layer {layer}: the K/V rows");
+    }
+}
+
+struct PersistentCacheBaseline {
+    draft: Arc<DFlash2Model>,
+    first: Vec<u32>,
+    a1: Turn,
+    of_b: Vec<u32>,
+    b: Turn,
+    second: Vec<u32>,
+    a2: Turn,
+    third: Vec<u32>,
+    plain3: Turn,
+    namespace: String,
+    plain_files: Vec<(String, Vec<u8>)>,
+    want_b: RowsSnapshot,
+    want3: RowsSnapshot,
+}
+
+fn persistent_cache_baseline() -> &'static PersistentCacheBaseline {
+    static BASELINE: std::sync::OnceLock<PersistentCacheBaseline> = std::sync::OnceLock::new();
+    BASELINE.get_or_init(|| {
+        let _host = memory::scoped_fixture_host();
+        let model = || chat_model(reuse_over(direct_inner()));
+        let c = super::route_step::moe_shape_config();
+        let draft = Arc::new(moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers));
+        let (first, plain_root, mut plain, a1) = {
+            let mut found = None;
+            for k in 0..16 {
+                let tokens = prompt(66, 3 + 17 * k);
+                let root = Root::new();
+                let mut driver = Driver::new(on_disk(model(), &root));
+                let said = driver.turn("a", &tokens, 4, false);
+                if said.turn.finish == "length" {
+                    found = Some((tokens, root, driver, said));
+                    break;
+                }
+            }
+            found.expect("no prompt ran 4 tokens")
+        };
+        settle(&mut plain.state.inner);
+        let h1 = a1.turn.tokens.clone();
+        let of_b = concat(&[&h1, &prompt(1, 21)]);
+        let b = plain.turn("b", &of_b, 4, false);
+        settle(&mut plain.state.inner);
+        let second = concat(&[&h1, &prompt(30, 23)]);
+        let a2 = plain.turn("a", &second, 6, false);
+        settle(&mut plain.state.inner);
+        assert_eq!(b.cached as usize, RESTORED, "plain: b restores a1's state");
+        assert_eq!(a2.cached as usize, h1.len(), "plain: a2 resumes its row");
+        drop(plain);
+
+        let namespace = plain_root
+            .namespace()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let plain_files = objects(&plain_root);
+
+        let third = concat(&[&h1, &prompt(5, 29)]);
+        let mut reference = Driver::new(on_disk(model(), &plain_root));
+        let plain3 = reference.turn("a", &third, 6, false);
+        let restored = reference
+            .state
+            .inner
+            .telemetry
+            .disk_restored
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            (plain3.cached as usize, restored),
+            (RESTORED, 1),
+            "plain store, plain model: restored from disk"
+        );
+        drop(reference);
+
+        let want_b = snapshot_rows(&rebuilt(model(), &draft, &of_b, RESTORED));
+        let want3 = snapshot_rows(&rebuilt(model(), &draft, &third, RESTORED));
+        PersistentCacheBaseline {
+            draft,
+            first,
+            a1: a1.turn,
+            of_b,
+            b: b.turn,
+            second,
+            a2: a2.turn,
+            third,
+            plain3: plain3.turn,
+            namespace,
+            plain_files,
+            want_b,
+            want3,
+        }
+    })
+}
+
 /// A drafted turn, then a second turn on the same sequence. At the first
 /// turn's end the context holds the turn's rows with the K/V a stepper's
 /// own cycles over the same forced proposals give, and no layer is tapped.
@@ -231,12 +400,9 @@ fn a_drafted_turn_carries_its_context_into_the_next_turn() {
     const FIRST: i32 = 12;
     const SECOND: i32 = 8;
     let model = || chat_model(reuse_over(direct_inner()));
-    let c = model().decoder.config.clone();
+    let c = super::route_step::moe_shape_config();
     let draft = Arc::new(moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers));
-    let (first, _) = full_length(model, 40, FIRST, 1);
-
-    let mut plain = Driver::new(model());
-    let plain1 = plain.turn("a", &first, FIRST, false);
+    let (first, mut plain, plain1) = full_length_driver(model, 40, FIRST, 1);
     let h1 = plain1.turn.tokens.clone();
     let second = concat(&[&h1, &prompt(3, 7)]);
     let plain2 = plain.turn("a", &second, SECOND, false);
@@ -332,12 +498,9 @@ fn rows_from_the_rule_leave_the_plain_state() {
     // every later one is right.
     const REFUSED: usize = 8;
     let model = || chat_model(reuse_over(direct_inner()));
-    let c = model().decoder.config.clone();
+    let c = super::route_step::moe_shape_config();
     let draft = Arc::new(moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers));
-    let (first, _) = full_length(model, 40, FIRST, 5);
-
-    let mut plain = Driver::new(model());
-    let plain1 = plain.turn("a", &first, FIRST, false);
+    let (first, mut plain, plain1) = full_length_driver(model, 40, FIRST, 5);
     let mut run = Driver::new(with_draft(model(), &draft));
     run.rule = true;
     let vocab = c.vocab_size as u32;
@@ -467,46 +630,30 @@ fn drafted_turns_on_the_rows_rule_keep_the_persistent_cache() {
 fn keeps_the_persistent_cache(rule: bool, early: bool) {
     let _host = memory::scoped_fixture_host();
     let model = || chat_model(reuse_over(direct_inner()));
-    let c = model().decoder.config.clone();
-    let draft = Arc::new(moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers));
-    let (first, _) = full_length(model, 66, 4, 3);
-
-    let plain_root = Root::new();
-    let mut plain = Driver::new(on_disk(model(), &plain_root));
-    let a1 = plain.turn("a", &first, 4, false);
-    settle(&mut plain.state.inner);
-    let h1 = a1.turn.tokens.clone();
-    let of_b = concat(&[&h1, &prompt(1, 21)]);
-    let b = plain.turn("b", &of_b, 4, false);
-    settle(&mut plain.state.inner);
-    let second = concat(&[&h1, &prompt(30, 23)]);
-    let a2 = plain.turn("a", &second, 6, false);
-    settle(&mut plain.state.inner);
-    assert_eq!(b.cached as usize, RESTORED, "plain: b restores a1's state");
-    assert_eq!(a2.cached as usize, h1.len(), "plain: a2 resumes its row");
-    drop(plain);
+    let base = persistent_cache_baseline();
+    let draft = Arc::clone(&base.draft);
+    let h1 = &base.a1.tokens;
 
     let drafted_root = Root::new();
     let mut run = Driver::new(with_draft(on_disk(model(), &drafted_root), &draft));
     run.rule = rule;
     let handle = disk(&run.state.inner).tier_handle();
-    run.force(&a1.turn.tokens);
+    run.force(&base.a1.tokens);
     let got_a1 = if early {
         run.state.inner.disk.as_mut().unwrap().delay = std::time::Duration::ZERO;
-        run.drafted("a", &first, 4, |inner| inner.step_disk_now())
+        run.drafted("a", &base.first, 4, |inner| inner.step_disk_now())
     } else {
-        run.turn("a", &first, 4, true)
+        run.turn("a", &base.first, 4, true)
     };
     let mode_a1 = run.state.inner.telemetry.mode(&handle);
     let offered_a1 = run.slot().offered.len();
     let mut ruled = vec![run.slot().chosen.len()];
     settle(&mut run.state.inner);
-    let want_b = rebuilt(model(), &draft, &of_b, RESTORED);
-    run.force(&b.turn.tokens);
-    let got_b = run.drafted("b", &of_b, 4, |inner| {
-        assert_same_rows(
+    run.force(&base.b.tokens);
+    let got_b = run.drafted("b", &base.of_b, 4, |inner| {
+        assert_rows_match_snapshot(
             context(inner),
-            &want_b,
+            &base.want_b,
             "b, restored in memory: the context at its first proposal",
         );
     });
@@ -514,8 +661,8 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
     let offered_b = run.slot().offered.len();
     ruled.push(run.slot().chosen.len());
     settle(&mut run.state.inner);
-    run.force(&a2.turn.tokens);
-    let got_a2 = run.turn("a", &second, 6, true);
+    run.force(&base.a2.tokens);
+    let got_a2 = run.turn("a", &base.second, 6, true);
     let mode_a2 = run.state.inner.telemetry.mode(&handle);
     let offered_a2 = run.slot().offered.len();
     ruled.push(run.slot().chosen.len());
@@ -529,7 +676,7 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
         "rule {rule}: the rows rule's calls per drafted turn: {ruled:?}"
     );
 
-    let plain_files = objects(&plain_root);
+    let plain_files = &base.plain_files;
     let drafted_files = objects(&drafted_root);
     const RECORD: &str = ".dflash2_state.safetensors";
     let names = |files: &[(String, Vec<u8>)], records: bool| -> Vec<String> {
@@ -549,23 +696,23 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
         };
         assert_ne!(
             stamps(&drafted_files),
-            stamps(&plain_files),
+            stamps(plain_files),
             "a1's record written before a1's end: an older stamp"
         );
     }
-    let states = names(&plain_files, true).len();
+    let states = names(plain_files, true).len();
     assert!(states >= 1, "the plain turns wrote a state");
     assert_eq!(
         names(&drafted_files, true),
-        names(&plain_files, true),
+        names(plain_files, true),
         "the drafted turns' state records: names"
     );
     assert_eq!(
         names(&drafted_files, false),
-        names(&plain_files, false),
+        names(plain_files, false),
         "the drafted turns' files: names"
     );
-    for ((name, got), (_, want)) in drafted_files.iter().zip(&plain_files) {
+    for ((name, got), (_, want)) in drafted_files.iter().zip(plain_files) {
         let parts: fn(&[u8]) -> (serde_json::Value, &[u8]) = if name.ends_with(RECORD) {
             record_parts
         } else {
@@ -590,9 +737,9 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
             .sum::<usize>()
     );
 
-    assert_eq!(got_a1.turn, a1.turn, "a1");
-    assert_eq!(got_b.turn, b.turn, "b");
-    assert_eq!(got_a2.turn, a2.turn, "a2");
+    assert_eq!(got_a1.turn, base.a1, "a1");
+    assert_eq!(got_b.turn, base.b, "b");
+    assert_eq!(got_a2.turn, base.a2, "a2");
     assert_eq!(got_b.cached as usize, RESTORED, "b restores a1's state");
     assert_eq!(got_a2.cached as usize, h1.len(), "a2 resumes its row");
     assert_eq!(
@@ -607,25 +754,11 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
     assert_eq!(starts, [(seq_a, true), (seq_b, true), (seq_a, true)]);
     assert!(taps, "no layer is tapped after the turns");
 
-    let third = concat(&[&h1, &prompt(5, 29)]);
-    let mut reference = Driver::new(on_disk(model(), &plain_root));
-    let plain3 = reference.turn("a", &third, 6, false);
-    let restored = reference
-        .state
-        .inner
-        .telemetry
-        .disk_restored
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        (plain3.cached as usize, restored),
-        (RESTORED, 1),
-        "plain store, plain model: restored from disk"
-    );
-    drop(reference);
-    let want3 = rebuilt(model(), &draft, &third, RESTORED);
+    let plain_copy = Root::new();
+    plain_copy.seed_namespace(&base.namespace, plain_files);
     for (name, root, attach) in [
         ("drafted store, drafted model", &drafted_root, true),
-        ("plain store, drafted model", &plain_root, true),
+        ("plain store, drafted model", &plain_copy, true),
         ("drafted store, plain model", &drafted_root, false),
     ] {
         let inner = on_disk(model(), root);
@@ -638,18 +771,18 @@ fn keeps_the_persistent_cache(rule: bool, early: bool) {
         run.rule = rule;
         let handle = disk(&run.state.inner).tier_handle();
         let got = if attach {
-            run.force(&plain3.turn.tokens);
-            run.drafted("a", &third, 6, |inner| {
-                assert_same_rows(
+            run.force(&base.plain3.tokens);
+            run.drafted("a", &base.third, 6, |inner| {
+                assert_rows_match_snapshot(
                     context(inner),
-                    &want3,
+                    &base.want3,
                     &format!("{name}: the context at the first proposal"),
                 );
             })
         } else {
-            run.turn("a", &third, 6, false)
+            run.turn("a", &base.third, 6, false)
         };
-        assert_eq!(got.turn, plain3.turn, "{name}: the plain text");
+        assert_eq!(got.turn, base.plain3, "{name}: the plain text");
         let restored = run
             .state
             .inner
@@ -692,12 +825,9 @@ fn a_regenerate_and_an_edit_draft_on_a_rebuilt_context() {
     let _host = memory::scoped_fixture_host();
     const MAX_NEW: i32 = 12;
     let model = || chat_model(reuse_over(direct_inner()));
-    let c = model().decoder.config.clone();
+    let c = super::route_step::moe_shape_config();
     let draft = Arc::new(moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers));
-    let (first, _) = full_length(model, 66, MAX_NEW, 9);
-
-    let mut plain = Driver::new(model());
-    let a1 = plain.turn("a", &first, MAX_NEW, false);
+    let (first, mut plain, a1) = full_length_driver(model, 66, MAX_NEW, 9);
     let h1 = a1.turn.tokens.clone();
     let second = concat(&[&h1, &prompt(5, 31)]);
     let a2 = plain.turn("a", &second, MAX_NEW, false);

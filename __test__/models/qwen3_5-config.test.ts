@@ -1,5 +1,6 @@
-import { QWEN35_CONFIGS, getQwen35Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
+
+import { QWEN35_CONFIGS, getQwen35Config } from '../../packages/lm/src/models/qwen3_5-configs.js';
 
 describe('Qwen3.5 Config', () => {
   it('should have valid config presets', () => {

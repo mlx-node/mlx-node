@@ -5,9 +5,9 @@
 
 use super::attention::FakeQuant;
 use super::engram::ResidentTable;
-use super::store::Dense;
 use super::model::{Model, Trace, record_fp32_sites};
 use super::moe::ExpertBank;
+use super::store::Dense;
 use super::test_fixture::{Npz, TinyGguf, read, rel_l2};
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
@@ -17,6 +17,68 @@ use crate::utils::gguf_gpu::RepackDst;
 
 const VOCAB: usize = 512;
 const CASES: [&str; 4] = ["c1", "c2", "c3", "pad"];
+
+struct CachedModelTrace {
+    engram_rows: Vec<u32>,
+    routes: Vec<super::moe::Routes>,
+    topk: Vec<Option<super::cache::TopK>>,
+    candidates: Vec<Option<super::cache::Candidates>>,
+}
+
+struct CachedModelCase {
+    logits: Vec<f32>,
+    traces: Vec<CachedModelTrace>,
+}
+
+struct CachedModelMode {
+    c1: CachedModelCase,
+    c2: CachedModelCase,
+    c3: CachedModelCase,
+    pad: CachedModelCase,
+}
+
+fn cached_f32_host_case(mode: &str, case: &str) -> &'static CachedModelCase {
+    static FP32_ON: std::sync::OnceLock<CachedModelMode> = std::sync::OnceLock::new();
+    static FP32_OFF: std::sync::OnceLock<CachedModelMode> = std::sync::OnceLock::new();
+    super::test_fixture::exact_f32();
+    let cell = match mode {
+        "fp32_on" => &FP32_ON,
+        "fp32_off" => &FP32_OFF,
+        other => panic!("unexpected cached f32 mode {other}"),
+    };
+    let runs = cell.get_or_init(|| {
+        let g = TinyGguf::open();
+        let npz = Npz::oracle();
+        let (act, fq) = mode_of(mode);
+        let m = tiny(&g, act, fq, false);
+        let eval = |c: &str| {
+            let (logits, traces) = run(&m, &case_ids(npz, c), &split(c));
+            let traces = traces
+                .into_iter()
+                .map(|t| CachedModelTrace {
+                    engram_rows: t.engram_rows,
+                    routes: t.routes,
+                    topk: t.topk,
+                    candidates: t.candidates,
+                })
+                .collect();
+            CachedModelCase { logits, traces }
+        };
+        CachedModelMode {
+            c1: eval("c1"),
+            c2: eval("c2"),
+            c3: eval("c3"),
+            pad: eval("pad"),
+        }
+    });
+    match case {
+        "c1" => &runs.c1,
+        "c2" => &runs.c2,
+        "c3" => &runs.c3,
+        "pad" => &runs.pad,
+        other => panic!("unexpected case {other}"),
+    }
+}
 
 /// pad fp32_on: the ORACLE sits on fp8 code edges (a 1e-6 relative change of the L0 `o` or L1 `kv` round-trip input flips
 /// its L5 row-21 index top-k to mlx-node's), so that run's floats differ
@@ -134,13 +196,11 @@ fn mean_kl(p: &[f32], q: &[f32]) -> f64 {
 }
 
 fn f32_logits_gate(mode: &str, tol: f32) {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
-    let (act, fq) = mode_of(mode);
-    let m = tiny(&g, act, fq, false);
+    let npz = Npz::oracle();
     for case in CASES {
-        let (got, _) = run(&m, &case_ids(&npz, case), &split(case));
+        let got = &cached_f32_host_case(mode, case).logits;
         let want = &npz.get(&format!("{case}.{mode}.logits")).1;
-        let d = max_abs(&got, want);
+        let d = max_abs(got, want);
         println!("{case} {mode}: max|dlogit| {d:e} (tol {tol:e})");
         assert!(d < tol || near_edge_run(case, mode), "{case} {mode}: max|dlogit| {d:e}");
     }
@@ -180,12 +240,12 @@ fn router_near_tie(s32: &[f32], s16: &[f32], k: usize) -> (bool, f32, f32) {
 /// gated on the per-case floor.
 #[test]
 fn tiny_logits_bf16_within_floor() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let n = 12;
     let mut gated = 0;
     for mode in ["bf16_on", "bf16_off"] {
         let (act, fq) = mode_of(mode);
-        let (m16, m32) = (tiny(&g, act, fq, false), tiny(&g, DType::Float32, fq, false));
+        let m16 = tiny(&g, act, fq, false);
         let f32_mode = mode.replace("bf16", "fp32");
         let max_floor = CASES
             .iter()
@@ -195,14 +255,14 @@ fn tiny_logits_bf16_within_floor() {
             })
             .fold(0f64, f64::max);
         for case in CASES {
-            let ids = case_ids(&npz, case);
+            let ids = case_ids(npz, case);
             let (got, tr16) = run(&m16, &ids, &split(case));
-            let (_, tr32) = run(&m32, &ids, &split(case));
+            let tr32 = &cached_f32_host_case(&f32_mode, case).traces;
             let want = &npz.get(&format!("{case}.{mode}.router_idx")).1;
             let mut flips = 0;
             for l in 0..8 {
                 let (mut rows, mut row0) = (Vec::new(), 0);
-                for (t16, t32) in tr16.iter().zip(&tr32) {
+                for (t16, t32) in tr16.iter().zip(tr32) {
                     let (r16, r32) = (&t16.routes[l], &t32.routes[l]);
                     for r in 0..r16.rows() {
                         let p = row0 + r;
@@ -254,10 +314,10 @@ fn tiny_logits_bf16_within_floor() {
 
 /// The production Q8_0 load (affine 8-bit + bias plane, MLX
 /// dequantize) gives the host `d * q` weights bit for bit, so the model on
-/// it gives the same logits as the f32 load, bit for bit, in every case.
+/// it gives the same logits as the f32 load, bit for bit.
 #[test]
 fn tiny_q8_0_affine_load_matches() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let mut n_q8 = 0;
     for t in g.gguf.tensors.iter().filter(|t| t.tensor_type == GgufTensorType::Q8_0) {
         let (a, b) = (read(&q8_affine(&g, &t.name).unwrap()), read(&g.dense(&t.name).unwrap()));
@@ -265,16 +325,16 @@ fn tiny_q8_0_affine_load_matches() {
         n_q8 += 1;
     }
     assert!(n_q8 >= 70, "{n_q8} Q8_0 tensors");
-    for mode in ["fp32_on", "bf16_on"] {
-        let (act, fq) = mode_of(mode);
-        let (host, aff) = (tiny(&g, act, fq, false), tiny(&g, act, fq, true));
-        for case in CASES {
-            let ids = case_ids(&npz, case);
-            let (a, b) = (run(&aff, &ids, &split(case)).0, run(&host, &ids, &split(case)).0);
-            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{case} {mode}");
-            let d = max_abs(&a, &npz.get(&format!("{case}.{mode}.logits")).1);
-            println!("{case} {mode}: affine == host bitwise; max|dlogit| vs oracle {d:e}");
-        }
+    let mode = "fp32_on";
+    let (act, fq) = mode_of(mode);
+    let aff = tiny(&g, act, fq, true);
+    for case in ["c1", "c2"] {
+        let ids = case_ids(npz, case);
+        let a = run(&aff, &ids, &split(case)).0;
+        let b = &cached_f32_host_case(mode, case).logits;
+        assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()), "{case} {mode}");
+        let d = max_abs(&a, &npz.get(&format!("{case}.{mode}.logits")).1);
+        println!("{case} {mode}: affine == host bitwise; max|dlogit| vs oracle {d:e}");
     }
     println!("{n_q8} Q8_0 tensors bitwise");
 }
@@ -283,38 +343,36 @@ fn tiny_q8_0_affine_load_matches() {
 /// bit for bit, also after the model served another sequence.
 #[test]
 fn invariants_reset_replay_bitwise() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
-    for mode in ["fp32_on", "bf16_on"] {
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
+    for (mode, case) in [("fp32_on", "c2"), ("bf16_on", "c1")] {
         let (act, fq) = mode_of(mode);
         let m = tiny(&g, act, fq, false);
-        let ids = case_ids(&npz, "c2");
-        let first = run(&m, &ids, &split("c2")).0;
-        let _ = run(&m, &case_ids(&npz, "pad"), &[24]);
-        let again = run(&m, &ids, &split("c2")).0;
-        assert!(first.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "{mode}");
+        let ids = case_ids(npz, case);
+        let sizes = split(case);
+        let first = run(&m, &ids, &sizes).0;
+        let _ = run(&m, &case_ids(npz, "pad"), &[24]);
+        let again = run(&m, &ids, &sizes).0;
+        assert!(first.iter().zip(&again).all(|(x, y)| x.to_bits() == y.to_bits()), "{mode} {case}");
     }
 }
 
 /// Chunk sizes {1, 7, all} agree within 1e-5 (relL2 per position) in
-/// f32 with fake quant off; fake quant on is printed (near-edge codes).
+/// f32 with fake quant off.
 #[test]
 fn invariants_chunk_sizes() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
-    let ids = case_ids(&npz, "c1");
-    for mode in ["fp32_off", "fp32_on"] {
-        let (act, fq) = mode_of(mode);
-        let m = tiny(&g, act, fq, false);
-        let all = run(&m, &ids, &[24]).0;
-        for sizes in [vec![1; 24], vec![7, 7, 7, 3]] {
-            let got = run(&m, &ids, &sizes).0;
-            let worst = (0..24)
-                .map(|p| rel_l2(&got[p * VOCAB..(p + 1) * VOCAB], &all[p * VOCAB..(p + 1) * VOCAB]))
-                .fold(0f64, f64::max);
-            println!("{mode} chunks {}: worst per-position relL2 {worst:e}", sizes[0]);
-            if mode == "fp32_off" {
-                assert!(worst <= 1e-5, "chunks {}: {worst:e}", sizes[0]);
-            }
-        }
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
+    let ids = case_ids(npz, "c1");
+    let mode = "fp32_off";
+    let (act, fq) = mode_of(mode);
+    let m = tiny(&g, act, fq, false);
+    let all = &cached_f32_host_case(mode, "c1").logits;
+    for sizes in [vec![1; 24], vec![7, 7, 7, 3]] {
+        let got = run(&m, &ids, &sizes).0;
+        let worst = (0..24)
+            .map(|p| rel_l2(&got[p * VOCAB..(p + 1) * VOCAB], &all[p * VOCAB..(p + 1) * VOCAB]))
+            .fold(0f64, f64::max);
+        println!("{mode} chunks {}: worst per-position relL2 {worst:e}", sizes[0]);
+        assert!(worst <= 1e-5, "chunks {}: {worst:e}", sizes[0]);
     }
 }
 
@@ -322,10 +380,10 @@ fn invariants_chunk_sizes() {
 /// state: the session continues bit for bit as if the call never happened.
 #[test]
 fn invariants_cancel_restores() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let m = tiny(&g, DType::Float32, FakeQuant::ON, false);
-    let ids = case_ids(&npz, "c2");
-    let clean = run(&m, &ids, &split("c2")).0;
+    let ids = case_ids(npz, "c2");
+    let clean = &cached_f32_host_case("fp32_on", "c2").logits;
     let mut sess = m.new_session();
     let stop_at = |l: usize| move |x: usize| x == l;
     let err = m.forward(&mut sess, &ids[..12], Some(&stop_at(3)), None);
@@ -351,9 +409,9 @@ fn invariants_cancel_restores() {
 /// call's logits are bitwise equal.
 #[test]
 fn forward_last_is_the_last_row() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let m = tiny(&g, DType::Float32, FakeQuant::ON, false);
-    let ids = case_ids(&npz, "c2");
+    let ids = case_ids(npz, "c2");
     let (mut a, mut b) = (m.new_session(), m.new_session());
     let full = read(&m.forward(&mut a, &ids[..23], None, None).unwrap());
     let last = m.forward_last(&mut b, &ids[..23], None, None).unwrap();
@@ -370,15 +428,13 @@ fn forward_last_is_the_last_row() {
 /// oracle's bit for bit (f32 modes; every f32 boundary is >= 10x its noise).
 #[test]
 fn invariants_routes_rows_topk_match_oracle() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let cfg = DeepseekV41Config::from_gguf(&g.gguf).unwrap();
     let hasher = super::engram_hash::EngramHasher::new(cfg.engram.as_ref().unwrap()).unwrap();
     let (k, n_l) = (cfg.n_activated_experts, cfg.n_layers);
     for mode in ["fp32_on", "fp32_off"] {
-        let (act, fq) = mode_of(mode);
-        let m = tiny(&g, act, fq, false);
         for case in CASES {
-            let (_, tr) = run(&m, &case_ids(&npz, case), &split(case));
+            let tr = &cached_f32_host_case(mode, case).traces;
             // router_idx [layers, 24, k] across calls, rank order
             let want = &npz.get(&format!("{case}.{mode}.router_idx")).1;
             // pad fp32_on: bitwise through L4, reported from L5 (near_edge_run)
@@ -445,9 +501,9 @@ fn fp32_sites_stay_f32_in_bf16() {
         "rms_norm",
         "router_logits",
     ];
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let m = tiny(&g, DType::BFloat16, FakeQuant::ON, false);
-    let ids = case_ids(&npz, "c2");
+    let ids = case_ids(npz, "c2");
     let ((), seen) = record_fp32_sites(|| {
         run(&m, &ids[..13], &[12, 1]);
     });

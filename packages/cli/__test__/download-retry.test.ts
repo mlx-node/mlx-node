@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test';
 
-import { isRetriableFetchError, withRetries } from '../src/commands/download-model.js';
+import { isRetriableFetchError, withRetries } from '../src/commands/download-model-helpers.js';
 
 /** A `HubApiError`-shaped failure: what `@huggingface/hub` actually throws. */
 function hubError(statusCode: number): Error {

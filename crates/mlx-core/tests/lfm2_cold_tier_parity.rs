@@ -11,7 +11,7 @@
 //! ```shell
 //! MLX_COLD_CACHE_DIR=$(mktemp -d) \
 //! MLX_TEST_MODEL_PATH=.cache/models/lfm2.5-1.2b-thinking-mlx \
-//! cargo test -p mlx-core --release --test lfm2_cold_tier_parity -- \
+//! cargo test -p mlx-core --release --features e2e-tests --test lfm2_cold_tier_parity -- \
 //!   --ignored --test-threads=1 --nocapture
 //! ```
 

@@ -55,6 +55,7 @@ import {
 import type { ChatScope } from './rpc/protocol.js';
 import { SystemOneService, type SystemOneJobSnapshot } from './systemone.js';
 import { startDbWorker, type DbWorkerLifecycle, type WorkerQueue } from './worker/client.js';
+import { startInProcessDbWorker } from './worker/in-process.js';
 
 /** Incremental rescan cadence while the runtime is alive. */
 const INGEST_INTERVAL_MS = 30_000;
@@ -123,6 +124,12 @@ export interface DashboardRuntimeOptions {
    * Electron the worker must load from an unpacked path outside the asar archive.
    */
   workerUrl?: URL | string;
+  /**
+   * Run the database worker in-process instead of spawning a worker thread.
+   * Intended for API tests that spin up many isolated runtimes; production always
+   * uses the default (`false`, dedicated worker thread).
+   */
+  inProcessWorker?: boolean;
   /**
    * How long each shutdown step waits for the worker before it is terminated
    * outright. A supervisor with its own quit deadline (Electron's `before-quit`)
@@ -308,10 +315,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   // Spawning is asynchronous but `new Worker` is not, and messages queue on the
   // port until the thread is up — so the factory stays synchronous and no caller
   // has to await readiness.
-  const worker = startDbWorker({
-    workerUrl: opts.workerUrl ?? defaultWorkerUrl(),
-    shutdownTimeoutMs: opts.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
-    ...(opts.workerRequestTimeoutMs === undefined ? {} : { requestTimeoutMs: opts.workerRequestTimeoutMs }),
+  const workerBoot = {
     onLifecycle: opts.onLifecycle ?? ((): void => {}),
     dbPath,
     modelsDir,
@@ -322,7 +326,15 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     agentHome,
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
-  });
+  };
+  const worker = opts.inProcessWorker
+    ? startInProcessDbWorker(workerBoot)
+    : startDbWorker({
+        workerUrl: opts.workerUrl ?? defaultWorkerUrl(),
+        shutdownTimeoutMs: opts.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+        ...(opts.workerRequestTimeoutMs === undefined ? {} : { requestTimeoutMs: opts.workerRequestTimeoutMs }),
+        ...workerBoot,
+      });
   const downloads = new DownloadManager({
     modelsDir,
     ...(opts.moveToTrash === undefined ? {} : { moveToTrash: opts.moveToTrash }),

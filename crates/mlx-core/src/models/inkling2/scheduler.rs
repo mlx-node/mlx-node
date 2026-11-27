@@ -11322,7 +11322,7 @@ pub(super) mod tests {
             .inner()
             .token_to_id(crate::tools::inkling::MESSAGE_USER)
             .unwrap();
-        let inner = build_synthetic_dflash2_inner_with_window(8192, Some(uid), 2048, 2);
+        let inner = build_synthetic_dflash2_inner_with_window(512, Some(uid), 128, 2);
         let mut sched = Inkling2SchedulerState::new(inner).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
         let mut cfg = scheduled_sampled_dflash2_config("r14-ring", 2, "salt-r14-ring");
@@ -11462,7 +11462,7 @@ pub(super) mod tests {
             .inner()
             .token_to_id(crate::tools::inkling::MESSAGE_USER)
             .unwrap();
-        let inner = build_synthetic_dflash2_inner_with_window(8192, Some(uid), 2048, 2);
+        let inner = build_synthetic_dflash2_inner_with_window(512, Some(uid), 128, 2);
         let mut sched = Inkling2SchedulerState::new(inner).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
 

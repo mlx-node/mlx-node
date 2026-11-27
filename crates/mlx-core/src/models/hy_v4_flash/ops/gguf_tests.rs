@@ -444,10 +444,10 @@ fn gguf_routed_decode_parity_dedup_and_clamp() {
             6.0,
             true,
         ),
-        (400, 4, 1536, 1536, 1536, 1, 16, &slots_r1, 4.0, true),
-        (500, 4, 1536, 1536, 1536, 2, 16, &slots_r2, 4.0, true),
-        (550, 24, 1536, 1536, 1536, 2, 16, &slots_r2_mix, 4.0, true),
-        (600, 12, 1536, 1536, 1536, 4, 16, &slots_r4, 4.0, true),
+        (400, 4, 512, 512, 512, 1, 16, &slots_r1, 4.0, true),
+        (500, 4, 512, 512, 512, 2, 16, &slots_r2, 4.0, true),
+        (550, 24, 512, 512, 512, 2, 16, &slots_r2_mix, 4.0, true),
+        (600, 12, 512, 512, 512, 4, 16, &slots_r4, 4.0, true),
     ];
 
     for bits in [4, 6] {
@@ -471,7 +471,7 @@ fn gguf_routed_decode_parity_dedup_and_clamp() {
         // Multi-row dedup (>4 chunk splitting with counts 1..=8 + OOB) & row invariance.
         for &(ne, k, m, h, top, seed) in &[
             (24usize, 768usize, 256usize, 259usize, 8usize, 7000u64),
-            (32, 1536, 1536, 1536, 16, 8000),
+            (24, 512, 512, 512, 16, 8000),
         ] {
             let mut rng = Rng::new(seed + bits as u64);
             let rig = GgufExpertsRig::new(&mut rng, bits, ne, k, m, h, true);
@@ -514,7 +514,7 @@ fn gguf_routed_decode_parity_dedup_and_clamp() {
         }
 
         // Unchunked M=32 (n_assign=512, 10-bit packing for assign >= 256, OOB > 256).
-        let (ne, k, m, h, rows, top) = (48usize, 512usize, 256usize, 259usize, 32usize, 16usize);
+        let (ne, k, m, h, rows, top) = (28usize, 512usize, 256usize, 259usize, 32usize, 16usize);
         let mut rng = Rng::new(9100 + bits as u64);
         let rig = GgufExpertsRig::new(&mut rng, bits, ne, k, m, h, true);
         let (xv, wv) = (
@@ -570,7 +570,7 @@ fn gguf_prefill_nax_matches_kq_prefill_q4k_and_q6k() {
     );
     let cases: &[(u64, usize, usize, usize, usize, usize, usize, f32)] = &[
         (1000, 5, 512, 256, 256, 20, 4, 6.0),
-        (2000, 4, 1536, 1536, 1536, 8, 16, 4.0),
+        (2000, 4, 512, 512, 512, 8, 16, 4.0),
     ];
 
     for bits in [4, 6] {

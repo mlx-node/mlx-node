@@ -24,6 +24,8 @@ import type { ChatResult, ToolCallResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { handleCreateResponse } from '../../packages/server/src/endpoints/responses.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';

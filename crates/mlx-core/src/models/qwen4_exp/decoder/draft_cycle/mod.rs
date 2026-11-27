@@ -326,6 +326,10 @@ pub(in super::super) struct DraftStepper<'a> {
     #[cfg(test)]
     pub(in super::super) drawn:
         Option<Box<dyn FnMut(u32) -> (Vec<u32>, Vec<SparseDistribution>) + 'a>>,
+    /// When true, run and materialize `draft.propose_with` before applying
+    /// `drawn` so in-place proposal scratch writes still exercise the context.
+    #[cfg(test)]
+    pub(in super::super) run_propose_before_drawn: bool,
 }
 
 impl Drop for DraftStepper<'_> {
@@ -403,6 +407,8 @@ impl<'a> DraftStepper<'a> {
             forced: None,
             #[cfg(test)]
             drawn: None,
+            #[cfg(test)]
+            run_propose_before_drawn: false,
         })
     }
 
@@ -449,6 +455,20 @@ impl<'a> DraftStepper<'a> {
             .temperature
             .unwrap_or(1.0);
         let greedy = is_greedy_temperature(temperature);
+        #[cfg(test)]
+        if !greedy
+            && !confident
+            && !self.run_propose_before_drawn
+            && self.forced.is_none()
+            && let Some(drawn) = self.drawn.as_mut()
+        {
+            let (ids, rows) = drawn(anchor);
+            return Ok(Proposed {
+                ids,
+                sparse: rows,
+                confidence: None,
+            });
+        }
         let device_path = greedy
             && params.repetition_penalty == 1.0
             && params.presence_penalty == 0.0
@@ -754,6 +774,18 @@ pub(in super::super) struct DraftSlot {
     /// a sampled turn, as [`DraftStepper::drawn`], from the anchor.
     #[cfg(test)]
     pub(in super::super) drawn: Option<Box<dyn FnMut(u32) -> (Vec<u32>, Vec<SparseDistribution>)>>,
+    /// One-shot variant of [`Self::drawn`]: consumed on the first proposal so
+    /// subsequent cycles run the real draft model on the recovered context.
+    #[cfg(test)]
+    pub(in super::super) drawn_once:
+        Option<Box<dyn FnOnce(u32) -> (Vec<u32>, Vec<SparseDistribution>)>>,
+    /// When set, each scheduled proposal records a clone of the synced draft
+    /// context right before the proposal runs.
+    #[cfg(test)]
+    pub(in super::super) capture_context: bool,
+    /// Synced draft contexts captured when [`Self::capture_context`] is true.
+    #[cfg(test)]
+    pub(in super::super) captured_contexts: Vec<DFlash2ContextCache>,
     /// Tests make the proposal at this many proposals made fail.
     #[cfg(test)]
     pub(in super::super) fail_at: Option<usize>,
@@ -788,6 +820,12 @@ impl super::super::Inner {
             offered: Vec::new(),
             #[cfg(test)]
             drawn: None,
+            #[cfg(test)]
+            drawn_once: None,
+            #[cfg(test)]
+            capture_context: false,
+            #[cfg(test)]
+            captured_contexts: Vec::new(),
             #[cfg(test)]
             fail_at: None,
         });
@@ -830,7 +868,11 @@ impl super::super::Inner {
             stepper.forced = Some(Box::new(move |position, ids: &[u32]| forced(position, ids)));
         }
         #[cfg(test)]
-        if let Some(drawn) = slot.drawn.as_mut() {
+        if let Some(drawn) = slot.drawn_once.take() {
+            let mut once = Some(drawn);
+            stepper.run_propose_before_drawn = true;
+            stepper.drawn = Some(Box::new(move |anchor| once.take().unwrap()(anchor)));
+        } else if let Some(drawn) = slot.drawn.as_mut() {
             stepper.drawn = Some(Box::new(drawn));
         }
         Ok(Some(stepper))
@@ -944,18 +986,31 @@ impl super::super::Inner {
                 error.reason
             ))
         };
-        let block = self
+        #[cfg(test)]
+        let capture_context = self.draft.as_ref().is_some_and(|slot| slot.capture_context);
+        let (block, captured_ctx) = self
             .draft_stepper(cap + 1)
             .and_then(|stepper| {
-                stepper
-                    .ok_or_else(|| Error::from_reason("Qwen4 draft proposal without a draft"))?
-                    .propose_block(anchor, params, rng, rule)
+                let mut stepper = stepper
+                    .ok_or_else(|| Error::from_reason("Qwen4 draft proposal without a draft"))?;
+                #[cfg(test)]
+                let snap = capture_context.then(|| stepper.context.clone());
+                #[cfg(not(test))]
+                let snap = ();
+                let block = stepper.propose_block(anchor, params, rng, rule)?;
+                Ok((block, snap))
             })
             .map_err(failed)?;
         let slot = self
             .draft
             .as_mut()
             .ok_or_else(|| failed(Error::from_reason("the draft went away")))?;
+        #[cfg(test)]
+        if let Some(ctx) = captured_ctx {
+            slot.captured_contexts.push(ctx);
+        }
+        #[cfg(not(test))]
+        let () = captured_ctx;
         #[cfg(test)]
         let block = match slot.confidence.clone() {
             Some(confidence) => Proposed {

@@ -87,6 +87,12 @@ pub(super) fn cold_on(mut inner: Inner, tokens: &[u32]) -> (Vec<f32>, Vec<Vec<f3
     (logits, steps)
 }
 
+pub(super) fn cold_logits_on(mut inner: Inner, tokens: &[u32]) -> Vec<f32> {
+    let (cached, logits) = turn(&mut inner, 1, tokens);
+    assert_eq!(cached, 0);
+    logits
+}
+
 fn depths(inner: &Inner) -> Vec<(usize, bool)> {
     let mut depths: Vec<_> = inner
         .prefix_states
@@ -108,8 +114,7 @@ fn depths(inner: &Inner) -> Vec<(usize, bool)> {
 fn a_follow_up_turn_resumes_at_the_stored_state_and_matches_a_cold_turn() {
     use crate::transformer::KvFormat;
     let _host = memory::scoped_fixture_host();
-    let dir = Temp::new();
-    write_wide_head_fixture(&dir.0);
+    let (wide, _) = wide_head_fixture();
     let halved = || {
         let mut inner = reuse_inner();
         let config = Arc::clone(&inner.decoder.config);
@@ -119,7 +124,7 @@ fn a_follow_up_turn_resumes_at_the_stored_state_and_matches_a_cold_turn() {
     let cases: [(&str, &dyn Fn() -> Inner); 3] = [
         ("bf16", &reuse_inner),
         ("int8", &|| {
-            reuse_over(wide_head_inner(&dir.0, KvFormat::Int8))
+            reuse_over(wide_head_inner(wide, KvFormat::Int8))
         }),
         ("halved", &halved),
     ];
@@ -882,8 +887,7 @@ fn passes(inner: &mut Inner) -> Vec<usize> {
 fn a_follow_up_resumes_at_the_block_before_the_generation_prompt() {
     use crate::transformer::KvFormat;
     let _host = memory::scoped_fixture_host();
-    let dir = Temp::new();
-    write_wide_head_fixture(&dir.0);
+    let (wide, _) = wide_head_fixture();
     let halved = || {
         let mut inner = cut_inner();
         let config = Arc::clone(&inner.decoder.config);
@@ -892,9 +896,7 @@ fn a_follow_up_resumes_at_the_block_before_the_generation_prompt() {
     };
     let cases: [(&str, &dyn Fn() -> Inner); 3] = [
         ("bf16", &cut_inner),
-        ("int8", &|| {
-            cut_over(wide_head_inner(&dir.0, KvFormat::Int8))
-        }),
+        ("int8", &|| cut_over(wide_head_inner(wide, KvFormat::Int8))),
         ("halved", &halved),
     ];
     let (a, b) = conversation();

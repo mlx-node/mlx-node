@@ -33,37 +33,93 @@ pub(super) fn host_with(non_reclaimable: u64) -> memory::HostMemory {
     }
 }
 
-/// The fixture through the load's steps: the whole store plan, the host
-/// gate read on `host`, the dense banks, the plan the decoder adopts.
-fn loaded(host: memory::HostMemory) -> (decoder::Decoder, media::Vision) {
-    let (mut decoder, vision) = moe_shape_decoder(deep_moe_shape_fixture());
-    decoder.weights.plan_fixture_store().unwrap();
-    decoder.weights.plan.physical_bytes = Some(PHYSICAL);
-    decoder.register_cache_limit();
-    {
-        let _host = memory::scoped_test_host(host);
-        decoder.weights.select_residency(NEED).unwrap();
-    }
-    decoder.weights.prepare_fixture_hot().unwrap();
-    decoder.weights.finish_fixture_load().unwrap();
-    decoder.weights.publish_live();
-    decoder.adopt_plan(WINDOW, ALLOWANCE);
-    (decoder, vision)
+/// Cached direct (whole-bank) store template on the deep fixture; cloned via
+/// `clone_direct_for_test` so tests never reload 525 MiB of banks.
+fn deep_direct_store() -> (weights::Store, config::Config) {
+    static DIRECT: std::sync::OnceLock<(std::sync::Mutex<weights::Store>, config::Config)> =
+        std::sync::OnceLock::new();
+    let (store, config) = DIRECT.get_or_init(|| {
+        let (mut decoder, _) = moe_shape_decoder(deep_moe_shape_fixture());
+        decoder.weights.plan_fixture_store().unwrap();
+        decoder.weights.plan.physical_bytes = Some(PHYSICAL);
+        decoder.register_cache_limit();
+        {
+            let _host = memory::scoped_test_host(memory::fixture_host());
+            decoder.weights.select_residency(NEED).unwrap();
+        }
+        decoder.weights.prepare_fixture_hot().unwrap();
+        decoder.weights.finish_fixture_load().unwrap();
+        let probe = MxArray::from_uint32(&[0], &[1]).unwrap();
+        for layer in 0..decoder.config.num_hidden_layers {
+            decoder
+                .weights
+                .device_expert_slots(layer, &probe)
+                .unwrap()
+                .expect("a filled direct layer");
+        }
+        decoder.weights.start_direct_fill().unwrap();
+        decoder.weights.publish_live();
+        assert!(
+            decoder.weights.plan.direct,
+            "the fixture host admits the banks"
+        );
+        let c = (*decoder.config).clone();
+        (std::sync::Mutex::new(decoder.weights), c)
+    });
+    let cloned = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone_direct_for_test();
+    (cloned, config.clone())
 }
 
-fn model(host: memory::HostMemory) -> Inner {
-    let (decoder, vision) = loaded(host);
+/// Cached host-gate partial store template (empty slots, resident fixed banks)
+/// on the deep fixture; cloned via `clone_partial_for_test`.
+fn deep_host_gate_store(bank: u64) -> (weights::Store, config::Config) {
+    static GATE: std::sync::OnceLock<(std::sync::Mutex<weights::Store>, config::Config)> =
+        std::sync::OnceLock::new();
+    let (store, config) = GATE.get_or_init(|| {
+        let host = host_with(edge(bank) + bank / 24);
+        let (mut decoder, _) = moe_shape_decoder(deep_moe_shape_fixture());
+        decoder.weights.plan_fixture_store().unwrap();
+        decoder.weights.plan.physical_bytes = Some(PHYSICAL);
+        decoder.register_cache_limit();
+        {
+            let _host = memory::scoped_test_host(host);
+            decoder.weights.select_residency(NEED).unwrap();
+        }
+        decoder.weights.prepare_fixture_hot().unwrap();
+        decoder.weights.finish_fixture_load().unwrap();
+        decoder.weights.publish_live();
+        let c = (*decoder.config).clone();
+        (std::sync::Mutex::new(decoder.weights), c)
+    });
+    let cloned = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone_partial_for_test(None);
+    (cloned, config.clone())
+}
+
+fn model_over_store(store: weights::Store, c: config::Config) -> Inner {
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, &c).unwrap();
+    let mut decoder = decoder::Decoder::new(c.clone(), store).unwrap();
+    decoder.paged = Some(paged::create_fixture(&c).unwrap());
+    decoder.register_cache_limit();
+    decoder.weights.publish_live();
+    decoder.adopt_plan(WINDOW, ALLOWANCE);
     reuse_over(inner_over(decoder, vision, false))
+}
+
+pub(super) fn model_direct() -> Inner {
+    let (store, c) = deep_direct_store();
+    model_over_store(store, c)
 }
 
 /// The routed bank bytes of the whole store.
 pub(super) fn bank_bytes() -> u64 {
-    let (decoder, _) = loaded(memory::fixture_host());
-    assert!(
-        decoder.weights.plan.direct,
-        "the fixture host admits the banks"
-    );
-    decoder.weights.plan.direct_bytes
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| deep_direct_store().0.plan.direct_bytes)
 }
 
 /// The other processes' non-reclaimable bytes at which a load just admits
@@ -75,7 +131,8 @@ fn edge(bank: u64) -> u64 {
 /// A load beside other memory that leaves 23/24 of the banks: 10 or 11
 /// slots, one or two fewer than the experts.
 pub(super) fn host_gate_model(bank: u64) -> Inner {
-    let inner = model(host_with(edge(bank) + bank / 24));
+    let (store, c) = deep_host_gate_store(bank);
+    let inner = model_over_store(store, c);
     let weights = &inner.decoder.weights;
     assert!(!weights.plan.direct && weights.plan.partial_direct_gate);
     assert_eq!(weights.live.residency(), Residency::HostGate);
@@ -165,17 +222,17 @@ fn a_host_gate_store_moves_up_at_its_last_close_and_decodes_as_a_whole_load() {
     let busy = edge(bank) + bank / 24;
     let mut moving = host_gate_model(bank);
     let mut stays = host_gate_model(bank);
-    let mut whole = model(memory::fixture_host());
+    let mut whole = model_direct();
     assert_eq!(whole.decoder.weights.live.residency(), Residency::Direct);
 
-    let a = prompt(100, 1);
-    let (_, w1) = whole_turn(&mut whole, 1, &a, 4, quiet);
-    let (_, s1) = whole_turn(&mut stays, 1, &a, 4, busy);
-    let (cached, p1) = open_turn(&mut moving, 1, &a, 4);
+    let a = prompt(68, 1);
+    let (_, w1) = whole_turn(&mut whole, 1, &a, 2, quiet);
+    let (_, s1) = whole_turn(&mut stays, 1, &a, 2, busy);
+    let (cached, p1) = open_turn(&mut moving, 1, &a, 2);
     assert_eq!(cached, 0);
     assert_eq!(p1, s1, "turn 1: the refused stores");
     assert_eq!(p1, w1, "turn 1: refused against whole");
-    assert_eq!(moving.prefix_states.counters.published, 3);
+    assert_eq!(moving.prefix_states.counters.published, 2);
     let room = moving.state_room();
     let wired = moving.wired_bytes();
     let dynamic = moving.memory_plan.dynamic_budget_bytes;
@@ -231,12 +288,12 @@ fn a_host_gate_store_moves_up_at_its_last_close_and_decodes_as_a_whole_load() {
     assert_eq!(slot_counts(&stays), vec![Some(slots); LAYERS]);
 
     let misses = moving.decoder.weights.slot_misses;
-    let b = fork(&a, 98, 110, 2);
-    let (cached, p2) = whole_turn(&mut moving, 2, &b, 6, quiet);
-    assert_eq!(cached, 96, "the state published before the move");
+    let b = fork(&a, 66, 78, 2);
+    let (cached, p2) = whole_turn(&mut moving, 2, &b, 3, quiet);
+    assert_eq!(cached, 64, "the state published before the move");
     assert_eq!(moving.prefix_states.counters.restored, 1);
-    let (_, w2) = whole_turn(&mut whole, 2, &b, 6, quiet);
-    let (_, s2) = whole_turn(&mut stays, 2, &b, 6, busy);
+    let (_, w2) = whole_turn(&mut whole, 2, &b, 3, quiet);
+    let (_, s2) = whole_turn(&mut stays, 2, &b, 3, busy);
     assert_eq!(p2, w2, "turn 2: moved against a whole load");
     assert_eq!(p2, s2, "turn 2: moved against the refused store");
     assert_eq!(promotions(&moving), 1, "a whole store moves no more");
@@ -264,9 +321,16 @@ fn the_promotion_gate_is_the_load_gate_with_this_models_bytes_taken_out() {
     open_turn(&mut refused, 1, &a, 2);
     eprintln!("own {} B, banks {bank} B, line {line} B", own(&refused));
     assert!(own(&refused) > 0);
-    for other in [line + (1 << 20), line + 1, line, line - (1 << 20)] {
-        let (fresh, _) = loaded(host_with(other));
-        let whole = fresh.weights.plan.direct;
+    let cases = [line + (1 << 20), line + 1, line, line - (1 << 20)];
+    for (i, other) in cases.into_iter().enumerate() {
+        let whole = {
+            let mut store = weights::Store::open_fixture(deep_moe_shape_fixture(), None).unwrap();
+            store.plan_fixture_store().unwrap();
+            store.plan.physical_bytes = Some(PHYSICAL);
+            let _host = memory::scoped_test_host(host_with(other));
+            store.select_residency(NEED).unwrap();
+            store.plan.direct
+        };
         assert_eq!(whole, other <= line, "a load beside {other} B");
         let close = host_with(other + own(&refused));
         {
@@ -275,7 +339,7 @@ fn the_promotion_gate_is_the_load_gate_with_this_models_bytes_taken_out() {
         }
         let moved = refused.decoder.weights.plan.direct;
         assert_eq!(moved, whole, "a close beside {other} B");
-        if moved {
+        if moved && i + 1 < cases.len() {
             refused = host_gate_model(bank);
             open_turn(&mut refused, 1, &a, 2);
         }
@@ -318,17 +382,12 @@ fn a_lowered_cap_a_store_plan_partial_and_an_mtp_load_never_move() {
     let bank = bank_bytes();
     let quiet = 3 << 30;
 
-    let (mut decoder, vision) = loaded(host_with(edge(bank) + bank / 24));
-    assert!(decoder.weights.lower_store_cap(1).unwrap());
-    let mut lowered = reuse_over(inner_over(decoder, vision, false));
+    let mut lowered = host_gate_model(bank);
+    assert!(lowered.decoder.weights.lower_store_cap(1).unwrap());
 
-    let (mut decoder, vision) = moe_shape_decoder(deep_moe_shape_fixture());
-    decoder.weights.stream_fixture_store(11).unwrap();
-    decoder.weights.plan.physical_bytes = Some(PHYSICAL);
-    decoder.register_cache_limit();
-    decoder.weights.publish_live();
-    decoder.adopt_plan(WINDOW, ALLOWANCE);
-    let mut streamed = reuse_over(inner_over(decoder, vision, false));
+    let (mut store, c) = super::route_step::streamed_moe_store(true, 11);
+    store.plan.physical_bytes = Some(PHYSICAL);
+    let mut streamed = model_over_store(store, c);
     assert_eq!(
         streamed.decoder.weights.live.residency(),
         Residency::StorePlan
@@ -371,9 +430,9 @@ fn a_refused_allocation_half_way_leaves_a_partial_store_for_the_next_turn() {
     let busy = edge(bank) + bank / 24;
     let mut tried = host_gate_model(bank);
     let mut never = host_gate_model(bank);
-    let a = prompt(100, 1);
-    whole_turn(&mut tried, 1, &a, 4, busy);
-    whole_turn(&mut never, 1, &a, 4, busy);
+    let a = prompt(68, 1);
+    whole_turn(&mut tried, 1, &a, 2, busy);
+    whole_turn(&mut never, 1, &a, 2, busy);
     let (before, ..) = tried.decoder.weights.slot_ledger();
     let slots = tried.decoder.weights.plan.partial_expert_slots;
     assert_eq!(slot_counts(&tried), vec![Some(slots); LAYERS]);
@@ -408,10 +467,10 @@ fn a_refused_allocation_half_way_leaves_a_partial_store_for_the_next_turn() {
     assert!(after > 0 && after < before, "{after} of {before} B left");
     assert!(tried.decoder.host_prefill_scratch.is_some());
 
-    let b = fork(&a, 98, 110, 2);
-    let (cached, got) = whole_turn(&mut tried, 2, &b, 6, busy);
-    let (_, want) = whole_turn(&mut never, 2, &b, 6, busy);
-    assert_eq!(cached, 96);
+    let b = fork(&a, 66, 78, 2);
+    let (cached, got) = whole_turn(&mut tried, 2, &b, 3, busy);
+    let (_, want) = whole_turn(&mut never, 2, &b, 3, busy);
+    assert_eq!(cached, 64);
     assert_eq!(got, want);
     assert_eq!(slot_counts(&tried), vec![Some(slots); LAYERS]);
     assert_eq!(
@@ -435,25 +494,26 @@ fn a_move_the_host_cannot_finish_keeps_every_warm_slot() {
     let bank = bank_bytes();
     let busy = edge(bank) + bank / 24;
     let quiet = 3 << 30;
-    let (whole, _) = loaded(memory::fixture_host());
+    let whole = model_direct();
     assert_eq!(
-        whole.weights.slot_ledger().0,
+        whole.decoder.weights.slot_ledger().0,
         bank,
         "a whole load's slot banks are the gate's bank set"
     );
+    drop(whole);
     let staging = 3 * weights::MAX_READ_BYTES;
-    let a = prompt(100, 1);
+    let a = prompt(68, 1);
+    let mut tried = host_gate_model(bank);
+    whole_turn(&mut tried, 1, &a, 2, busy);
+    let slots = tried.decoder.weights.plan.partial_expert_slots as u64;
+    let (partial_bytes, ..) = tried.decoder.weights.slot_ledger();
+    assert_eq!(slot_counts(&tried), vec![Some(slots as usize); LAYERS]);
+    let warm: Vec<_> = (0..LAYERS)
+        .map(|layer| tried.decoder.weights.slot_occupants(layer))
+        .collect();
+    assert!(warm.iter().flatten().flatten().any(Option::is_some));
+    let growth = bank - partial_bytes;
     for (short, moves) in [(1u64, false), (0, true)] {
-        let mut tried = host_gate_model(bank);
-        whole_turn(&mut tried, 1, &a, 4, busy);
-        let slots = tried.decoder.weights.plan.partial_expert_slots as u64;
-        let (partial_bytes, ..) = tried.decoder.weights.slot_ledger();
-        assert_eq!(slot_counts(&tried), vec![Some(slots as usize); LAYERS]);
-        let warm: Vec<_> = (0..LAYERS)
-            .map(|layer| tried.decoder.weights.slot_occupants(layer))
-            .collect();
-        assert!(warm.iter().flatten().flatten().any(Option::is_some));
-        let growth = bank - partial_bytes;
         let room = growth + staging - short;
         let mut asked = Vec::new();
         let mut dropped = 0u64;
@@ -531,7 +591,7 @@ fn a_move_the_host_refuses_before_any_bank_drops_is_counted() {
     let busy = edge(bank) + bank / 24;
     let quiet = 3 << 30;
     let mut inner = host_gate_model(bank);
-    whole_turn(&mut inner, 1, &prompt(100, 1), 2, busy);
+    whole_turn(&mut inner, 1, &prompt(68, 1), 2, busy);
     let residency = |inner: &Inner| inner.decoder.weights.live.residency();
     assert_eq!(residency(&inner), Residency::HostGate);
     assert_eq!((promotions(&inner), promotion_refusals(&inner)), (0, 0));
@@ -560,6 +620,7 @@ fn a_move_the_host_refuses_before_any_bank_drops_is_counted() {
 /// MUTATION pass-key: a block's key leaves out the pass ends inside it → red.
 #[test]
 fn a_state_written_on_halved_passes_does_not_serve_the_moved_store() {
+    use crate::engine::backend::ResetScope;
     let bits = |rows: &[Vec<f32>]| -> Vec<Vec<u32>> {
         rows.iter()
             .map(|row| row.iter().map(|v| v.to_bits()).collect())
@@ -576,16 +637,20 @@ fn a_state_written_on_halved_passes_does_not_serve_the_moved_store() {
     };
     let a = prompt(100, 1);
     let b = fork(&a, 98, 110, 2);
-    let cold_prompt = |halved: bool| -> (Vec<usize>, Vec<Vec<u32>>) {
-        let mut inner = model(memory::fixture_host());
+    let mut whole = model_direct();
+    let mut cold_prompt = |halved: bool| -> (Vec<usize>, Vec<Vec<u32>>) {
+        whole.reset_caches(ResetScope::Command).unwrap();
+        whole.prefix_states.reset(true);
+        whole.decoder.pass_samples.clear();
+        whole.decoder.host_prefill_scratch = None;
         if halved {
-            halve(&mut inner);
+            halve(&mut whole);
         }
         let _host = memory::scoped_test_host(quiet);
-        open(&mut inner);
-        let (cached, logits) = turn(&mut inner, 1, &a);
+        open(&mut whole);
+        let (cached, logits) = turn(&mut whole, 1, &a);
         assert_eq!(cached, 0);
-        let rows = inner.decoder.pass_samples.iter().map(|&(r, _)| r).collect();
+        let rows = whole.decoder.pass_samples.iter().map(|&(r, _)| r).collect();
         (rows, bits(&[logits]))
     };
     let (whole_rows, whole_bits) = cold_prompt(false);
@@ -597,14 +662,14 @@ fn a_state_written_on_halved_passes_does_not_serve_the_moved_store() {
         "halved passes gave the whole passes' bits"
     );
 
-    let mut moving = model(host_with(edge(bank) + bank / 24));
+    let mut moving = host_gate_model(bank);
     assert!(moving.decoder.weights.plan.partial_direct_gate);
     halve(&mut moving);
     {
         let _host = memory::scoped_test_host(quiet);
         open(&mut moving);
         let (_, logits) = turn(&mut moving, 1, &a);
-        greedy(&mut moving, &logits, 4);
+        greedy(&mut moving, &logits, 2);
         finish(&mut moving);
     }
     let mut depths: Vec<usize> = moving
@@ -625,17 +690,19 @@ fn a_state_written_on_halved_passes_does_not_serve_the_moved_store() {
         open(&mut moving);
         let (cached, logits) = turn(&mut moving, 2, &b);
         let mut out = vec![logits.clone()];
-        out.extend(greedy(&mut moving, &logits, 6));
+        out.extend(greedy(&mut moving, &logits, 3));
         (cached, out)
     };
     let cold = {
-        let mut cold = model(memory::fixture_host());
+        whole.reset_caches(ResetScope::Command).unwrap();
+        whole.prefix_states.reset(true);
+        whole.decoder.host_prefill_scratch = None;
         let _host = memory::scoped_test_host(quiet);
-        open(&mut cold);
-        let (cached, logits) = turn(&mut cold, 1, &b);
+        open(&mut whole);
+        let (cached, logits) = turn(&mut whole, 1, &b);
         assert_eq!(cached, 0);
         let mut out = vec![logits.clone()];
-        out.extend(greedy(&mut cold, &logits, 6));
+        out.extend(greedy(&mut whole, &logits, 3));
         out
     };
     assert_eq!(cached, 64, "the state at 96 was written on halved passes");

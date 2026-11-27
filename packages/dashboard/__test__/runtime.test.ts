@@ -19,6 +19,7 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime, type RuntimeLifecycleEvent } from '../src/runtime.js';
 import { startDbWorker } from '../src/worker/client.js';
+import { startInProcessDbWorker } from '../src/worker/in-process.js';
 
 let base: string;
 let tracesDir: string;
@@ -722,6 +723,35 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     } finally {
       renderer.close();
       dispose();
+    }
+  });
+
+  it('clears in-process worker queue telemetry when a queued call is aborted before dispatch', async () => {
+    const worker = startInProcessDbWorker({
+      onLifecycle: (): void => {},
+      dbPath: ':memory:',
+      modelsDir,
+      tracesDir,
+      runtimeDir: join(base, 'runtime'),
+      cacheRoot: undefined,
+      prefixCacheRoot: undefined,
+      agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
+    });
+    try {
+      const controller = new AbortController();
+      // Queued behind boot ingest; abort immediately before the chain reaches this call.
+      const pending = worker.call({ method: 'GET', path: '/api/health', route: 'GET /api/health' }, controller.signal);
+      expect(worker.queue()).toMatchObject({ wq: 1, wroute: 'GET /api/health' });
+      controller.abort();
+
+      const res = await pending;
+      expect(res.ok).toBe(false);
+      expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
+      expect(worker.queue()).toBeNull();
+    } finally {
+      await worker.close();
     }
   });
 });

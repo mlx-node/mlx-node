@@ -11,7 +11,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/qwen3.5-0.8b-mlx-bf16 \
-//!     cargo test -p mlx-core --test qwen3_5_delta_chat -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_delta_chat -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_MODEL_PATH` the test early-returns and passes

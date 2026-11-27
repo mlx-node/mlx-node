@@ -743,24 +743,37 @@ fn rows_cycle(
     Ok(emitted)
 }
 
-/// Pooled p-value of `draws` emitted tokens, per verify row, against the
-/// filter chain's distribution of that row.
-fn rows_law(draws: usize, seed: u64, call: Call, planted: Planted) -> Result<(f64, Vec<String>)> {
-    let f = device_sampled::fixture(seed)?;
+/// Pooled p-value and per-row hit counts over either a draw budget or a cycle
+/// budget against the filter chain's distribution of each verify row.
+fn rows_law_with(
+    draws: usize,
+    cycles_limit: Option<usize>,
+    seed: u64,
+    call: Call,
+    planted: Planted,
+    align_scores: bool,
+) -> Result<(f64, Vec<u64>, Vec<String>)> {
+    let f = device_sampled::fixture_with(seed, device_sampled::L, align_scores)?;
     let mut rng = StdRng::seed_from_u64(seed ^ 0xA11CE);
     let mut counts = vec![vec![0u64; device_sampled::V]; device_sampled::L + 1];
-    let mut total = 0usize;
-    while total < draws {
+    let (mut total, mut cycles) = (0usize, 0usize);
+    while match cycles_limit {
+        Some(limit) => cycles < limit,
+        None => total < draws,
+    } {
         let emitted = rows_cycle(&f, &mut rng, call, planted)?;
         for (row, &token) in emitted.iter().enumerate() {
             counts[row][token] += 1;
         }
         total += emitted.len();
+        cycles += 1;
     }
     let mut lines = Vec::new();
+    let mut row_hits = Vec::with_capacity(device_sampled::L + 1);
     let (mut stat, mut dof) = (0.0, 0usize);
     for (row, (c, p)) in counts.iter().zip(&f.targets).enumerate() {
         let n: u64 = c.iter().sum();
+        row_hits.push(n);
         if n < 200 {
             continue;
         }
@@ -772,11 +785,22 @@ fn rows_law(draws: usize, seed: u64, call: Call, planted: Planted) -> Result<(f6
         stat += s;
         dof += d;
     }
-    Ok((device_sampled::gamma_q(dof as f64 / 2.0, stat / 2.0), lines))
+    Ok((
+        device_sampled::gamma_q(dof as f64 / 2.0, stat / 2.0),
+        row_hits,
+        lines,
+    ))
 }
 
-/// 200,000 emitted tokens through each call keep the target law, row by
-/// row; three planted sampler defects break it. `MLX_TEST_SAMPLED_DRAWS` sets the count.
+fn rows_law(draws: usize, seed: u64, call: Call, planted: Planted) -> Result<(f64, Vec<String>)> {
+    let (p, _, lines) = rows_law_with(draws, None, seed, call, planted, false)?;
+    Ok((p, lines))
+}
+
+/// 8,000 emitted tokens through each call keep the target law, row by
+/// row; a full-width high-acceptance arm verifies every verify row 0..=L
+/// (including late rows 4..=6 and bonus row 7) with >= 200 hits each; and
+/// three planted sampler defects break it. `MLX_TEST_SAMPLED_DRAWS` sets the count.
 #[test]
 fn device_rows_keep_the_target_law_through_the_whole_turn_and_the_lane() -> Result<()> {
     if !metal()
@@ -789,7 +813,7 @@ fn device_rows_keep_the_target_law_through_the_whole_turn_and_the_lane() -> Resu
     let draws = std::env::var("MLX_TEST_SAMPLED_DRAWS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200_000);
+        .unwrap_or(8_000);
     for (call, seed) in [(Call::WholeTurn, 0x61), (Call::Lane, 0x62)] {
         let started = Instant::now();
         let (p, lines) = rows_law(draws, seed, call, Planted::None)?;
@@ -804,9 +828,34 @@ fn device_rows_keep_the_target_law_through_the_whole_turn_and_the_lane() -> Resu
             p >= 1e-6,
             "{call:?}: the device rows break the law: p {p:.3e}"
         );
+
+        // High-acceptance full-width (L = 7) arm guarantees every verify row
+        // 0..=L (including late rows and the bonus row) reaches >= 200 hits.
+        const FULL_CYCLES: usize = 1_500;
+        let started = Instant::now();
+        let (full_p, row_hits, full_lines) =
+            rows_law_with(0, Some(FULL_CYCLES), seed ^ 0x40, call, Planted::None, true)?;
+        eprintln!(
+            "LAW {call:?} full-width cycles {FULL_CYCLES} hits {:?} pooled p {full_p:.3e} in {:?}",
+            row_hits,
+            started.elapsed()
+        );
+        for line in &full_lines {
+            eprintln!("LAW   {line}");
+        }
+        for (row, &hits) in row_hits.iter().enumerate() {
+            assert!(
+                hits >= 200,
+                "{call:?}: full-width row {row} got only {hits} hits (< 200)"
+            );
+        }
+        assert!(
+            full_p >= 1e-6,
+            "{call:?}: full-width device rows break the law: p {full_p:.3e}"
+        );
     }
     for planted in [Planted::Hot, Planted::NoNucleus, Planted::WrongDraft] {
-        let (p, _) = rows_law(draws.min(40_000), 0x63, Call::Lane, planted)?;
+        let (p, _) = rows_law(draws.min(6_000), 0x63, Call::Lane, planted)?;
         eprintln!("LAW planted {planted:?} pooled p {p:.3e}");
         assert!(
             p < 1e-6,

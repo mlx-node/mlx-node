@@ -2,7 +2,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
 
 import type { MemoryGovernorStatus } from '@mlx-node/core';
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 import {
   createHealthReporter,

@@ -1,6 +1,6 @@
 /** Where an edit really lands once links on disk are followed, and which folders the work-folder rule refuses. */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -149,4 +149,21 @@ describe('checkWorkFolder', () => {
       problem: 'root',
     });
   });
+
+  it.runIf(process.platform === 'darwin')(
+    'refuses home and app-data folders reached through the /System/Volumes/Data firmlink',
+    async () => {
+      const home = join(root, 'home');
+      const agentHome = join(root, 'agent-home');
+      mkdirSync(home, { recursive: true });
+      mkdirSync(agentHome, { recursive: true });
+      const firmlinkedHome = `/System/Volumes/Data${realpathSync(home)}`;
+      const firmlinkedAgentHome = `${firmlinkedHome}/../agent-home`;
+      expect(existsSync(firmlinkedHome)).toBe(true);
+      expect(existsSync(firmlinkedAgentHome)).toBe(true);
+      const rules = { home, refused: [agentHome] };
+      expect(await checkWorkFolder(firmlinkedHome, rules)).toEqual({ ok: false, problem: 'home' });
+      expect(await checkWorkFolder(firmlinkedAgentHome, rules)).toEqual({ ok: false, problem: 'app-data' });
+    },
+  );
 });

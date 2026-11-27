@@ -2,17 +2,20 @@ import { request as httpRequest } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import OpenAI from 'openai';
-import { afterEach, expect, it, vi } from 'vite-plus/test';
+import { it, vi } from 'vite-plus/test';
 
 import { AudioError } from '../../packages/server/src/audio-io.js';
 import { ttsCapabilities } from '../../packages/server/src/audio-registry.js';
 import { createServer, type ServerInstance } from '../../packages/server/src/server.js';
 import { createTtsModel, type TtsBackend } from '../../packages/tts/src/model.js';
 
-const servers: ServerInstance[] = [];
-afterEach(async () => {
-  for (const server of servers.splice(0)) await server.close({ timeoutMs: 100 });
-});
+// Pure JS stubs for PCM16 encoding and WAV header synthesis so this retry suite
+// runs in parallel on `pure-ts` without dlopening the native addon.
+vi.mock('@mlx-node/core', () => ({
+  __internal__: { clearCache: () => {} },
+  audioEncodePcm16: (samples: Float32Array) => Buffer.alloc(samples.length * 2),
+  audioWavHeader: () => Buffer.alloc(44),
+}));
 
 interface Outcome {
   status: number;
@@ -42,8 +45,13 @@ async function speech(url: string, format: 'pcm' | 'wav' | 'sse' = 'pcm'): Promi
 }
 
 function backend(failure?: 'start' | 'next') {
-  const waitFinished = vi.fn(async () => {});
-  const generate = vi.fn(() => {
+  let generateCalls = 0;
+  let waitFinishedCalls = 0;
+  const waitFinished = async () => {
+    waitFinishedCalls += 1;
+  };
+  const generate = () => {
+    generateCalls += 1;
     if (failure === 'start') throw new Error('injected native start failure');
     let first = true;
     return {
@@ -57,7 +65,7 @@ function backend(failure?: 'start' | 'next') {
       cancel() {},
       waitFinished,
     };
-  });
+  };
   const native: TtsBackend = {
     capabilities: {
       family: 'test',
@@ -72,11 +80,19 @@ function backend(failure?: 'start' | 'next') {
       textStreaming: 'segmented',
     },
     start: generate,
-    prepareVoice: vi.fn(),
-    releaseVoice: vi.fn(),
-    dispose: vi.fn(async () => {}),
+    prepareVoice: async () => '',
+    releaseVoice: async () => {},
+    dispose: async () => {},
   };
-  return { model: createTtsModel(native), generate, waitFinished };
+  return {
+    model: createTtsModel(native),
+    get generateCalls() {
+      return generateCalls;
+    },
+    get waitFinishedCalls() {
+      return waitFinishedCalls;
+    },
+  };
 }
 
 function observeAttempts(server: ServerInstance) {
@@ -101,13 +117,16 @@ const cases = (['ingress', 'resident queue', 'cold load queue'] as const).flatMa
   [true, false].map((recover) => ({ layer, recover })),
 );
 
-it.each(cases)(
+it.concurrent.for(cases)(
   `node sdk default retries: $layer, recover=$recover, rejected attempts never synthesize`,
-  async ({ layer, recover }) => {
-    const { model, generate } = backend();
-    const load = vi.fn(async () => {
-      server.registry.audio.register('tts', { kind: 'tts', model });
-    });
+  { timeout: 15_000 },
+  async ({ layer, recover }, { expect }) => {
+    const mock = backend();
+    let loadCalls = 0;
+    const load = async () => {
+      loadCalls += 1;
+      server.registry.audio.register('tts', { kind: 'tts', model: mock.model });
+    };
     const server = await createServer({
       host: '127.0.0.1',
       port: 0,
@@ -124,71 +143,73 @@ it.each(cases)(
           owned_by: 'test',
           modality: 'audio',
           task: 'tts',
-          capabilities: ttsCapabilities(model.capabilities),
+          capabilities: ttsCapabilities(mock.model.capabilities),
         },
       ],
     });
-    servers.push(server);
-    if (layer !== 'cold load queue') server.registry.audio.register('tts', { kind: 'tts', model });
-    const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
-    const attempts = observeAttempts(server);
-    let release: () => Promise<void>;
-    if (layer === 'ingress') {
-      const blocker = httpRequest(`${url}/v1/audio/speech/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-ndjson' },
-      });
-      blocker.on('error', () => {});
-      blocker.write(JSON.stringify({ type: 'config', model: 'tts', voice: 'v' }) + '\n');
-      release = async () => {
-        blocker.destroy();
-        await vi.waitFor(() => expect(server.registry.audio.pending).toBe(0));
-      };
-      await vi.waitFor(() => expect(server.registry.audio.pending).toBe(1));
-    } else {
-      // Real admission permits fill the configured runner + waiter budget.
-      const permits = [0, 1].map(() =>
-        layer === 'resident queue'
-          ? server.registry.audio.acquire('tts')!
-          : server.modelWork.beginRequestLoadAdmission('tts'),
-      );
-      release = async () => {
-        for (const permit of permits) permit.release();
-      };
-    }
     try {
-      const result = speech(url);
-      void result.catch(() => {});
-      await vi.waitFor(() => expect(attempts[0]?.status).toBe(429), { timeout: 5000 });
-      expect(generate).not.toHaveBeenCalled();
-      expect(load).not.toHaveBeenCalled();
-      if (recover) await release();
-      const outcome = await result;
-      expect(outcome).toEqual(
-        recover
-          ? { status: 200, bytes: 48 }
-          : {
-              status: 429,
-              code: layer === 'ingress' ? 'audio_capacity_exceeded' : 'queue_full',
-            },
-      );
-      expect(attempts.map((a) => a.status)).toEqual(recover ? [429, 200] : [429, 429, 429]);
-      expect(attempts.every((a) => a.shouldRetry === undefined)).toBe(true);
-      for (let i = 1; i < attempts.length; i++) {
-        expect(attempts[i - 1].retryAfter).toBe('1');
-        expect(attempts[i].at - attempts[i - 1].at).toBeGreaterThanOrEqual(900);
+      if (layer !== 'cold load queue') server.registry.audio.register('tts', { kind: 'tts', model: mock.model });
+      const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
+      const attempts = observeAttempts(server);
+      let release: () => Promise<void>;
+      if (layer === 'ingress') {
+        const blocker = httpRequest(`${url}/v1/audio/speech/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        });
+        blocker.on('error', () => {});
+        blocker.write(JSON.stringify({ type: 'config', model: 'tts', voice: 'v' }) + '\n');
+        release = async () => {
+          blocker.destroy();
+          await vi.waitFor(() => expect(server.registry.audio.pending).toBe(0));
+        };
+        await vi.waitFor(() => expect(server.registry.audio.pending).toBe(1));
+      } else {
+        // Real admission permits fill the configured runner + waiter budget.
+        const permits = [0, 1].map(() =>
+          layer === 'resident queue'
+            ? server.registry.audio.acquire('tts')!
+            : server.modelWork.beginRequestLoadAdmission('tts'),
+        );
+        release = async () => {
+          for (const permit of permits) permit.release();
+        };
       }
-      expect(generate).toHaveBeenCalledTimes(recover ? 1 : 0);
-      expect(load).toHaveBeenCalledTimes(recover && layer === 'cold load queue' ? 1 : 0);
+      try {
+        const result = speech(url);
+        void result.catch(() => {});
+        await vi.waitFor(() => expect(attempts[0]?.status).toBe(429), { timeout: 5000 });
+        expect(mock.generateCalls).toBe(0);
+        expect(loadCalls).toBe(0);
+        if (recover) await release();
+        const outcome = await result;
+        expect(outcome).toEqual(
+          recover
+            ? { status: 200, bytes: 48 }
+            : {
+                status: 429,
+                code: layer === 'ingress' ? 'audio_capacity_exceeded' : 'queue_full',
+              },
+        );
+        expect(attempts.map((a) => a.status)).toEqual(recover ? [429, 200] : [429, 429, 429]);
+        expect(attempts.every((a) => a.shouldRetry === undefined)).toBe(true);
+        for (let i = 1; i < attempts.length; i++) {
+          expect(attempts[i - 1].retryAfter).toBe('1');
+          expect(attempts[i].at - attempts[i - 1].at).toBeGreaterThanOrEqual(900);
+        }
+        expect(mock.generateCalls).toBe(recover ? 1 : 0);
+        expect(loadCalls).toBe(recover && layer === 'cold load queue' ? 1 : 0);
+      } finally {
+        await release();
+      }
+      expect(server.registry.audio.pending).toBe(0);
     } finally {
-      await release();
+      await server.close({ timeoutMs: 100 });
     }
-    expect(server.registry.audio.pending).toBe(0);
   },
-  15_000,
 );
 
-it.each([
+it.concurrent.for([
   { failure: 'start', format: 'pcm' },
   { failure: 'next', format: 'pcm' },
   { failure: 'next', format: 'sse' },
@@ -196,8 +217,9 @@ it.each([
   { failure: 'storage', format: 'wav' },
 ] as const)(
   `node sdk default retries: $failure failure during $format synthesis executes only once`,
-  async ({ failure, format }) => {
-    const { model, generate, waitFinished } = backend(failure === 'storage' ? undefined : failure);
+  { timeout: 15_000 },
+  async ({ failure, format }, { expect }) => {
+    const mock = backend(failure === 'storage' ? undefined : failure);
     const server = await createServer({
       host: '127.0.0.1',
       port: 0,
@@ -206,56 +228,67 @@ it.each([
       // The WAV header fits; storing the first 48 PCM bytes exhausts the quota.
       audio: failure === 'storage' ? { maxTempBytes: 44 } : undefined,
     });
-    servers.push(server);
-    server.registry.audio.register('tts', { kind: 'tts', model });
-    const attempts = observeAttempts(server);
-    const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
-    const status = failure === 'storage' ? 503 : 500;
-    expect(await speech(url, format)).toEqual({
-      status,
-      code: failure === 'storage' ? 'audio_storage_full' : 'audio_inference_failed',
-    });
-    expect(attempts).toHaveLength(1);
-    expect(attempts[0]).toMatchObject({ status, shouldRetry: 'false' });
-    expect(attempts[0].retryAfter).toBeUndefined();
-    expect(generate).toHaveBeenCalledOnce();
-    if (failure !== 'start') expect(waitFinished).toHaveBeenCalledOnce();
-    expect(server.registry.audio.pending).toBe(0);
+    try {
+      server.registry.audio.register('tts', { kind: 'tts', model: mock.model });
+      const attempts = observeAttempts(server);
+      const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
+      const status = failure === 'storage' ? 503 : 500;
+      expect(await speech(url, format)).toEqual({
+        status,
+        code: failure === 'storage' ? 'audio_storage_full' : 'audio_inference_failed',
+      });
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ status, shouldRetry: 'false' });
+      expect(attempts[0].retryAfter).toBeUndefined();
+      expect(mock.generateCalls).toBe(1);
+      if (failure !== 'start') expect(mock.waitFinishedCalls).toBe(1);
+      expect(server.registry.audio.pending).toBe(0);
+    } finally {
+      await server.close({ timeoutMs: 100 });
+    }
   },
-  15_000,
 );
 
-it(`node sdk default retries: pre-dispatch model loading failures remain retryable`, async () => {
-  const { model, generate } = backend();
-  const load = vi.fn(async () => {
-    throw new AudioError(503, 'model_unavailable', 'injected temporary loading failure');
-  });
-  const server = await createServer({
-    host: '127.0.0.1',
-    port: 0,
-    disableStore: true,
-    idleClearCacheMs: 0,
-    resolveModel: load,
-    listModels: () => [
-      {
-        id: 'tts',
-        object: 'model',
-        created: 0,
-        owned_by: 'test',
-        modality: 'audio',
-        task: 'tts',
-        capabilities: ttsCapabilities(model.capabilities),
-      },
-    ],
-  });
-  servers.push(server);
-  const attempts = observeAttempts(server);
-  const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
-  expect(await speech(url)).toEqual({ status: 503, code: 'model_unavailable' });
-  expect(attempts.map((a) => a.status)).toEqual([503, 503, 503]);
-  expect(attempts.every((a) => a.retryAfter === '1' && a.shouldRetry === undefined)).toBe(true);
-  expect(load).toHaveBeenCalledTimes(3);
-  expect(generate).not.toHaveBeenCalled();
-  expect(server.registry.audio.pending).toBe(0);
-  await model.dispose();
-}, 15_000);
+it.concurrent(
+  `node sdk default retries: pre-dispatch model loading failures remain retryable`,
+  { timeout: 15_000 },
+  async ({ expect }) => {
+    const mock = backend();
+    let loadCalls = 0;
+    const load = async () => {
+      loadCalls += 1;
+      throw new AudioError(503, 'model_unavailable', 'injected temporary loading failure');
+    };
+    const server = await createServer({
+      host: '127.0.0.1',
+      port: 0,
+      disableStore: true,
+      idleClearCacheMs: 0,
+      resolveModel: load,
+      listModels: () => [
+        {
+          id: 'tts',
+          object: 'model',
+          created: 0,
+          owned_by: 'test',
+          modality: 'audio',
+          task: 'tts',
+          capabilities: ttsCapabilities(mock.model.capabilities),
+        },
+      ],
+    });
+    try {
+      const attempts = observeAttempts(server);
+      const url = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
+      expect(await speech(url)).toEqual({ status: 503, code: 'model_unavailable' });
+      expect(attempts.map((a) => a.status)).toEqual([503, 503, 503]);
+      expect(attempts.every((a) => a.retryAfter === '1' && a.shouldRetry === undefined)).toBe(true);
+      expect(loadCalls).toBe(3);
+      expect(mock.generateCalls).toBe(0);
+      expect(server.registry.audio.pending).toBe(0);
+      await mock.model.dispose();
+    } finally {
+      await server.close({ timeoutMs: 100 });
+    }
+  },
+);

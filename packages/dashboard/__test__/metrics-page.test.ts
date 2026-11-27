@@ -4,11 +4,12 @@
 
 import { act, createElement, type ReactElement } from 'react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { ApiCall } from '../src/runtime.js';
 import { alignedRange } from '../ui/src/lib/range.js';
 import type { MetricsSpeculative, ModelsResponse } from '../ui/src/lib/types.js';
+import { __setLiveRefetchMinMsForTests } from '../ui/src/lib/use-api.js';
 import Metrics from '../ui/src/pages/metrics.js';
 import {
   busyTotals,
@@ -41,6 +42,14 @@ import {
 
 let mounted: RenderedPage | undefined;
 let api: StubbedApi | undefined;
+
+beforeAll(() => {
+  __setLiveRefetchMinMsForTests(0);
+});
+
+afterAll(() => {
+  __setLiveRefetchMinMsForTests(undefined);
+});
 
 afterEach(() => {
   mounted?.unmount();

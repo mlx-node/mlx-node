@@ -1,34 +1,43 @@
 #!/usr/bin/env oxnode
 /**
- * Classify every vitest file into the `addon` or `pure-ts` lane by tracing its
- * static import graph for a path to `@mlx-node/core` (the NAPI addon loader).
+ * Classify every vitest file into the `addon`, `darwin-ts`, or `pure-ts` lane
+ * by tracing its AST import graph for a path to `@mlx-node/core` (the NAPI
+ * addon loader).
  *
- * `vite.config.ts` calls `classify()` at config load to build the two vitest
- * projects: `addon` (serial) and `pure-ts` (parallel). See the comment there
- * for why the two lanes exist (Metal must not be oversubscribed).
+ * `vite.config.ts` calls `classify()` at config load to build the three vitest
+ * projects: `pure-ts` (parallel, OS-agnostic — runnable on Linux CI),
+ * `darwin-ts` (parallel, macOS-specific pure-TS tests), and `addon` (serial,
+ * Metal must not be oversubscribed).
  *
- *   oxnode scripts/test-lanes.ts   # print both lists
+ *   oxnode scripts/test-lanes.ts   # print all three lists
  *
  * What counts as "reaches the addon":
  *   - a module whose specifier is `@mlx-node/core` (the only entry that loads
  *     `mlx-core.<platform>.node`), reached through any chain of static
  *     `import`/`export ... from`, `import()` with a literal specifier, or
- *     `require()` with a literal specifier;
+ *     `require()` with a literal specifier (parsed via `oxc-parser`, so string
+ *     literals in test fixtures are never misread as imports);
  *   - `@mlx-node/*` specifiers resolve exactly like the `workspaceSource` vite
  *     plugin: through each package's `exports[...]['@mlx-node/source']`;
  *   - `import type` / `export type` edges are skipped (erased at runtime);
- *   - `vi.mock('@mlx-node/core', ...)` does NOT remove a file from the addon
- *     lane: the mock factory may still touch the real module and the file is
- *     cheap enough serialised. Conservative is correct here.
+ *   - a top-level `vi.mock(spec, () => ...)` whose factory takes no parameters
+ *     and never calls `importActual`/`importOriginal` replaces that resolved
+ *     target for ESM edges (`import`/`export ... from`/`import()`) in that test
+ *     file's module graph, pruning edges to the mocked module. Partial mocks
+ *     (`importOriginal` / `importActual`) keep the real edge, and CommonJS
+ *     `require()` / `createRequire()` edges are never pruned because they go
+ *     through Node's CJS loader and bypass Vitest's ESM mock.
  *
  * Files that spawn a child process which loads the addon on its own (desktop
- * sidecar, `mlx` CLI e2e) are listed in `SERIAL_BY_HAND`; the
- * tracer cannot see across a process boundary.
+ * sidecar, `mlx` CLI e2e) are listed in `SERIAL_BY_HAND`; the tracer cannot
+ * see across a process boundary.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { parseSync } from 'oxc-parser';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE_CONDITION = '@mlx-node/source';
@@ -58,6 +67,35 @@ export const SERIAL_BY_HAND: string[] = [
   // interleave free/bind into EADDRINUSE; serial was what made it safe.
   '__test__/server/host/net.test.ts',
   '__test__/server/host/logger.test.ts',
+  // Reads `data/openai-gsm8k/{train,test}.jsonl`, which CI prepares via
+  // `yarn mlx download dataset` (uses `@mlx-node/core`'s `convertParquetToJsonl`).
+  '__test__/utils/dataset.test.ts',
+];
+
+/**
+ * Pure-TS test files that rely on macOS-specific behaviour (APFS/darwin
+ * flock, `/usr/bin/trash`, macOS volume layout) and therefore run on macOS CI
+ * (`--project darwin-ts`) while `pure-ts` stays OS-agnostic for Linux CI.
+ */
+export const DARWIN_TS: string[] = [
+  // Inspects the real macOS `.node` and `paged_attn.metallib` artifacts from
+  // `yarn build:native` (only downloaded in the macOS `ts-test` job).
+  '__test__/core/metallib-select.test.ts',
+  // Exercises case-insensitive APFS cache-root folding (`volumeIsCaseInsensitive`),
+  // which early-returns on case-sensitive Linux ext4.
+  'packages/agent/__test__/cold-tier-root.test.ts',
+  'packages/dashboard/__test__/api-prefix-cache.test.ts',
+  'packages/dashboard/__test__/chat-work-landing.test.ts',
+  // Exercises macOS `/bin/zsh` login-shell PATH rules (9/11 tests skip without
+  // `/bin/zsh`, and Ubuntu's `/etc/profile.d/apps-bin-path.sh` appends `/snap/bin`).
+  'packages/dashboard/__test__/chat-work-path.test.ts',
+  'packages/dashboard/__test__/download.test.ts',
+  'packages/dashboard/__test__/prefix-cache.test.ts',
+  // Inspects the real macOS `.node` and `.metallib` artifacts from `yarn build:native`.
+  'packages/desktop/__test__/payload.test.ts',
+  // Copies `/bin/echo` expecting a macOS Mach-O binary (`file` / `findMachOFiles`);
+  // Ubuntu's `/bin/echo` is ELF.
+  'packages/desktop/__test__/verify-bundle.test.ts',
 ];
 
 // Same globs as `test.include` in vite.config.ts.
@@ -113,22 +151,166 @@ function loadWorkspacePackages(): Map<string, PkgExports> {
 
 const PACKAGES = loadWorkspacePackages();
 
-/** Strip comments so commented-out imports do not count as edges. */
-function stripComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+type AstNode = Record<string, unknown>;
+
+function staticString(node: unknown): string | null {
+  if (typeof node !== 'object' || node === null) return null;
+  const n = node as AstNode;
+  if (n.type === 'Literal' && typeof n.value === 'string') return n.value;
+  if (n.type === 'TemplateLiteral') {
+    const exprs = n.expressions as unknown[] | undefined;
+    const quasis = n.quasis as AstNode[] | undefined;
+    if (exprs?.length === 0 && quasis?.length === 1) {
+      const value = quasis[0]?.value as { cooked?: unknown } | undefined;
+      if (typeof value?.cooked === 'string') return value.cooked;
+    }
+  }
+  return null;
 }
 
-/** Collect runtime import specifiers from one TS/JS source file. */
-function collectSpecifiers(src: string): string[] {
-  const code = stripComments(src);
-  const specs = new Set<string>();
-  // import x from '...' / import { a } from '...' / import '...' — skipping `import type`.
-  for (const m of code.matchAll(/^\s*import\s+(?!type\s)(?:[^'"]*?\sfrom\s*)?['"]([^'"]+)['"]/gm)) specs.add(m[1]);
-  // export { a } from '...' / export * from '...' — skipping `export type`.
-  for (const m of code.matchAll(/^\s*export\s+(?!type\s)[^'"]*?\sfrom\s*['"]([^'"]+)['"]/gm)) specs.add(m[1]);
-  // import('...') / require('...') with a literal.
-  for (const m of code.matchAll(/\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) specs.add(m[1]);
-  return [...specs];
+function visitAst(node: unknown, fn: (n: AstNode) => void): void {
+  if (typeof node !== 'object' || node === null) return;
+  if (Array.isArray(node)) {
+    for (const item of node) visitAst(item, fn);
+    return;
+  }
+  const obj = node as AstNode;
+  if (typeof obj.type === 'string') fn(obj);
+  for (const value of Object.values(obj)) {
+    if (typeof value === 'object' && value !== null) visitAst(value, fn);
+  }
+}
+
+interface ImportEdge {
+  specifier: string;
+  /** True for ESM imports/re-exports/dynamic `import()`; false for CJS `require`/`createRequire`. */
+  mockable: boolean;
+}
+
+interface ParsedFile {
+  edges: ImportEdge[];
+  fullMockSpecs: string[];
+}
+
+const parsedCache = new Map<string, ParsedFile>();
+
+function isViMockCallee(callee: unknown): boolean {
+  if (typeof callee !== 'object' || callee === null) return false;
+  const c = callee as AstNode;
+  if (c.type !== 'MemberExpression' || c.computed === true) return false;
+  const obj = c.object as AstNode | undefined;
+  const prop = c.property as AstNode | undefined;
+  return (
+    obj?.type === 'Identifier' &&
+    (obj.name === 'vi' || obj.name === 'vitest') &&
+    prop?.type === 'Identifier' &&
+    prop.name === 'mock'
+  );
+}
+
+function isCreateRequireCall(node: unknown): boolean {
+  if (typeof node !== 'object' || node === null) return false;
+  const n = node as AstNode;
+  if (n.type !== 'CallExpression') return false;
+  const callee = n.callee as AstNode | undefined;
+  if (callee?.type === 'Identifier' && callee.name === 'createRequire') return true;
+  if (callee?.type === 'MemberExpression' && callee.computed !== true) {
+    const prop = callee.property as AstNode | undefined;
+    if (prop?.type === 'Identifier' && prop.name === 'createRequire') return true;
+  }
+  return false;
+}
+
+function isRequireCallee(callee: unknown, requireAliases: ReadonlySet<string>): boolean {
+  if (typeof callee !== 'object' || callee === null) return false;
+  const c = callee as AstNode;
+  if (c.type === 'Identifier' && typeof c.name === 'string' && requireAliases.has(c.name)) return true;
+  return isCreateRequireCall(c);
+}
+
+function isFullMockFactory(factory: unknown): boolean {
+  if (typeof factory !== 'object' || factory === null) return false;
+  const f = factory as AstNode;
+  if (f.type !== 'ArrowFunctionExpression' && f.type !== 'FunctionExpression') return false;
+  const params = f.params as unknown[] | undefined;
+  // A factory taking `(importOriginal)` / `(importActual)` can load the real module.
+  if (params !== undefined && params.length > 0) return false;
+  let touchesReal = false;
+  visitAst(f.body, (node) => {
+    if (touchesReal) return;
+    if (node.type === 'Identifier' && (node.name === 'importActual' || node.name === 'importOriginal')) {
+      touchesReal = true;
+    }
+  });
+  return !touchesReal;
+}
+
+/** Collect runtime import specifiers (and top-level full `vi.mock` targets) via `oxc-parser`. */
+function parseFile(file: string): ParsedFile {
+  const cached = parsedCache.get(file);
+  if (cached !== undefined) return cached;
+
+  const src = readFileSync(file, 'utf-8');
+  const parsed = parseSync(file, src);
+  // Map specifier -> mockable (false wins when the same file both imports and requires a spec).
+  const edgeMap = new Map<string, boolean>();
+  const addEdge = (spec: string, mockable: boolean): void => {
+    if (!mockable) edgeMap.set(spec, false);
+    else if (!edgeMap.has(spec)) edgeMap.set(spec, true);
+  };
+  const fullMockSpecs: string[] = [];
+
+  // Static imports: skip pure type imports (`import type` / `import { type X }`), keep side-effect `import '...'`.
+  for (const imp of parsed.module.staticImports) {
+    if (imp.entries.length > 0 && imp.entries.every((e) => e.isType)) continue;
+    addEdge(imp.moduleRequest.value, true);
+  }
+  // Static re-exports: skip `export type ... from '...'`.
+  for (const exp of parsed.module.staticExports) {
+    for (const entry of exp.entries) {
+      if (!entry.isType && entry.moduleRequest) addEdge(entry.moduleRequest.value, true);
+    }
+  }
+  // Collect local aliases created via `const req = createRequire(...)`.
+  const requireAliases = new Set<string>(['require']);
+  visitAst(parsed.program, (node) => {
+    if (node.type === 'VariableDeclarator' && isCreateRequireCall(node.init)) {
+      const id = node.id as AstNode | undefined;
+      if (id?.type === 'Identifier' && typeof id.name === 'string') {
+        requireAliases.add(id.name);
+      }
+    }
+  });
+  // Dynamic `import('...')` and `require('...')` / `createRequire(...)('...')` with literal specifiers.
+  visitAst(parsed.program, (node) => {
+    if (node.type === 'ImportExpression') {
+      const lit = staticString(node.source);
+      if (lit !== null) addEdge(lit, true);
+    } else if (node.type === 'CallExpression' && isRequireCallee(node.callee, requireAliases)) {
+      const args = node.arguments as unknown[] | undefined;
+      const lit = args?.[0] !== undefined ? staticString(args[0]) : null;
+      if (lit !== null) addEdge(lit, false);
+    }
+  });
+
+  // Top-level hoisted `vi.mock('spec', () => ({ ... }))` full module replacements.
+  const body = (parsed.program as unknown as { body?: AstNode[] }).body ?? [];
+  for (const stmt of body) {
+    if (stmt.type !== 'ExpressionStatement') continue;
+    const expr = stmt.expression as AstNode | undefined;
+    if (expr?.type !== 'CallExpression' || !isViMockCallee(expr.callee)) continue;
+    const args = expr.arguments as unknown[] | undefined;
+    if (args === undefined || args.length < 2) continue;
+    const spec = staticString(args[0]);
+    if (spec !== null && isFullMockFactory(args[1])) {
+      fullMockSpecs.push(spec);
+    }
+  }
+
+  const edges: ImportEdge[] = [...edgeMap.entries()].map(([specifier, mockable]) => ({ specifier, mockable }));
+  const result: ParsedFile = { edges, fullMockSpecs };
+  parsedCache.set(file, result);
+  return result;
 }
 
 const EXTS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.mjs', '.cjs'];
@@ -175,46 +357,74 @@ function resolveSpecifier(spec: string, fromFile: string): string | null {
 
 const reachCache = new Map<string, boolean>();
 
-/** True when `file` (absolute) can reach `@mlx-node/core` through runtime imports. */
-export function reachesAddon(file: string, stack: Set<string> = new Set()): boolean {
-  const cached = reachCache.get(file);
+function reachesAddonWithMocks(
+  file: string,
+  stack: Set<string>,
+  mockedTargets: ReadonlySet<string>,
+  cache: Map<string, boolean>,
+): boolean {
+  const cached = cache.get(file);
   if (cached !== undefined) return cached;
   if (stack.has(file)) return false; // cycle: resolved by whoever entered first
   stack.add(file);
   let hit = false;
-  const src = readFileSync(file, 'utf-8');
-  for (const spec of collectSpecifiers(src)) {
-    const target = resolveSpecifier(spec, file);
+  const { edges } = parseFile(file);
+  for (const { specifier, mockable } of edges) {
+    const target = resolveSpecifier(specifier, file);
     if (target === null) continue;
-    if (target === ADDON_PACKAGE || reachesAddon(target, stack)) {
+    if (mockable && mockedTargets.has(target)) continue;
+    if (target === ADDON_PACKAGE || reachesAddonWithMocks(target, stack, mockedTargets, cache)) {
       hit = true;
       break;
     }
   }
   stack.delete(file);
-  reachCache.set(file, hit);
+  cache.set(file, hit);
   return hit;
+}
+
+/** True when `file` (absolute) can reach `@mlx-node/core` through runtime imports. */
+export function reachesAddon(file: string, stack: Set<string> = new Set()): boolean {
+  const { fullMockSpecs } = parseFile(file);
+  if (fullMockSpecs.length === 0) {
+    return reachesAddonWithMocks(file, stack, new Set(), reachCache);
+  }
+  const mockedTargets = new Set<string>();
+  for (const spec of fullMockSpecs) {
+    const target = resolveSpecifier(spec, file);
+    if (target !== null) mockedTargets.add(target);
+  }
+  if (mockedTargets.size === 0) {
+    return reachesAddonWithMocks(file, stack, new Set(), reachCache);
+  }
+  return reachesAddonWithMocks(file, stack, mockedTargets, new Map());
 }
 
 export interface Lanes {
   addon: string[];
+  darwinTs: string[];
   pureTs: string[];
 }
 
 export function classify(): Lanes {
   const addon: string[] = [];
+  const darwinTs: string[] = [];
   const pureTs: string[] = [];
+  const darwinSet = new Set(DARWIN_TS);
   for (const rel of listTestFiles()) {
     if (SERIAL_BY_HAND.includes(rel) || reachesAddon(join(ROOT, rel))) addon.push(rel);
+    else if (darwinSet.has(rel)) darwinTs.push(rel);
     else pureTs.push(rel);
   }
-  return { addon, pureTs };
+  return { addon, darwinTs, pureTs };
 }
 
 function main(): void {
   const lanes = classify();
   console.log(`// addon lane (${lanes.addon.length} files)`);
   for (const f of lanes.addon) console.log(`  '${f}',`);
+  console.log(`\n// darwin-ts lane (${lanes.darwinTs.length} files)`);
+  for (const f of lanes.darwinTs) console.log(`  '${f}',`);
   console.log(`\n// pure-ts lane (${lanes.pureTs.length} files)`);
   for (const f of lanes.pureTs) console.log(`  ${f}`);
 }

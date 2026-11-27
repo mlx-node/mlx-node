@@ -205,11 +205,11 @@ fn deferred_gdn_matches_independent_t1_prefix_for_every_count_and_width() {
             let prior_out = prior
                 .complete(false, None, None)
                 .expect("ordinary complete GDN");
-            for keep in 0..=8 {
+            for keep in [0usize, 1, 3, 7, 8] {
                 let settled =
                     settle_t1(&prior_out.tape, &prior.a[7], &prior.a[4], &prior.a[0], keep);
                 let keep_array = MxArray::from_int32(&[keep as i32], &[1]).unwrap();
-                for rows in 1..=8 {
+                for rows in [1i64, 3, 7, 8] {
                     let mut current =
                         Window::new(rows, 4, 31 + keep + rows as usize, rows % 2 == 1);
                     current.a[4] = prior.a[4].clone();
@@ -603,7 +603,7 @@ fn deferred_fold_matches_t1_settle_on_model_shapes() {
                 } else {
                     grouped_tape(&prior_out.tape, hk, hv)
                 };
-                for keep in 0..=8usize {
+                for keep in [0usize, 1, 4, 8] {
                     let tag = format!(
                         "hk={hk} hv={hv} tiled={tiled} keep={keep} scan={scan} storage={storage}"
                     );

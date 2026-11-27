@@ -6,6 +6,8 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 /**
  * Build a minimal session-capable model mock. Every method is a vi.fn() so
  * tests can spy or stub per-method when needed.

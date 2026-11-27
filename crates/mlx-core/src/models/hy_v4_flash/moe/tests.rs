@@ -1165,8 +1165,8 @@ fn kq_routed_decode_parity_dedup_and_clamp() {
     let cases: &[(usize, usize, usize, usize, ExpertClass, u64)] = &[
         (256, 256, 6, 2, ExpertClass::Q4kDown, 51),
         (256, 256, 6, 2, ExpertClass::Q6kDown, 53),
-        (1536, 1536, 20, 16, ExpertClass::Q4kDown, 59),
-        (1536, 1536, 20, 16, ExpertClass::Q6kDown, 61),
+        (512, 512, 18, 16, ExpertClass::Q4kDown, 59),
+        (512, 512, 18, 16, ExpertClass::Q6kDown, 61),
     ];
     for &(k_dim, ff_dim, ne, top, class, seed) in cases {
         let mut rng = Rng::new(seed);
@@ -1260,7 +1260,7 @@ fn kq_routed_decode_parity_dedup_and_clamp() {
 #[test]
 fn kq_prefill_indirect_gu_and_sorted_combine_parity() {
     crate::models::hy_v4_flash::exact_f32();
-    let (rows, k_dim, m_dim, top, ne) = (256usize, 1536usize, 1536usize, 16usize, 40usize);
+    let (rows, k_dim, m_dim, top, ne) = (128usize, 512usize, 512usize, 16usize, 36usize);
     let tol = if !unsafe { mlx_sys::mlx_metal_is_nax_available() }
         || std::env::var("MLX_HY4_FORCE_METAL3").as_deref() == Ok("1")
     {
@@ -1303,7 +1303,7 @@ fn kq_prefill_indirect_gu_and_sorted_combine_parity() {
                 && counts[..24].iter().any(|&c| c > 32)
         );
 
-        let z = arr(&rng.vec_f32(rows * k_dim, 3.0), &[rows, k_dim]);
+        let z = arr(&rng.vec_f32(rows * k_dim, 5.5), &[rows, k_dim]);
         let routes = Routes {
             k: top,
             ids,

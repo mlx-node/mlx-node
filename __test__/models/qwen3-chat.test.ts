@@ -51,7 +51,7 @@ describe('Qwen3 Chat Session API', () => {
       await model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
-      const result = await model.chatSessionStart(messages);
+      const result = await model.chatSessionStart(messages, { maxNewTokens: 8 });
 
       // Verify ChatResult structure
       expect(result).toBeDefined();
@@ -68,7 +68,7 @@ describe('Qwen3 Chat Session API', () => {
       await model.resetCaches();
       const messages = [{ role: 'user', content: 'Say something' }];
 
-      const result = await model.chatSessionStart(messages);
+      const result = await model.chatSessionStart(messages, { maxNewTokens: 8 });
 
       // Model should generate at least some tokens
       expect(result.numTokens).toBeGreaterThan(0);
@@ -230,7 +230,7 @@ describe('Qwen3 Chat Session API', () => {
       const messages = [{ role: 'user', content: 'Hi' }];
 
       const result = await model.chatSessionStart(messages, {
-        maxNewTokens: 500, // Give it room to naturally stop
+        maxNewTokens: 64, // Give it room to naturally stop
       });
 
       // With random weights, might hit either stop or length

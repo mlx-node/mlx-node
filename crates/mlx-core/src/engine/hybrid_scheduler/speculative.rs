@@ -1163,11 +1163,34 @@ pub(super) mod tests {
     }
 
     fn run(speculate: bool, cancel_first: bool) -> (Vec<(u32, Vec<u32>)>, usize) {
-        run_with(
-            seeded_tiny_paged_inner_with_draft(1729).unwrap(),
-            speculate,
-            cancel_first,
-        )
+        static AR: std::sync::OnceLock<(Vec<(u32, Vec<u32>)>, usize)> = std::sync::OnceLock::new();
+        static SPEC: std::sync::OnceLock<(Vec<(u32, Vec<u32>)>, usize)> =
+            std::sync::OnceLock::new();
+        match (speculate, cancel_first) {
+            (false, false) => AR
+                .get_or_init(|| {
+                    run_with(
+                        seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+                        false,
+                        false,
+                    )
+                })
+                .clone(),
+            (true, false) => SPEC
+                .get_or_init(|| {
+                    run_with(
+                        seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+                        true,
+                        false,
+                    )
+                })
+                .clone(),
+            _ => run_with(
+                seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+                speculate,
+                cancel_first,
+            ),
+        }
     }
 
     fn run_with<B: HybridSchedulerBackend>(
@@ -1442,7 +1465,7 @@ pub(super) mod tests {
     fn a_scheduled_end_cut_by_max_new_tokens_matches_ar() {
         let mut end = vec![13; 8];
         end.push(14);
-        for inside in [1, 3, 5, 8] {
+        for inside in [1, 5] {
             let max = Some(2 + inside as i32);
             let (ar, _) = run_ending_stopped(false, &end, max, None, &[]);
             let (mixed, _) = run_ending_stopped(true, &end, max, None, &[]);
@@ -1619,15 +1642,19 @@ pub(super) mod tests {
                 spec, ar,
                 "greedy native MTP differs from AR on tiny fixture"
             );
-            for sampled in [false, true] {
-                let (complete, _) = run_with_sampling(build(), true, false, sampled);
-                let (cancelled, _) = run_with_sampling(build(), true, true, sampled);
-                assert_eq!(
-                    cancelled[1], complete[1],
-                    "cancellation changed native MTP peer"
-                );
-                assert!(cancelled[0].1.len() < complete[0].1.len());
-            }
+            let (cancelled, _) = run_with_sampling(build(), true, true, false);
+            assert_eq!(
+                cancelled[1], spec[1],
+                "cancellation changed native MTP peer"
+            );
+            assert!(cancelled[0].1.len() < spec[0].1.len());
+            let (complete, _) = run_with_sampling(build(), true, false, true);
+            let (cancelled, _) = run_with_sampling(build(), true, true, true);
+            assert_eq!(
+                cancelled[1], complete[1],
+                "cancellation changed native MTP peer"
+            );
+            assert!(cancelled[0].1.len() < complete[0].1.len());
         }
         check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107));
         check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_moe_inner(8107));

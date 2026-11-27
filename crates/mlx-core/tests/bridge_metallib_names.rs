@@ -217,15 +217,18 @@ const INKLING2_TOTAL_PIPELINES: i64 = 13 + 8 + 50 + 30;
 const INKLING2_NAX_ONLY_PIPELINES: i64 = 8 + 3 + 4;
 
 #[test]
-fn every_inkling2_kernel_is_in_the_metallib_and_builds() {
+fn every_inkling2_kernel_is_in_the_metallib() {
+    assert_names("inkling2", INKLING2_PREFIX_NAMES);
+}
+
+/// Verifies that every Inkling2 pipeline (including the 13
+/// `paged_attention_inkling2_*` decode kernels) builds on this GPU. Kept in
+/// the every-PR `rust-int` leg (~6s on hosted macOS runners) so Metal shader
+/// changes fail before merge.
+#[test]
+fn every_inkling2_kernel_builds_a_pipeline() {
     let c = check("inkling2", true);
-    assert_eq!(c.names, INKLING2_PREFIX_NAMES, "inkling2 prefix names");
-    assert!(
-        c.report.is_empty(),
-        "paged_attn.metallib does not match inkling2 dispatcher:\n{}",
-        c.report
-    );
-    assert_eq!(c.in_library, INKLING2_PREFIX_NAMES);
+    assert!(c.report.is_empty(), "{}", c.report);
     let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
     let apple10 = unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= 17;
     let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };

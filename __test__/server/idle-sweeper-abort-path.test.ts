@@ -24,6 +24,8 @@ import type { ServerResponse } from 'node:http';
 
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { handleCreateResponse } from '../../packages/server/src/endpoints/responses.js';
 import type { IdleSweeper } from '../../packages/server/src/idle-sweeper.js';

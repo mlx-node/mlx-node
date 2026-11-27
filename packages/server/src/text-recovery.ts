@@ -22,4 +22,4 @@
  *
  * Internal-only — not exported from `packages/server/src/index.ts`.
  */
-export { longestSuffixPrefixOverlap } from '@mlx-node/lm';
+export { longestSuffixPrefixOverlap } from '@mlx-node/lm/tool-call-buffer';

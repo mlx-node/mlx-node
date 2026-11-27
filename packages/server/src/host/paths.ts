@@ -43,6 +43,22 @@ export function resolveMlxNodeHome(): string {
 }
 
 /**
+ * Resolve the log directory for a verbose launch.
+ *
+ * Order: explicit `--log-dir` > `MLX_LOG_DIR` env > a fresh timestamped
+ * directory under `<mlxNodeHome>/logs/`. The timestamped default gives
+ * each launch its own dir so concurrent / sequential runs don't
+ * interleave into one file.
+ */
+export function resolveLogDir(explicit: string | undefined, mlxNodeHome: string): string {
+  if (explicit) return explicit;
+  const envDir = process.env.MLX_LOG_DIR;
+  if (envDir) return envDir;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return join(mlxNodeHome, 'logs', stamp);
+}
+
+/**
  * Resolve the directory where downloaded models live.
  *
  * Resolution order:

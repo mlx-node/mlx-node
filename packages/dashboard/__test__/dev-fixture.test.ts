@@ -19,7 +19,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   assertFixtureHome,
@@ -54,8 +54,24 @@ import { discoverLocalModels } from '../src/models.js';
 import { closePrefixCacheWalks, scanPrefixCaches } from '../src/prefix-cache.js';
 
 let home: string;
+let readonlyHome: string;
+let readonlySummary: ReturnType<typeof writeFixtureHome>;
+let twiceHome: string;
 let dash: DashboardDb | undefined;
 const now = Date.now();
+
+beforeAll(() => {
+  readonlyHome = mkdtempSync(join(tmpdir(), 'dash-dev-fixture-ro-'));
+  readonlySummary = writeFixtureHome(readonlyHome, { now });
+  twiceHome = mkdtempSync(join(tmpdir(), 'dash-dev-fixture-twice-'));
+  writeFixtureHome(twiceHome, { now });
+  writeFixtureHome(twiceHome, { now });
+});
+
+afterAll(() => {
+  rmSync(readonlyHome, { recursive: true, force: true });
+  rmSync(twiceHome, { recursive: true, force: true });
+});
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'dash-dev-fixture-'));
@@ -70,8 +86,8 @@ afterEach(() => {
 
 describe('dev fixture home', () => {
   it('ingests 30 days of v2 traces for ten models without pruning a file', async () => {
-    const summary = writeFixtureHome(home, { now });
-    const paths = fixturePaths(home);
+    const summary = readonlySummary;
+    const paths = fixturePaths(readonlyHome);
     const files = readdirSync(paths.tracesDir);
     dash = openDashboardDb(':memory:');
     const result = await ingestTraces(dash, paths.tracesDir);
@@ -95,8 +111,7 @@ describe('dev fixture home', () => {
   });
 
   it('holds old, measured and unmeasured traces, and sessions with and without a measured prefill', async () => {
-    writeFixtureHome(home, { now });
-    const paths = fixturePaths(home);
+    const paths = fixturePaths(readonlyHome);
     dash = openDashboardDb(':memory:');
     await ingestTraces(dash, paths.tracesDir);
     const count = (where: string): number =>
@@ -170,8 +185,7 @@ describe('dev fixture home', () => {
   });
 
   it('ingests the runtime series and serves a running live file with this process as its pid', async () => {
-    writeFixtureHome(home, { now });
-    const paths = fixturePaths(home);
+    const paths = fixturePaths(readonlyHome);
     dash = openDashboardDb(':memory:');
     const runtime = await ingestRuntime(dash, paths.runtimeDir, { now });
     expect(runtime.pruned).toBe(0);
@@ -276,8 +290,7 @@ describe('dev fixture home', () => {
   });
 
   it('holds ten models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
-    writeFixtureHome(home, { now });
-    const paths = fixturePaths(home);
+    const paths = fixturePaths(readonlyHome);
     const models = discoverLocalModels(paths.modelsDir);
     expect(models.models).toHaveLength(10);
     expect(models.companions).toHaveLength(2);
@@ -299,9 +312,7 @@ describe('dev fixture home', () => {
 
 describe('dev fixture content for the manage pages', () => {
   it('writes three model caches the scan reads', () => {
-    writeFixtureHome(home, { now });
-    writeFixtureHome(home, { now });
-    const paths = fixturePaths(home);
+    const paths = fixturePaths(twiceHome);
     const scan = scanPrefixCaches([{ root: paths.prefixCacheRoot, isDefault: true, engines: [] }], { canLock: true });
     const rows = scan.roots[0]!.namespaces;
     expect(rows).toHaveLength(3);
@@ -316,8 +327,7 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('blocks one catalog slug with a one-file leftover that a cleanup can replace', () => {
-    writeFixtureHome(home, { now });
-    const build = catalogWithState(fixturePaths(home).modelsDir)
+    const build = catalogWithState(fixturePaths(readonlyHome).modelsDir)
       .flatMap((item) => item.builds)
       .find((item) => item.slug === CATALOG_BLOCKED.slug);
     expect(build?.blocker).toEqual({
@@ -337,26 +347,23 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('makes one catalog slug a link to a folder of model files inside the home, which a cleanup removes alone', () => {
-    writeFixtureHome(home, { now });
-    const build = catalogWithState(fixturePaths(home).modelsDir)
+    const build = catalogWithState(fixturePaths(twiceHome).modelsDir)
       .flatMap((item) => item.builds)
       .find((item) => item.slug === CATALOG_LINK.slug);
     expect(build).toMatchObject({ present: false, heldBy: null, blockedByForeignDir: true, listed: false });
     expect(build?.blocker).toMatchObject({
       kind: 'symlink',
       holdsModel: true,
-      linkTarget: realpathSync(join(home, CATALOG_LINK.target)),
+      linkTarget: realpathSync(join(twiceHome, CATALOG_LINK.target)),
       dangling: false,
       locked: false,
     });
     // A second run over the same home keeps the link and its folder; the tree check accepts both.
-    writeFixtureHome(home, { now });
-    expect(() => assertFixtureTree(home)).not.toThrow();
+    expect(() => assertFixtureTree(twiceHome)).not.toThrow();
   });
 
   it('holds one catalog slug with a GGUF folder that Update can adopt', () => {
-    writeFixtureHome(home, { now });
-    const builds = catalogWithState(fixturePaths(home).modelsDir).flatMap((item) => item.builds);
+    const builds = catalogWithState(fixturePaths(readonlyHome).modelsDir).flatMap((item) => item.builds);
     const build = builds.find((item) => item.slug === CATALOG_UPDATE.slug);
     expect(build).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
     expect(build?.blocker).toMatchObject({ kind: 'directory', fileCount: 4, truncated: false, holdsModel: true });
@@ -364,8 +371,7 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('installs the first build of one catalog model that reads as installed with an update, with no network', () => {
-    writeFixtureHome(home, { now });
-    const item = catalogWithState(fixturePaths(home).modelsDir).find((entry) =>
+    const item = catalogWithState(fixturePaths(readonlyHome).modelsDir).find((entry) =>
       entry.builds.some((build) => build.slug === CATALOG_INSTALL.slug),
     );
     const [first, second] = item?.builds ?? [];
@@ -394,13 +400,11 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('holds one catalog model that Locate made from a folder on another disk, with links inside the home', () => {
-    writeFixtureHome(home, { now });
-    writeFixtureHome(home, { now });
-    const modelsDir = fixturePaths(home).modelsDir;
+    const modelsDir = fixturePaths(twiceHome).modelsDir;
     const build = catalogWithState(modelsDir)
       .flatMap((item) => item.builds)
       .find((item) => item.slug === CATALOG_LOCATED.slug);
-    const source = realpathSync(join(home, CATALOG_LOCATED.source));
+    const source = realpathSync(join(twiceHome, CATALOG_LOCATED.source));
     expect(build).toMatchObject({ present: true, installed: true, blocker: null });
     expect(build?.located).toEqual({ from: source, mode: 'linked', filesAvailable: true });
     expect(build?.assetsRepo).toBe(build?.localAssetsRepo);
@@ -410,12 +414,11 @@ describe('dev fixture content for the manage pages', () => {
     expect(discoverLocalModels(modelsDir).models.find((model) => model.name === CATALOG_LOCATED.slug)?.located).toEqual(
       { from: source, mode: 'linked', filesAvailable: true, filesStay: true },
     );
-    expect(() => assertFixtureTree(home)).not.toThrow();
+    expect(() => assertFixtureTree(twiceHome)).not.toThrow();
   });
 
   it('writes a long session with subagents and a live session whose last turn is still running', () => {
-    writeFixtureHome(home, { now });
-    const reader = new AgentSessionsReader({ agentHome: fixturePaths(home).agentHome, now: () => now });
+    const reader = new AgentSessionsReader({ agentHome: fixturePaths(readonlyHome).agentHome, now: () => now });
     const long = reader.detail(LONG_SESSION_ID)!;
     expect(long.turns.length).toBeGreaterThanOrEqual(40);
     const kinds = new Set(long.transcript.map((entry) => entry.kind));
@@ -433,8 +436,7 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('gives the agent timeline a turn for each case it draws', () => {
-    writeFixtureHome(home, { now });
-    const reader = new AgentSessionsReader({ agentHome: fixturePaths(home).agentHome, now: () => now });
+    const reader = new AgentSessionsReader({ agentHome: fixturePaths(readonlyHome).agentHome, now: () => now });
     const timeline = (id: string, turn: number) => {
       const body = reader.timeline(id, turn);
       if (body === null || body === 'no-turn') throw new Error(`no timeline for turn ${String(turn)}`);
@@ -544,10 +546,9 @@ describe('dev fixture content for the manage pages', () => {
   });
 
   it('gives each coding agent its own state: current, old command, broken block', () => {
-    writeFixtureHome(home, { now });
-    const claude = readFileSync(join(home, '.claude', 'CLAUDE.md'), 'utf8');
-    const codex = readFileSync(join(home, '.codex', 'AGENTS.md'), 'utf8');
-    const grok = readFileSync(join(home, '.grok', 'AGENTS.md'), 'utf8');
+    const claude = readFileSync(join(readonlyHome, '.claude', 'CLAUDE.md'), 'utf8');
+    const codex = readFileSync(join(readonlyHome, '.codex', 'AGENTS.md'), 'utf8');
+    const grok = readFileSync(join(readonlyHome, '.grok', 'AGENTS.md'), 'utf8');
     expect(claude.includes(MANAGED_BEGIN) && claude.includes(MANAGED_END)).toBe(true);
     expect(codex.includes(MANAGED_BEGIN) && codex.includes(MANAGED_END)).toBe(true);
     expect(codex).not.toEqual(claude.slice(claude.indexOf(MANAGED_BEGIN)));

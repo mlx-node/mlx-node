@@ -2,7 +2,7 @@
 //!
 //! Run with a dense Qwen3.5 checkpoint. Installed vision/MTP weights are
 //! allowed because every request explicitly uses text-only plain AR:
-//! `QWEN35_STAGE2_MODEL_PATH=/abs/qwen3.5-text cargo test -p mlx-core --test qwen3_5_concurrent_batched_parity -- --ignored --nocapture`
+//! `QWEN35_STAGE2_MODEL_PATH=/abs/qwen3.5-text cargo test -p mlx-core --features e2e-tests --test qwen3_5_concurrent_batched_parity -- --ignored --nocapture`
 
 use std::fs;
 use std::path::{Path, PathBuf};

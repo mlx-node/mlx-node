@@ -5,7 +5,9 @@ import {
   DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL,
   type ServableModel,
 } from '@mlx-node/server';
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 /**
  * Minimal session-capable stub for observing per-model registry state
