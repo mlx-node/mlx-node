@@ -1,6 +1,7 @@
 {
   "name": "@mlx-node/core-linux-arm64-gnu",
   "version": "0.0.22",
+  "private": true,
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
   "license": "MIT",
   "repository": {

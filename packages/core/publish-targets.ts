@@ -1,3 +1,6 @@
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { parseTriple } from '@napi-rs/cli';
 
 // Which platform targets the publish job may collect `.node` artifacts for.
@@ -89,4 +92,21 @@ export function resolvePublishedTargets(inputs: PublishTargetInputs): string[] {
   }
 
   return configuredTargets.filter((triple) => declared.has(parseTriple(triple).platformArchABI));
+}
+
+// A directory under packages/core/npm/ is a published platform package only
+// when it holds a package.json that is not private: a desktop-only from-source
+// build lands its addon in npm/<triple>/ with no manifest, and a private one is
+// skipped by `yarn workspaces foreach --no-private npm publish`.
+export function listPublishedPlatformDirs(npmDir: string): string[] {
+  const dirs: string[] = [];
+  for (const entry of readdirSync(npmDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = join(npmDir, entry.name, 'package.json');
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { private?: unknown };
+    if (manifest.private === true) continue;
+    dirs.push(entry.name);
+  }
+  return dirs.sort();
 }

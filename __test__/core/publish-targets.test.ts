@@ -1,9 +1,10 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, it, expect } from 'vite-plus/test';
 
-import { resolvePublishedTargets } from '../../packages/core/publish-targets';
+import { listPublishedPlatformDirs, resolvePublishedTargets } from '../../packages/core/publish-targets';
 
 const CORE = 'packages/core';
 const NAME = '@mlx-node/core';
@@ -24,10 +25,7 @@ describe('resolvePublishedTargets', () => {
 
   it('matches the real packages/core manifest', () => {
     const manifest = JSON.parse(readFileSync(join(CORE, 'package.json'), 'utf-8'));
-    const npmDir = join(CORE, 'npm');
-    const platformPackageDirs = readdirSync(npmDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && existsSync(join(npmDir, entry.name, 'package.json')))
-      .map((entry) => entry.name);
+    const platformPackageDirs = listPublishedPlatformDirs(join(CORE, 'npm'));
 
     expect(manifest.napi.targets).toContain('aarch64-pc-windows-msvc');
     expect(
@@ -37,7 +35,24 @@ describe('resolvePublishedTargets', () => {
         optionalDependencies: Object.keys(manifest.optionalDependencies ?? {}),
         platformPackageDirs,
       }),
-    ).toEqual(['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu']);
+    ).toEqual(['aarch64-apple-darwin']);
+  });
+
+  it('counts only platform folders with a package.json that is not private', () => {
+    const npmDir = mkdtempSync(join(tmpdir(), 'publish-targets-'));
+    try {
+      mkdirSync(join(npmDir, 'darwin-arm64'));
+      writeFileSync(join(npmDir, 'darwin-arm64', 'package.json'), JSON.stringify({ name: `${NAME}-darwin-arm64` }));
+      mkdirSync(join(npmDir, 'linux-arm64-gnu'));
+      writeFileSync(
+        join(npmDir, 'linux-arm64-gnu', 'package.json'),
+        JSON.stringify({ name: `${NAME}-linux-arm64-gnu`, private: true }),
+      );
+      mkdirSync(join(npmDir, 'win32-arm64-msvc'));
+      expect(listPublishedPlatformDirs(npmDir)).toEqual(['darwin-arm64']);
+    } finally {
+      rmSync(npmDir, { recursive: true, force: true });
+    }
   });
 
   // The whole point of deriving rather than committing a second target list:
