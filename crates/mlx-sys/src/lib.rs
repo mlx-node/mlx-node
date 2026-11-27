@@ -4925,6 +4925,233 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    // Hy4-flash CUDA kernels (crates/mlx-sys/src/cuda/hy4/{nvfp4,moe,hc_engram,mla,indexer}.cpp).
+    // All return nullptr / false on non-CUDA builds (macOS / CPU).
+    pub fn mlx_hy4_nvfp4_swizzle_scales_cuda(scales: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_hy4_nvfp4_few_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_nvfp4_prefill_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        swizzled_scales_opt: *mut mlx_array,
+        mode: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_lm_head_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales_opt: *mut mlx_array,
+        weight_mode: i32,
+        out_mode: i32,
+        out_a: *mut *mut mlx_array,
+        out_b: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_grouped_q8_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        gate_opt: *mut mlx_array,
+        n_heads: i32,
+        in_dim: i32,
+        out_dim: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_moe_router_topk_cuda(
+        x_h: *mut mlx_array,
+        router_w_h: *mut mlx_array,
+        exp_probs_b_opt_h: *mut mlx_array,
+        top_k: i32,
+        route_scale: f32,
+        norm_topk: bool,
+        out_ids: *mut *mut mlx_array,
+        out_weights: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_moe_routed_few_cuda(
+        z_h: *mut mlx_array,
+        topk_ids_h: *mut mlx_array,
+        topk_weights_h: *mut mlx_array,
+        gate_w_h: *mut mlx_array,
+        gate_s_h: *mut mlx_array,
+        up_w_h: *mut mlx_array,
+        up_s_h: *mut mlx_array,
+        down_w_h: *mut mlx_array,
+        down_s_h: *mut mlx_array,
+        mode: i32,
+        swiglu_limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_moe_routed_prefill_cuda(
+        z_h: *mut mlx_array,
+        topk_ids_h: *mut mlx_array,
+        topk_weights_h: *mut mlx_array,
+        gate_w_h: *mut mlx_array,
+        gate_s_h: *mut mlx_array,
+        up_w_h: *mut mlx_array,
+        up_s_h: *mut mlx_array,
+        down_w_h: *mut mlx_array,
+        down_s_h: *mut mlx_array,
+        mode: i32,
+        swiglu_limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_pre_cuda(
+        x_h: *mut mlx_array,
+        w_fn_h: *mut mlx_array,
+        s_fn_h: *mut mlx_array,
+        scale_h: *mut mlx_array,
+        base_h: *mut mlx_array,
+        norm_w_h: *mut mlx_array,
+        fn_mode: i32,
+        norm_eps: f32,
+        hc_eps: f32,
+        hc_mag: f32,
+        head_only: bool,
+        out_h: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_hc_head_cuda(
+        x_h: *mut mlx_array,
+        w_fn_h: *mut mlx_array,
+        s_fn_h: *mut mlx_array,
+        scale_h: *mut mlx_array,
+        base_h: *mut mlx_array,
+        output_norm_h: *mut mlx_array,
+        fn_mode: i32,
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_post_cuda(
+        x_h: *mut mlx_array,
+        y_h: *mut mlx_array,
+        post_h: *mut mlx_array,
+        post_norm_w_h: *mut mlx_array,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_hc_post_pre_cuda(
+        x_h: *mut mlx_array,
+        y_h: *mut mlx_array,
+        prev_post_h: *mut mlx_array,
+        prev_post_norm_w_h: *mut mlx_array,
+        w_fn_h: *mut mlx_array,
+        s_fn_h: *mut mlx_array,
+        scale_h: *mut mlx_array,
+        base_h: *mut mlx_array,
+        next_norm_w_h: *mut mlx_array,
+        fn_mode: i32,
+        norm_eps: f32,
+        hc_eps: f32,
+        hc_mag: f32,
+        out_x: *mut *mut mlx_array,
+        out_h: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_engram_lookup_norm_cuda(
+        raw_rows_h: *mut mlx_array,
+        lookup_norm_h: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_engram_gate_add_cuda(
+        x_h: *mut mlx_array,
+        kv_h: *mut mlx_array,
+        kv_b_h: *mut mlx_array,
+        gate_w_h: *mut mlx_array,
+        pre_gamma_h: *mut mlx_array,
+        hc_scale_h: *mut mlx_array,
+        keep_mask_h: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mtp_eh_norm_concat_cuda(
+        emb_h: *mut mlx_array,
+        hidden_h: *mut mlx_array,
+        enorm_h: *mut mlx_array,
+        hnorm_h: *mut mlx_array,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_ring_write_cuda(
+        buf_h: *mut mlx_array,
+        rows_h: *mut mlx_array,
+        start_pos: i64,
+        ring_cap: i32,
+        force_in_place: bool,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_prep_kv_store_cuda(
+        q_a_opt_h: *mut mlx_array,
+        kv_a_h: *mut mlx_array,
+        q_a_norm_opt_h: *mut mlx_array,
+        kv_a_norm_h: *mut mlx_array,
+        inv_freq_h: *mut mlx_array,
+        kv_buf_h: *mut mlx_array,
+        slot_start: i64,
+        rope_start: i64,
+        ring_cap: i32,
+        norm_eps: f32,
+        out_qr: *mut *mut mlx_array,
+        out_kv_buf: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_rope_norm_q_cuda(
+        q_abs_h: *mut mlx_array,
+        q_raw_h: *mut mlx_array,
+        inv_freq_h: *mut mlx_array,
+        rope_start: i64,
+        nope_dim: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_sdpa_cuda(
+        q_h: *mut mlx_array,
+        kv_buf_h: *mut mlx_array,
+        sinks_h: *mut mlx_array,
+        idx_opt_h: *mut mlx_array,
+        slot_start: i64,
+        total_len: i32,
+        ring_cap: i32,
+        window: i32,
+        scale: f32,
+        kv_lora: i32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kpool_compress_cuda(
+        tok_k_h: *mut mlx_array,
+        w_val_h: *mut mlx_array,
+        w_gate_h: *mut mlx_array,
+        ape_h: *mut mlx_array,
+        comp_norm_h: *mut mlx_array,
+        inv_freq_h: *mut mlx_array,
+        pooled_buf_h: *mut mlx_array,
+        start_group: i64,
+        kpool: i32,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_indexer_select_cuda(
+        q_idx_raw_h: *mut mlx_array,
+        w_proj_h: *mut mlx_array,
+        pooled_buf_h: *mut mlx_array,
+        inv_freq_h: *mut mlx_array,
+        slot_start: i64,
+        rope_start: i64,
+        kpool: i32,
+        top_k: i32,
+        select_tail: bool,
+        weight_scale: f32,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
     pub fn mlx_hy4_hc_mix_reduce(
         x: *mut mlx_array,
         weight: *mut mlx_array,

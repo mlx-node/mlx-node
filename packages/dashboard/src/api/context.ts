@@ -14,6 +14,8 @@
  * pins it to a thread — `routes.ts` cannot put it on the other one.
  */
 
+import type { CatalogGpuInfo } from '@mlx-node/agent/catalog';
+
 import type { AgentSessionsReader } from '../agent-sessions/reader.js';
 import type { WorkIndex } from '../chat/index-file.js';
 import type { ProvidersService } from '../chat/providers/service.js';
@@ -85,6 +87,8 @@ export interface MainApiContext extends ApiPaths {
   providers?: ProvidersService;
   /** System One (Clairic + CLEF) async job runner and history. */
   systemone?: SystemOneService;
+  /** Host GPU capability probe (cached per runtime; absent in bare unit-test stubs). */
+  hostGpu?: () => Promise<CatalogGpuInfo | undefined>;
 }
 
 /**

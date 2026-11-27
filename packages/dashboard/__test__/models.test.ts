@@ -1178,7 +1178,9 @@ describe('catalogWithState — sidecar provenance reaches update discovery', () 
       revision: 'b'.repeat(40),
     });
 
-    const item = buildItem(slug);
+    const item = catalogWithState(modelsDir, 'darwin')
+      .flatMap((entry) => entry.builds)
+      .find((candidate) => candidate.slug === slug)!;
     expect(item.localAssetsRepo).toBe(build.assetsRepo);
     expect(item.localAssetsRevision).toBe('b'.repeat(40));
 

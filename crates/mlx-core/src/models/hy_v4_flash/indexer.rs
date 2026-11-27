@@ -253,7 +253,7 @@ pub fn scores(q: &MxArray, w: &MxArray, keys: &MxArray) -> Result<MxArray> {
 /// Extra slots reserved in [`TokTail`]'s circular ring beyond `keep` so
 /// decode steps up to 4 rows write disjoint slots and roll back in O(1)
 /// without cloning the ring buffer.
-const TAIL_ROLLBACK_SLACK: usize = 4;
+pub(crate) const TAIL_ROLLBACK_SLACK: usize = 4;
 
 fn linear_tail_range(
     buf: &MxArray,
@@ -302,8 +302,12 @@ impl TokTail {
         }
     }
 
-    fn target_ring_cap(&self) -> usize {
+    pub(crate) fn target_ring_cap(&self) -> usize {
         self.keep + TAIL_ROLLBACK_SLACK
+    }
+
+    pub(crate) fn ring_cap(&self) -> usize {
+        self.ring_cap
     }
 
     /// Max rows a push can append without touching any of the `keep` held rows,
@@ -566,6 +570,98 @@ impl TokTail {
         self.len = prev_len;
         self.held = prev_held;
     }
+
+    /// GPU-resident circular ring push on CUDA `device == 0` via `kernels::hy4::ring_write`.
+    pub(crate) fn cuda_push(&mut self, tok: &MxArray) -> Result<()> {
+        self.cuda_push_with_detach(tok, false)
+    }
+
+    /// Like [`Self::cuda_push`]; when `detach_prev` is true (used only on large
+    /// prefill chunks whose linear compressor still holds a lazy view of the
+    /// previous ring), allocates or copies the destination buffer so in-place
+    /// `Hy4RingWriteCuda` cannot overwrite the previous ring before it is read.
+    fn cuda_push_with_detach(&mut self, tok: &MxArray, detach_prev: bool) -> Result<()> {
+        let tok_f32 = if tok.dtype()? == DType::Float32 {
+            tok.clone()
+        } else {
+            tok.astype(DType::Float32)?
+        };
+        let n = tok_f32.shape_at(0)? as usize;
+        let cap = if self.ring_cap > 0 {
+            self.ring_cap
+        } else {
+            self.target_ring_cap()
+        };
+        let cap_i64 = i64::try_from(cap).map_err(|_| bad("tail ring capacity exceeds i64"))?;
+        let alloc_ring = || -> Result<MxArray> {
+            if let Some(b) = MxArray::alloc_gpu_uninit(&[cap_i64, self.width], DType::Float32)? {
+                return Ok(b);
+            }
+            let b = MxArray::zeros(&[cap_i64, self.width], Some(DType::Float32))?;
+            MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash indexer tail alloc")?;
+            Ok(b)
+        };
+
+        let prev = if self.ring_cap > 0 {
+            match self.rows.take() {
+                Some(mut b) => {
+                    if detach_prev {
+                        if n >= cap {
+                            alloc_ring()?
+                        } else {
+                            if b.is_available() {
+                                b.promote_cuda_device()?;
+                            }
+                            b.deep_copy()?
+                        }
+                    } else {
+                        if b.is_available() {
+                            b.promote_cuda_device()?;
+                        }
+                        b
+                    }
+                }
+                None => alloc_ring()?,
+            }
+        } else {
+            let base = alloc_ring()?;
+            if let Some(linear) = self.rows.take()
+                && self.held > 0
+            {
+                let first_pos = self.len - self.held;
+                let filled = super::ops::ring_write(&base, &linear, first_pos % cap, cap)?;
+                drop(base);
+                filled
+            } else {
+                base
+            }
+        };
+
+        let (src, write_start) = if n > cap {
+            (
+                tok_f32.slice(&[(n - cap) as i64, 0], &[n as i64, self.width])?,
+                self.len + n - cap,
+            )
+        } else {
+            (tok_f32, self.len)
+        };
+        let next = match crate::kernels::hy4::ring_write_in_place(
+            &prev,
+            &src,
+            write_start as i64,
+            cap as i32,
+        )? {
+            Some(updated) => updated,
+            None => super::ops::ring_write(&prev, &src, write_start % cap, cap)?,
+        };
+        drop(prev);
+        super::stats::defer(&next, "hy_v4_flash indexer tail")?;
+        self.rows = Some(next);
+        self.ring_cap = cap;
+        self.held = (self.held + n).min(self.keep);
+        self.len += n;
+        Ok(())
+    }
 }
 
 /// The lengths and open rows of an indexer state, to go back to later.
@@ -775,6 +871,30 @@ impl IndexerState {
         &self.tail
     }
 
+    pub(crate) fn cuda_pooled_buf_clone(&self) -> Option<MxArray> {
+        self.pooled.cuda_buf_clone()
+    }
+
+    pub(crate) fn cuda_restore_pooled_buf(&mut self, buf: Option<MxArray>) {
+        self.pooled.cuda_restore_buf_opt(buf);
+    }
+
+    pub(crate) fn cuda_tail_rows_clone(&self) -> Option<MxArray> {
+        self.tail.rows.clone()
+    }
+
+    pub(crate) fn cuda_restore_tail_rows(&mut self, rows: Option<MxArray>) {
+        self.tail.rows = rows;
+    }
+
+    pub(crate) fn is_pooled_buf_available(&self) -> bool {
+        self.pooled.is_buf_available()
+    }
+
+    pub(crate) fn is_tail_buf_available(&self) -> bool {
+        self.tail.rows.as_ref().is_none_or(MxArray::is_available)
+    }
+
     pub fn mark(&self) -> IndexerMark {
         IndexerMark {
             tail: self
@@ -795,6 +915,16 @@ impl IndexerState {
     pub(crate) fn rollback_push(&mut self, prev_len: usize, prev_held: usize) -> Result<()> {
         self.pooled.cut(prev_len / self.tail.kpool)?;
         self.tail.rollback_push(prev_len, prev_held);
+        Ok(())
+    }
+
+    /// Reverts a failed first write on a previously empty indexer state.
+    pub(crate) fn reset_empty(&mut self) -> Result<()> {
+        self.pooled.cut(0)?;
+        self.tail.rows = None;
+        self.tail.ring_cap = 0;
+        self.tail.held = 0;
+        self.tail.len = 0;
         Ok(())
     }
 
@@ -1554,6 +1684,294 @@ impl Indexer {
             restore_in(pooled, tail, mark)?;
         }
         out
+    }
+
+    fn cuda_update_in(
+        &self,
+        w: &IndexerWeights,
+        tok_k: &MxArray,
+        inv_freq: &MxArray,
+        start: usize,
+        st: &mut IndexerState,
+    ) -> Result<()> {
+        let n = tok_k.shape_at(0)? as usize;
+        if n == 0 || start != st.tail.len || st.tail.kpool != self.g.kpool {
+            return Err(bad(format!(
+                "cuda update of {n} rows at {start}, {} positions held",
+                st.tail.len
+            )));
+        }
+        let kp = self.g.kpool;
+        let plan = self.g.plan(start, n);
+        let open = st.tail.open(st.pooled.len());
+        if st.pooled.len() != plan.groups.start || open != plan.open_in {
+            return Err(bad(format!(
+                "state holds {} groups and open {open:?}, the call needs {:?} and {:?}",
+                st.pooled.len(),
+                plan.groups,
+                plan.open_in
+            )));
+        }
+        let tok_f32 = if tok_k.dtype()? == DType::Float32 {
+            tok_k.clone()
+        } else {
+            tok_k.astype(DType::Float32)?
+        };
+        let k = plan.groups.len();
+        let cap = if st.tail.ring_cap > 0 {
+            st.tail.ring_cap
+        } else {
+            st.tail.target_ring_cap()
+        };
+        // Constant-topology circular ring path for decode / verify / draft / commit:
+        // push `tok_f32` into the circular `tail` ring first, then unconditionally
+        // invoke `Hy4KpoolCompressCuda` in ring mode (reading `((start_group + g) * kp + s) % cap`,
+        // including `k == 0` as a 1-block no-op). Eliminates `last_rows` wrap
+        // `concatenate`, `slice`, and conditional graph-node churn across steps.
+        // Require the full span from the oldest incoming open-group row through the
+        // end of the append (`plan.open_in.len() + n`) to fit inside `cap` whenever
+        // `k > 0` so `cuda_push` never overwrites an open group before compression reads it.
+        let ring_span = if k > 0 { plan.open_in.len() + n } else { n };
+        if ring_span <= cap && kp <= 16 && st.pooled.cap() > 0 {
+            st.tail.cuda_push(&tok_f32)?;
+            let tail_buf = st
+                .tail
+                .rows
+                .as_ref()
+                .ok_or_else(|| bad("tok_k tail ring buffer missing after push"))?;
+            let pooled_buf = st.pooled.cuda_ensure_buf(plan.groups.end.max(1))?;
+            let ring_kpool = -(((k as i32) << 8) | (kp as i32));
+            if let Some(updated) = crate::kernels::hy4::kpool_compress(
+                tail_buf,
+                &w.compressor_value,
+                &w.compressor_gate,
+                &w.compressor_ape,
+                &w.compressor_norm,
+                inv_freq,
+                pooled_buf,
+                plan.groups.start as i64,
+                ring_kpool,
+                self.g.eps,
+            )? {
+                st.pooled.cuda_commit(updated, plan.groups.end)?;
+                return Ok(());
+            }
+            if k > 0 {
+                let d = self.g.head_dim as i64;
+                let grp_tok = linear_tail_range(
+                    tail_buf,
+                    st.tail.ring_cap,
+                    d,
+                    plan.groups.start * kp,
+                    k * kp,
+                    false,
+                )?;
+                let grp = grp_tok.reshape(&[k as i64, kp as i64, d])?;
+                let keys = self.pool(w, &grp, plan.groups.start)?;
+                st.pooled.write(&keys, plan.groups.start)?;
+            }
+            return Ok(());
+        }
+
+        let used_prev_tail = !plan.groups.is_empty() && !plan.open_in.is_empty();
+        if !plan.groups.is_empty() {
+            let open_len = plan.open_in.len();
+            let d = self.g.head_dim as i64;
+            let all = match st.tail.last_rows(open_len)? {
+                Some(open_rows) => MxArray::concatenate(&open_rows, &tok_f32, 0)?,
+                None => tok_f32.clone(),
+            };
+            let need_rows = (k * kp) as i64;
+            let grp_tok = if all.shape_at(0)? == need_rows {
+                all
+            } else {
+                all.slice(&[0, 0], &[need_rows, d])?
+            };
+            let pooled_buf = st.pooled.cuda_ensure_buf(plan.groups.end)?;
+            if let Some(updated) = crate::kernels::hy4::kpool_compress(
+                &grp_tok,
+                &w.compressor_value,
+                &w.compressor_gate,
+                &w.compressor_ape,
+                &w.compressor_norm,
+                inv_freq,
+                pooled_buf,
+                plan.groups.start as i64,
+                kp as i32,
+                self.g.eps,
+            )? {
+                st.pooled.cuda_commit(updated, plan.groups.end)?;
+            } else {
+                let grp = grp_tok.reshape(&[k as i64, kp as i64, d])?;
+                let keys = self.pool(w, &grp, plan.groups.start)?;
+                st.pooled.write(&keys, plan.groups.start)?;
+            }
+        }
+        st.tail.cuda_push_with_detach(&tok_f32, used_prev_tail)
+    }
+
+    fn cuda_select_from_state(
+        &self,
+        q_idx_raw: &MxArray,
+        w_proj: &MxArray,
+        inv_freq: &MxArray,
+        slot_start: usize,
+        rope_start: usize,
+        st: &mut IndexerState,
+    ) -> Result<MxArray> {
+        let top_k = ((self.g.n_top + usize::from(self.g.select_tail)) * self.g.kpool) as i32;
+        let dummy_pooled;
+        let pooled_buf: &MxArray = if st.pooled.cap() > 0 {
+            st.pooled.cuda_ensure_buf(st.pooled.len().max(1))?
+        } else {
+            let d = self.g.head_dim as i64;
+            dummy_pooled = match MxArray::alloc_gpu_uninit(&[1, d], super::cache::ROW_DTYPE)? {
+                Some(b) => b,
+                None => MxArray::zeros(&[1, d], Some(super::cache::ROW_DTYPE))?,
+            };
+            &dummy_pooled
+        };
+        crate::kernels::hy4::indexer_select(
+            q_idx_raw,
+            w_proj,
+            pooled_buf,
+            inv_freq,
+            slot_start as i64,
+            rope_start as i64,
+            self.g.kpool as i32,
+            top_k,
+            self.g.select_tail,
+            self.g.weight_scale,
+        )?
+        .ok_or_else(|| bad("hy4::indexer_select CUDA kernel declined input"))
+    }
+
+    /// CUDA fast path for `update`: compresses newly closed groups directly into
+    /// `st.pooled`'s GPU `device == 0` slab and pushes `tok_k` into `st.tail`'s GPU ring.
+    pub(crate) fn cuda_update(
+        &self,
+        w: &IndexerWeights,
+        tok_k: &MxArray,
+        inv_freq: &MxArray,
+        start: usize,
+        st: &mut IndexerState,
+    ) -> Result<()> {
+        let n = tok_k.shape_at(0)? as usize;
+        let fast_rollback = (st.tail.len == 0 && n <= st.tail.target_ring_cap())
+            || (st.tail.ring_cap > 0 && n <= st.tail.rollback_slack());
+        if fast_rollback {
+            let (prev_len, prev_held, prev_groups, had_buf) = (
+                st.tail.len,
+                st.tail.held,
+                st.pooled.len(),
+                st.tail.rows.is_some(),
+            );
+            let out = self.cuda_update_in(w, tok_k, inv_freq, start, st);
+            if out.is_err() {
+                st.pooled.truncate(prev_groups)?;
+                if !had_buf {
+                    st.tail.rows = None;
+                    st.tail.ring_cap = 0;
+                    st.tail.held = 0;
+                    st.tail.len = 0;
+                } else {
+                    st.tail.rollback_push(prev_len, prev_held);
+                }
+            }
+            return out;
+        }
+        let mark = st.mark();
+        let out = self.cuda_update_in(w, tok_k, inv_freq, start, st);
+        if out.is_err() {
+            st.restore(mark)?;
+        }
+        out
+    }
+
+    /// CUDA fast path for `select`: updates `st` via `kpool_compress` + `ring_write`
+    /// and selects top-K cell indices `[M, kmax]` i32 via `hy4::indexer_select`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cuda_select(
+        &self,
+        w: &IndexerWeights,
+        tok_k: &MxArray,
+        q_idx_raw: &MxArray,
+        w_proj: &MxArray,
+        inv_freq: &MxArray,
+        slot_start: usize,
+        rope_start: usize,
+        st: &mut IndexerState,
+    ) -> Result<MxArray> {
+        let n = tok_k.shape_at(0)? as usize;
+        let fast_rollback = (st.tail.len == 0 && n <= st.tail.target_ring_cap())
+            || (st.tail.ring_cap > 0 && n <= st.tail.rollback_slack());
+        if fast_rollback {
+            let (prev_len, prev_held, prev_groups, had_buf) = (
+                st.tail.len,
+                st.tail.held,
+                st.pooled.len(),
+                st.tail.rows.is_some(),
+            );
+            let out = self
+                .cuda_update_in(w, tok_k, inv_freq, slot_start, st)
+                .and_then(|()| {
+                    self.cuda_select_from_state(
+                        q_idx_raw, w_proj, inv_freq, slot_start, rope_start, st,
+                    )
+                });
+            if out.is_err() {
+                st.pooled.truncate(prev_groups)?;
+                if !had_buf {
+                    st.tail.rows = None;
+                    st.tail.ring_cap = 0;
+                    st.tail.held = 0;
+                    st.tail.len = 0;
+                } else {
+                    st.tail.rollback_push(prev_len, prev_held);
+                }
+            }
+            return out;
+        }
+        let mark = st.mark();
+        let out = self
+            .cuda_update_in(w, tok_k, inv_freq, slot_start, st)
+            .and_then(|()| {
+                self.cuda_select_from_state(q_idx_raw, w_proj, inv_freq, slot_start, rope_start, st)
+            });
+        if out.is_err() {
+            st.restore(mark)?;
+        }
+        out
+    }
+
+    /// CUDA fast path for single-row read-only selection (`select_tail == true`),
+    /// avoiding `tok_k` projection and state mutation on the final MTP draft step.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cuda_select_readonly(
+        &self,
+        q_idx_raw: &MxArray,
+        w_proj: &MxArray,
+        inv_freq: &MxArray,
+        slot_start: usize,
+        rope_start: usize,
+        st: &mut IndexerState,
+    ) -> Result<MxArray> {
+        let n = q_idx_raw.shape_at(0)? as usize;
+        if n != 1 || !self.g.select_tail {
+            return Err(bad(format!(
+                "cuda_select_readonly requires n == 1 and select_tail (got n={n}, select_tail={})",
+                self.g.select_tail
+            )));
+        }
+        let groups_before = slot_start / self.g.kpool;
+        if st.tail.len != slot_start || st.pooled.len() != groups_before {
+            return Err(bad(format!(
+                "cuda_select_readonly at {slot_start} with {} positions and {} groups",
+                st.tail.len,
+                st.pooled.len()
+            )));
+        }
+        self.cuda_select_from_state(q_idx_raw, w_proj, inv_freq, slot_start, rope_start, st)
     }
 }
 

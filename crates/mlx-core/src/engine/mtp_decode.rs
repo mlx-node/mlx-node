@@ -30,7 +30,7 @@ use crate::sampling::SamplingConfig;
 // |-------------------------------|---------|---------------|
 // | `mtpAdaptiveDepth` (TS field) | OFF*    | per-session   |
 // | `MLX_MTP_ADAPTIVE_DEPTH_MODE` | throughput | opt-IN EV  |
-// | `MLX_MTP_CHAINED_CYCLES`      | M5+ ON, M1–M4 OFF | gen-gated |
+// | `MLX_MTP_CHAINED_CYCLES`      | CUDA & M5+ ON, M1–M4 OFF | backend/gen-gated |
 // | `MLX_MTP_TRACE_ACCEPTANCE`    | OFF     | opt-IN        |
 //
 // * adaptive depth is opt-in. When unset, MTP pins depth 1 because current
@@ -43,10 +43,10 @@ use crate::sampling::SamplingConfig;
 //   `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
 //
 // Interaction notes:
-//   - `MLX_MTP_CHAINED_CYCLES` is GPU-generation-gated: default ON on M5+
-//     (arch gen >= 17), default OFF on M1–M4 (gen 13–16). Force OFF with
-//     `MLX_MTP_CHAINED_CYCLES=0` (even on M5+) or ON with `=1` (even on
-//     M1–M4) — see `mtp_chained_cycles_enabled()`. It is CROSS-CYCLE
+//   - `MLX_MTP_CHAINED_CYCLES` is backend/GPU-generation-gated: default ON on
+//     CUDA GPUs and Apple M5+ (arch gen >= 17), default OFF on M1–M4 (gen 13–16).
+//     Force OFF with `MLX_MTP_CHAINED_CYCLES=0` or ON with `=1` — see
+//     `mtp_chained_cycles_enabled()`. It is CROSS-CYCLE
 //     hidden-state export: each cycle's `verify_hidden[K]` slice seeds the
 //     next cycle's first MTP draft (batched into the next-cycle `async_eval`;
 //     see `eval_step_with_chained_hidden` below). The chained 1-forward-per-
@@ -230,14 +230,17 @@ const CHAINED_CYCLES_MIN_GPU_GEN: i32 = 17;
 // of the next-cycle draft's first inputs rather than a late dependency
 // materialized inside the draft graph build.
 //
-// Default ON on M5+ (gen >= 17), OFF on M1–M4 (gen 13–16) where a lazy-slice
-// eval-scheduling stall regresses depth-3 acceptance.
+// Default ON on CUDA GPUs and Apple M5+ (gen >= 17), OFF on M1–M4 (gen 13–16)
+// where a lazy-slice eval-scheduling stall regresses depth-3 acceptance.
+// (`mlx_gpu_architecture_gen()` is Metal-only and returns 0 on CUDA, so check
+// `host_has_cuda()` explicitly.)
 //
 // Override either direction with the env var: explicit `0` / `false` / `off`
-// forces OFF even on M5+; explicit `1` / `true` / `on` forces ON even on M1–M4
-// (e.g. for parity bisects).
+// forces OFF even on CUDA / M5+; explicit `1` / `true` / `on` forces ON even on
+// M1–M4 (e.g. for parity bisects).
 //
-// The env var (and the GPU-gen fallback) is read once per process and cached.
+// The env var (and the backend/GPU-gen fallback) is read once per process and
+// cached.
 pub(crate) fn mtp_chained_cycles_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_CHAINED_CYCLES") {
@@ -246,8 +249,8 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
         Err(_) => {
-            let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
-            gpu_gen >= CHAINED_CYCLES_MIN_GPU_GEN
+            crate::accelerator::host_has_cuda()
+                || unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= CHAINED_CYCLES_MIN_GPU_GEN
         }
     })
 }

@@ -7,7 +7,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { modelPresent, offeredOnHost } from '../lib/catalog';
+import { catalogItemForHost, modelPresent } from '../lib/catalog';
 import { formatBytes, formatBytesParts, formatCount } from '../lib/format';
 import { useHomeDir } from '../lib/home-dir';
 import { useHost } from '../lib/host';
@@ -195,7 +195,12 @@ function ModelsPage({ models, catalog, host: hostState, updates, downloads }: Mo
   const host = hostState.data;
   // Until the host answers, the memory filter is not known: the cards stay in their loading shape and there is no count.
   const catalogReady = catalog.data !== undefined && !hostState.loading;
-  const catalogItems = catalogReady ? (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host)) : [];
+  const catalogItems = catalogReady
+    ? (catalog.data?.items ?? []).flatMap((item) => {
+        const offered = catalogItemForHost(item, host);
+        return offered === undefined ? [] : [offered];
+      })
+    : [];
   const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
   const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
   const present = chatCatalogItems.filter(modelPresent).length;

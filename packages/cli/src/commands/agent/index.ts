@@ -22,7 +22,7 @@ import { totalmem } from 'node:os';
 
 // Native-free subpaths: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
-import { CHAT_FAMILY_IDS } from '@mlx-node/agent/catalog';
+import { type CatalogGpuInfo, CHAT_FAMILY_IDS } from '@mlx-node/agent/catalog';
 import { DECODE_SHARE_ERROR } from '@mlx-node/server/host/decode-share';
 import { IDLE_RELEASE_ERROR } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR } from '@mlx-node/server/host/max-context';
@@ -97,11 +97,24 @@ export interface AgentRunDeps {
   updateDeps?: AgentUpdateDeps;
 }
 
+/** Probe host GPU capabilities lazily via `@mlx-node/lm` on non-darwin hosts (fails closed to `undefined`). */
+async function probeRuntimeGpu(): Promise<CatalogGpuInfo | undefined> {
+  if (process.platform === 'darwin') return undefined;
+  try {
+    const { getRuntimeCapabilities } = await import('@mlx-node/lm');
+    const caps = getRuntimeCapabilities();
+    return { backend: caps.backend, totalMemoryBytes: caps.totalMemoryBytes };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Production wizard step: interactive catalog pick + download. */
 async function runProductionWizard(modelsDir: string): Promise<void> {
   const { runFirstRunWizard } = await import('./wizard.js');
   const { select } = await import('@inquirer/prompts');
   const { run: downloadModel } = await import('../download-model.js');
+  const gpu = await probeRuntimeGpu();
   await runFirstRunWizard({
     io: {
       select: (opts) => select(opts),
@@ -111,6 +124,7 @@ async function runProductionWizard(modelsDir: string): Promise<void> {
     download: (downloadArgv) => downloadModel(downloadArgv),
     modelsDir,
     totalMemBytes: totalmem(),
+    gpu,
   });
 }
 

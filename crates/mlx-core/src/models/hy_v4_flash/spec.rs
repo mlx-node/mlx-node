@@ -25,7 +25,7 @@ use super::cache::WINDOW_SLACK;
 use super::chat::Inner;
 use super::model::{Logits, Model, Want};
 use super::moe::RowKind;
-use super::mtp::{Draft, Lagged, MtpLayer, Seeds};
+use super::mtp::{Draft, DraftRollback, Lagged, MtpLayer, Seeds};
 use crate::array::MxArray;
 use crate::engine::backend::{MtpStepper, SpecFrontier, TurnOutput, WholeTurnArgs};
 use crate::engine::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
@@ -135,7 +135,16 @@ pub(crate) struct Flat<'a> {
     committed: usize,
     snap: Option<usize>,
     draft_scope: Option<super::stats::DeferScope>,
+    pending_draft: Option<DraftRollback>,
+    #[cfg(test)]
+    fail_next_commit_flush: bool,
     err: Option<Error>,
+}
+
+impl Drop for Flat<'_> {
+    fn drop(&mut self) {
+        let _ = self.flush_pending_commit();
+    }
 }
 
 impl<'a> Flat<'a> {
@@ -159,8 +168,46 @@ impl<'a> Flat<'a> {
             seq,
             snap: None,
             draft_scope: None,
+            pending_draft: None,
+            #[cfg(test)]
+            fail_next_commit_flush: false,
             err: None,
         })
+    }
+
+    fn flush_pending_commit(&mut self) -> Result<()> {
+        if let Some(rb) = self.pending_draft.take() {
+            #[cfg(test)]
+            let injected_err = if rb.is_commit() && self.fail_next_commit_flush {
+                self.fail_next_commit_flush = false;
+                Some(bad("injected final deferred MTP commit flush failure"))
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let injected_err: Option<Error> = None;
+            let what = if rb.is_commit() {
+                "hy_v4_flash MTP commit"
+            } else {
+                "hy_v4_flash MTP draft"
+            };
+            let res = match injected_err {
+                Some(err) => Err(err),
+                None => super::stats::flush(what),
+            };
+            self.draft_scope = None;
+            if let Err(e) = res {
+                crate::array::synchronize();
+                if rb.is_commit() {
+                    self.committed = rb.keep();
+                }
+                if let Ok(d) = self.draft_mut() {
+                    rb.restore(d);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     fn draft_mut(&mut self) -> Result<&mut Draft> {
@@ -209,6 +256,7 @@ impl MtpStepper for Flat<'_> {
         ids: &MxArray,
         _embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
+        self.flush_pending_commit()?;
         let token = ids.item_at_int32(0)? as u32;
         if self.draft_mut()?.len() != self.committed {
             return Err(bad("a main forward with draft rows held"));
@@ -233,6 +281,16 @@ impl MtpStepper for Flat<'_> {
         self.draft_scope
             .get_or_insert_with(super::stats::DeferScope::enter);
         let (model, mtp, committed) = (self.model, self.mtp, self.committed);
+        if mtp.cuda_fast_active() && self.pending_draft.is_none() {
+            let rb = {
+                let d = self
+                    .seq
+                    .draft()
+                    .ok_or_else(|| bad("the sequence has no draft"))?;
+                DraftRollback::capture(d, LOOKAHEAD_MAX, false)?
+            };
+            self.pending_draft = Some(rb);
+        }
         let d = self.draft_mut()?;
         // On a chained cycle `begin_cycle` cuts one row below `committed` and
         // `commit_mtp` reuses the row written by slot 0, so rows below
@@ -248,20 +306,46 @@ impl MtpStepper for Flat<'_> {
         depth: usize,
     ) -> Result<MtpVerifyOutput> {
         if ids.len() != depth + 1 || ids.len() > LOOKAHEAD_MAX {
+            let _ = self.flush_pending_commit();
             self.draft_scope = None;
             return Err(bad(format!("{} verify ids at depth {depth}", ids.len())));
         }
+        if self.seq.draft().is_none() {
+            let _ = self.flush_pending_commit();
+            self.draft_scope = None;
+            return Err(bad("the sequence has no draft"));
+        }
+        // Keep `self.draft_scope` alive across `model.forward` so any deferred
+        // `commit_lazy` / `draft_step` writes flush atomically alongside the
+        // trunk verify forward inside one fallible `stats::eval(...)` while
+        // `forward_trunk_cuda`'s rollback handles stay live.
+        let prev_draft = self.pending_draft.take();
         let model = self.model;
-        let (trunk, draft) = self.seq.parts();
-        let d = draft.ok_or_else(|| bad("the sequence has no draft"))?;
-        let start = trunk.len();
+        let start = self.seq.trunk().len();
         let want = Want {
             logits: Logits::All,
             hidden: true,
         };
-        let out = model.forward(trunk, ids, RowKind::Decode, want, None, None);
+        let out = {
+            let (trunk, _) = self.seq.parts();
+            model.forward(trunk, ids, RowKind::Decode, want, None, None)
+        };
         self.draft_scope = None;
-        let out = out?;
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(rb) = prev_draft {
+                    crate::array::synchronize();
+                    if rb.is_commit() {
+                        self.committed = rb.keep();
+                    }
+                    if let Ok(d) = self.draft_mut() {
+                        rb.restore(d);
+                    }
+                }
+                return Err(e);
+            }
+        };
         let n = ids.len() as i64;
         let shaped = out
             .logits
@@ -272,6 +356,8 @@ impl MtpStepper for Flat<'_> {
                 let (v, dim) = (l.shape_at(1)?, h.shape_at(1)?);
                 Ok((l.reshape(&[1, n, v])?, h.reshape(&[1, n, dim])?, seeds))
             });
+        let (trunk, draft) = self.seq.parts();
+        let d = draft.ok_or_else(|| bad("the sequence has no draft"))?;
         match shaped {
             Ok((logits, hiddens, seeds)) => {
                 d.seeds_mut().extend(seeds);
@@ -329,25 +415,58 @@ impl MtpStepper for Flat<'_> {
             )));
         }
         let hs = commit_hiddens(anchor, seed_h, verify_hiddens, committed_ids.len())?;
+        let cuda_lazy = self.mtp.cuda_fast_active() && !super::stats::profiling();
+        if cuda_lazy {
+            self.draft_scope
+                .get_or_insert_with(super::stats::DeferScope::enter);
+        }
         let (model, mtp, keep) = (self.model, self.mtp, self.committed);
         let d = self.draft_mut()?;
         d.cut(keep)?;
-        let committed = {
+        let pending_rb = if cuda_lazy {
+            Some(DraftRollback::capture(d, committed_ids.len(), true)?)
+        } else {
+            None
+        };
+        let committed = if cuda_lazy {
+            // Defer commit writes into `draft_scope` so they chain directly into
+            // the next cycle's `draft_0..draft_k` and sync once at verify/flush.
+            // Pre-commit GPU handles stay pinned in `pending_draft` until checked
+            // evaluation succeeds.
+            mtp.commit_lazy(model, d, &hs, committed_ids)
+        } else {
             let _scope = super::stats::DeferScope::enter();
             mtp.commit(model, d, &hs, committed_ids)
                 .and_then(|()| super::stats::flush("hy_v4_flash MTP commit"))
         };
         if let Err(e) = committed {
-            let _ = d.cut(keep);
+            if let Some(rb) = pending_rb {
+                crate::array::synchronize();
+                rb.restore(d);
+                self.draft_scope = None;
+                self.pending_draft = None;
+            } else {
+                let _ = d.cut(keep);
+            }
             return Err(e);
         }
         let rows = d.len();
         self.committed = rows;
+        if let Some(rb) = pending_rb {
+            self.pending_draft = Some(rb);
+        }
         Ok(())
     }
 
     fn begin_cycle(&mut self, chained_anchor: bool) {
-        self.draft_scope = None;
+        if !self
+            .pending_draft
+            .as_ref()
+            .is_some_and(DraftRollback::is_commit)
+        {
+            self.draft_scope = None;
+            self.pending_draft = None;
+        }
         let r = match cycle_rows(self.committed, chained_anchor) {
             Some(keep) => self.draft_mut().and_then(|d| d.cut(keep)),
             None => Err(bad("a chained cycle with no committed row")),
@@ -375,6 +494,9 @@ impl MtpStepper for Flat<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
+        if let Err(e) = self.flush_pending_commit() {
+            self.stash(Err(e));
+        }
         let keep = unemitted_keep(self.seq.len(), unemitted);
         let committed = self.committed;
         let r = self.cut_trunk(keep).and_then(|()| {
@@ -400,11 +522,14 @@ impl MtpStepper for Flat<'_> {
     }
 
     fn take_replay_error(&mut self) -> Option<Error> {
+        if let Err(e) = self.flush_pending_commit() {
+            self.stash(Err(e));
+        }
         self.err.take()
     }
 
-    fn into_desynced(self) -> bool {
-        false
+    fn into_desynced(mut self) -> bool {
+        self.flush_pending_commit().is_err()
     }
 }
 
@@ -643,6 +768,13 @@ impl<'a> Stepper<'a> {
     /// A paged stepper on `inner`'s active owner.
     pub(crate) fn paged(inner: &'a mut Inner) -> Result<Self> {
         Paged::begin(inner).map(Self::Paged)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_next_commit_flush_failure(&mut self) {
+        if let Self::Flat(s) = self {
+            s.fail_next_commit_flush = true;
+        }
     }
 }
 

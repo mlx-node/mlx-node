@@ -7,8 +7,10 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import {
   type CatalogBuild,
+  type CatalogGpuInfo,
   catalogBuildRepo,
   catalogBuildSlug,
+  catalogBuildSupportedOnHost,
   catalogDraftSlug,
   catalogFitsMemory,
   catalogSharesRepo,
@@ -28,6 +30,14 @@ const BIG_MAC = 128 * GIB;
 const MAC_96 = 96 * GIB;
 /** A 36 GB Mac: below every memory floor. */
 const SMALL_MAC = 36 * GIB;
+/** Windows RTX Spark (~102 GiB addressable CUDA pool). */
+const WIN_SPARK_GPU: CatalogGpuInfo = { backend: 'cuda', totalMemoryBytes: 102 * GIB };
+/** Linux DGX Spark (~128 GiB unified CUDA pool). */
+const LINUX_SPARK_GPU: CatalogGpuInfo = { backend: 'cuda', totalMemoryBytes: 128 * GIB };
+/** Desktop with a 24 GiB discrete CUDA GPU (e.g. RTX 4090). */
+const DISCRETE_24G_GPU: CatalogGpuInfo = { backend: 'cuda', totalMemoryBytes: 24 * GIB };
+/** CPU-only host with 128 GiB system RAM. */
+const CPU_ONLY_128G: CatalogGpuInfo = { backend: 'cpu', totalMemoryBytes: 128 * GIB };
 /** The entries the catalog offers only from 96 GiB. */
 const FLOORED = ['Qwen3.8-Flash-Next', 'Hy4-flash'];
 
@@ -362,6 +372,8 @@ describe('install folders', () => {
       ['Inkling-2-Mini', 'Original', 'inkling-2-mini'],
       ['Qwen3.8-Flash-Next', 'UD-Q4_K_XL', 'qwen3.8-flash-next-gguf'],
       ['Hy4-flash', 'Q4_K_M', 'hy4-flash-gguf'],
+      ['Hy4-flash', 'SPARK-4Bit', 'hy4-flash-gguf-spark-4bit'],
+      ['Hy4-flash', 'SPARK-4Bit-Fast', 'hy4-flash-gguf-spark-4bit-fast'],
       ['Gemma-4-12B', 'MXFP', 'gemma-4-12b-it-mxfp-mlx'],
       ['Nemotron-3.5-Lightning-30B-A3B', 'NVFP4', 'nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4-mlx'],
       ['Clairic Flash (9B)', 'UD-Q4_K_XL', 'clairic-flash-gguf'],
@@ -384,18 +396,24 @@ describe('install folders', () => {
       plain.set(build.hfRepo, (plain.get(build.hfRepo) ?? 0) + 1);
     }
     for (const [repo, count] of plain) expect(count, repo).toBe(1);
-    // A suffix is only for a build whose repository another build already installs.
+    // A suffix is only for a build whose repository another build already installs (across all builds).
+    const repoBuildCounts = new Map<string, number>();
     for (const { build } of ALL_BUILDS) {
-      if (build.folderSuffix !== undefined) expect(catalogSharesRepo(build, 'darwin'), build.id).toBe(true);
+      repoBuildCounts.set(build.hfRepo, (repoBuildCounts.get(build.hfRepo) ?? 0) + 1);
+    }
+    for (const { build } of ALL_BUILDS) {
+      if (build.folderSuffix !== undefined) {
+        expect(repoBuildCounts.get(build.hfRepo), build.id).toBeGreaterThan(1);
+      }
     }
   });
 
-  it('names the repositories two builds share, and only those', () => {
-    const shared = ALL_BUILDS.filter(({ build }) => catalogSharesRepo(build, 'darwin')).map(({ entry, build }) => [
-      entry.label,
-      build.id,
-    ]);
-    expect(shared).toEqual([
+  it('names the repositories two builds share on each platform, and only those', () => {
+    const sharedOn = (platform: NodeJS.Platform) =>
+      ALL_BUILDS.filter(
+        ({ build }) => catalogSupportedOnPlatform(build, platform) && catalogSharesRepo(build, platform),
+      ).map(({ entry, build }) => [entry.label, build.id]);
+    const common = [
       ['Qwen3.8-27B', 'UD-Q4_K_XL'],
       ['Qwen3.8-27B', 'UD-Q4_K_M'],
       ['Inkling-2-Mini', 'UD-Q4_K_XL'],
@@ -404,7 +422,22 @@ describe('install folders', () => {
       ['CLEF Flash (9B)', 'Q4_K_M'],
       ['CLEF (27B)', 'Q8_0'],
       ['CLEF (27B)', 'Q4_K_M'],
-    ]);
+    ];
+    expect(sharedOn('darwin')).toEqual(common);
+    for (const platform of ['win32', 'linux'] as const) {
+      expect(sharedOn(platform), platform).toEqual([
+        ['Qwen3.8-27B', 'UD-Q4_K_XL'],
+        ['Qwen3.8-27B', 'UD-Q4_K_M'],
+        ['Inkling-2-Mini', 'UD-Q4_K_XL'],
+        ['Inkling-2-Mini', 'UD-Q4_K_M'],
+        ['Hy4-flash', 'SPARK-4Bit'],
+        ['Hy4-flash', 'SPARK-4Bit-Fast'],
+        ['CLEF Flash (9B)', 'Q8_0'],
+        ['CLEF Flash (9B)', 'Q4_K_M'],
+        ['CLEF (27B)', 'Q8_0'],
+        ['CLEF (27B)', 'Q4_K_M'],
+      ]);
+    }
   });
 
   it('resolves the CUDA build only when a build carries one, and its folder follows the repo', () => {
@@ -556,6 +589,8 @@ describe('the files each build installs', () => {
         ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
         168_347_133_632,
       ],
+      ['Hy4-flash', 'SPARK-4Bit', ['Hy4-flash-SPARK-4Bit.gguf'], 162_509_777_248],
+      ['Hy4-flash', 'SPARK-4Bit-Fast', ['Hy4-flash-SPARK-4Bit-Fast.gguf'], 159_611_554_144],
       ['CLEF Flash (9B)', 'Q8_0', ['Clef-Flash-Q8_0.gguf'], 9_657_260_288],
       ['CLEF Flash (9B)', 'Q4_K_M', ['Clef-Flash-Q4_K_M.gguf'], 6_732_781_824],
       ['CLEF (27B)', 'Q8_0', ['Clef-Q8_0.gguf'], 28_732_215_456],
@@ -571,10 +606,20 @@ describe('the files each build installs', () => {
       expect(bytesOf(listing, selected), `${label} ${id}`).toBe(bytes);
       expect(Math.round(bytes / 1e8) / 10, `${label} ${id}`).toBe(build.sizeGb);
     }
-    // Every chat build and every CLEF build of the catalog is checked here.
-    for (const entry of [...visibleCatalog(BIG_MAC, 'darwin'), ...visibleSystemOneCatalog(BIG_MAC, 'darwin')]) {
-      if (entry.label.startsWith('Clairic')) continue;
-      for (const build of entry.builds) expect(covered.has(build), `${entry.label} ${build.id}`).toBe(true);
+    // Every chat build and every CLEF build of the catalog across darwin/win32/linux is checked here.
+    const hostCases: Array<readonly [NodeJS.Platform, CatalogGpuInfo | undefined]> = [
+      ['darwin', undefined],
+      ['win32', WIN_SPARK_GPU],
+      ['linux', LINUX_SPARK_GPU],
+    ];
+    for (const [platform, gpu] of hostCases) {
+      for (const entry of [
+        ...visibleCatalog(BIG_MAC, platform, gpu),
+        ...visibleSystemOneCatalog(BIG_MAC, platform, gpu),
+      ]) {
+        if (entry.label.startsWith('Clairic')) continue;
+        for (const build of entry.builds) expect(covered.has(build), `${platform} ${entry.label} ${build.id}`).toBe(true);
+      }
     }
   });
 
@@ -702,17 +747,26 @@ describe('catalogUpdateRepos — update discovery covers the sidecar sources', (
     }
   });
 
-  it('omits darwin-only Hy4-flash from targets, slug allowlist, and update repos on non-darwin platforms', () => {
+  it('routes Hy4-flash to Q4_K_M on darwin and SPARK-4Bit builds on win32 and linux', () => {
     expect(catalogTargetForSlug('hy4-flash-gguf', 'darwin')?.repo).toBe('AngelSlim/Hy4-flash-GGUF');
+    expect(catalogTargetForSlug('hy4-flash-gguf-spark-4bit', 'darwin')).toBeUndefined();
+    expect(catalogTargetForSlug('hy4-flash-gguf-spark-4bit-fast', 'darwin')).toBeUndefined();
     for (const platform of ['win32', 'linux'] as const) {
-      expect(catalogTargets(platform).map((t) => t.slug)).not.toContain('hy4-flash-gguf');
+      const slugs = catalogTargets(platform).map((t) => t.slug);
+      expect(slugs, platform).not.toContain('hy4-flash-gguf');
+      expect(slugs, platform).toContain('hy4-flash-gguf-spark-4bit');
+      expect(slugs, platform).toContain('hy4-flash-gguf-spark-4bit-fast');
       expect(catalogTargetForSlug('hy4-flash-gguf', platform)).toBeUndefined();
+      expect(catalogTargetForSlug('hy4-flash-gguf-spark-4bit', platform)?.repo).toBe('AngelSlim/Hy4-flash-GGUF');
+      expect(catalogTargetForSlug('hy4-flash-gguf-spark-4bit-fast', platform)?.repo).toBe('AngelSlim/Hy4-flash-GGUF');
       const updates = catalogUpdateRepos(platform);
-      expect(updates).not.toContain('AngelSlim/Hy4-flash-GGUF');
-      expect(updates).not.toContain('tencent/Hy4-flash');
+      expect(updates).toContain('AngelSlim/Hy4-flash-GGUF');
+      expect(updates).toContain('tencent/Hy4-flash');
       expect(updates).toContain('unsloth/Qwen3.8-27B-GGUF');
       expect(updates).toContain('unsloth/Qwen3.8-Flash-Next-GGUF');
     }
+    expect(catalogTargetForSlug('hy4-flash-gguf', 'freebsd')).toBeUndefined();
+    expect(catalogTargetForSlug('hy4-flash-gguf-spark-4bit', 'freebsd')).toBeUndefined();
   });
 });
 
@@ -791,13 +845,13 @@ describe('MODEL_CATALOG', () => {
 
 describe('visibleCatalog', () => {
   it('offers Qwen3.8-Flash-Next and Hy4-flash from 96 GiB on darwin, at exactly 96 GiB too', () => {
+    const labelsOf = (entries: readonly { label: string }[]) => entries.map((e) => e.label);
     for (const label of FLOORED) {
-      const entry = MODEL_CATALOG.find((candidate) => candidate.label === label)!;
-      expect(visibleCatalog(SMALL_MAC, 'darwin'), label).not.toContain(entry);
-      expect(visibleCatalog(64 * GIB, 'darwin'), label).not.toContain(entry);
-      expect(visibleCatalog(MAC_96 - 1, 'darwin'), label).not.toContain(entry);
-      expect(visibleCatalog(MAC_96, 'darwin'), label).toContain(entry);
-      expect(visibleCatalog(BIG_MAC, 'darwin'), label).toContain(entry);
+      expect(labelsOf(visibleCatalog(SMALL_MAC, 'darwin')), label).not.toContain(label);
+      expect(labelsOf(visibleCatalog(64 * GIB, 'darwin')), label).not.toContain(label);
+      expect(labelsOf(visibleCatalog(MAC_96 - 1, 'darwin')), label).not.toContain(label);
+      expect(labelsOf(visibleCatalog(MAC_96, 'darwin')), label).toContain(label);
+      expect(labelsOf(visibleCatalog(BIG_MAC, 'darwin')), label).toContain(label);
     }
     // Entries without a floor stay on the smallest machine.
     const small = visibleCatalog(SMALL_MAC, 'darwin');
@@ -808,19 +862,84 @@ describe('visibleCatalog', () => {
     }
   });
 
-  it('gates Hy4-flash to darwin and leaves cross-platform entries visible on win32 and linux', () => {
+  it('offers Hy4-flash Q4_K_M on darwin and gates SPARK-4Bit builds on >=96 GiB CUDA GPU on win32 and linux', () => {
     const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
-    expect(hy4.platforms).toEqual(['darwin']);
+    expect(hy4.platforms).toEqual(['darwin', 'win32', 'linux']);
     expect(catalogSupportedOnPlatform(hy4, 'darwin')).toBe(true);
-    expect(catalogSupportedOnPlatform(hy4, 'win32')).toBe(false);
-    expect(catalogSupportedOnPlatform(hy4, 'linux')).toBe(false);
+    expect(catalogSupportedOnPlatform(hy4, 'win32')).toBe(true);
+    expect(catalogSupportedOnPlatform(hy4, 'linux')).toBe(true);
+    expect(catalogSupportedOnPlatform(hy4, 'freebsd')).toBe(false);
     expect(catalogSupportedOnPlatform({}, 'win32')).toBe(true);
 
-    for (const platform of ['win32', 'linux'] as const) {
-      const labels = visibleCatalog(BIG_MAC, platform).map((entry) => entry.label);
-      expect(labels, platform).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next']);
-      expect(visibleSystemOneCatalog(BIG_MAC, platform).length).toBeGreaterThan(0);
+    // Only Hy4-flash SPARK CUDA builds carry a GPU memory floor.
+    for (const { entry, build } of ALL_BUILDS) {
+      const isHy4Spark = entry.label === 'Hy4-flash' && build.id.startsWith('SPARK-');
+      expect(build.minGpuMemoryGb, `${entry.label} ${build.id}`).toBe(isHy4Spark ? 96 : undefined);
     }
+
+    // macOS Metal: no GPU probe needed; Q4_K_M streams routed experts from SSD.
+    const darwinHy4 = visibleCatalog(BIG_MAC, 'darwin').find((e) => e.label === 'Hy4-flash');
+    expect(darwinHy4?.builds.map((b) => b.id)).toEqual(['Q4_K_M']);
+
+    // Windows RTX Spark (102 GiB CUDA) and Linux DGX Spark (128 GiB CUDA): offer both SPARK builds.
+    const sparkCases: Array<readonly [NodeJS.Platform, CatalogGpuInfo]> = [
+      ['win32', WIN_SPARK_GPU],
+      ['linux', LINUX_SPARK_GPU],
+    ];
+    for (const [platform, sparkGpu] of sparkCases) {
+      const visible = visibleCatalog(BIG_MAC, platform, sparkGpu);
+      expect(
+        visible.map((entry) => entry.label),
+        platform,
+      ).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next', 'Hy4-flash']);
+      const hy4Builds = visible.find((entry) => entry.label === 'Hy4-flash')!.builds;
+      expect(
+        hy4Builds.map((b) => [b.id, b.hfRepo, b.assetsRepo, b.sizeGb, b.source]),
+        platform,
+      ).toEqual([
+        ['SPARK-4Bit', 'AngelSlim/Hy4-flash-GGUF', 'tencent/Hy4-flash', 162.5, 'AngelSlim GGUF'],
+        ['SPARK-4Bit-Fast', 'AngelSlim/Hy4-flash-GGUF', 'tencent/Hy4-flash', 159.6, 'AngelSlim GGUF'],
+      ]);
+      expect(visibleSystemOneCatalog(BIG_MAC, platform, sparkGpu).length).toBeGreaterThan(0);
+
+      // Exact 96 GiB boundary passes; 96 GiB - 1 fails closed.
+      expect(
+        visibleCatalog(BIG_MAC, platform, { backend: 'cuda', totalMemoryBytes: 96 * GIB }).map((e) => e.label),
+        `${platform} exact 96 GiB CUDA`,
+      ).toContain('Hy4-flash');
+      expect(
+        visibleCatalog(BIG_MAC, platform, { backend: 'cuda', totalMemoryBytes: 96 * GIB - 1 }).map((e) => e.label),
+        `${platform} 96 GiB - 1 CUDA`,
+      ).not.toContain('Hy4-flash');
+
+      // 128 GiB RAM desktop with 24 GiB discrete CUDA GPU, CPU-only, or unknown GPU: Hy4-flash MUST NOT be offered.
+      for (const [caseName, gpu] of [
+        ['24 GiB discrete CUDA', DISCRETE_24G_GPU],
+        ['CPU-only 128 GiB', CPU_ONLY_128G],
+        ['missing GPU info', undefined],
+      ] as const) {
+        expect(
+          visibleCatalog(BIG_MAC, platform, gpu).map((entry) => entry.label),
+          `${platform} ${caseName}`,
+        ).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next']);
+      }
+    }
+
+    expect(visibleCatalog(BIG_MAC, 'freebsd', LINUX_SPARK_GPU).map((e) => e.label)).toEqual([
+      'Qwen3.8-27B',
+      'Inkling-2-Mini',
+      'Qwen3.8-Flash-Next',
+    ]);
+
+    // Direct helper checks.
+    const sparkBuild = buildOf('Hy4-flash', 'SPARK-4Bit');
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'win32', WIN_SPARK_GPU)).toBe(true);
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'linux', LINUX_SPARK_GPU)).toBe(true);
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'win32', DISCRETE_24G_GPU)).toBe(false);
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'linux', CPU_ONLY_128G)).toBe(false);
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'win32', undefined)).toBe(false);
+    expect(catalogBuildSupportedOnHost(sparkBuild, 'darwin', WIN_SPARK_GPU)).toBe(false);
+    expect(catalogBuildSupportedOnHost(buildOf('Hy4-flash', 'Q4_K_M'), 'darwin', undefined)).toBe(true);
   });
 
   it('catalogFitsMemory passes an entry without a floor on any machine', () => {
@@ -848,9 +967,13 @@ describe('visibleCatalog', () => {
   });
 
   it('is a subset of MODEL_CATALOG', () => {
-    const all = new Set(MODEL_CATALOG);
+    const byLabel = new Map(MODEL_CATALOG.map((entry) => [entry.label, entry]));
     for (const entry of visibleCatalog()) {
-      expect(all.has(entry), entry.label).toBe(true);
+      const source = byLabel.get(entry.label);
+      expect(source, entry.label).toBeDefined();
+      for (const build of entry.builds) {
+        expect(source!.builds, `${entry.label} ${build.id}`).toContain(build);
+      }
       expect(entry.category ?? 'chat', entry.label).toBe('chat');
     }
   });

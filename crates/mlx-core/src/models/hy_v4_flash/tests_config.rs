@@ -607,7 +607,9 @@ fn class_name(c: ExpertClass) -> &'static str {
     match c {
         ExpertClass::Q6kDown => "A",
         ExpertClass::Q4kDown => "B",
+        ExpertClass::Nvfp4 => "NVFP4",
         ExpertClass::Bf16 => "MTP_BF16",
+        ExpertClass::Q8_0 => "MTP_Q8_0",
     }
 }
 

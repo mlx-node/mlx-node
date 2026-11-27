@@ -360,6 +360,7 @@ fn form_key(role: Role, i: &GgufTensorInfo) -> &'static str {
     match (form(role, i).unwrap(), i.tensor_type) {
         (Form::Codes, _) => "q8_codes",
         (Form::Qmm, _) => "qmm_affine8",
+        (Form::Nvfp4, _) => "nvfp4",
         (Form::F32, GgufTensorType::F32) => "f32",
         (Form::F32, _) => "f32_dequant",
         (Form::F16, _) => "f16",

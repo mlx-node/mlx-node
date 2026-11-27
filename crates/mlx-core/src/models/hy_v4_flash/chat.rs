@@ -794,6 +794,19 @@ impl DecodeStep for Step<'_> {
         stats::emit_profile("decode");
         Ok((logits, false))
     }
+
+    fn maintain_cache(&mut self, step: i32) {
+        if (step + 1) % 256 != 0 {
+            return;
+        }
+        if crate::accelerator::cuda_ops_available()
+            && crate::array::get_cache_memory()
+                <= crate::accelerator::cuda_cache_clear_threshold_bytes()
+        {
+            return;
+        }
+        crate::array::clear_cache();
+    }
 }
 
 impl ChatBackend for Inner {

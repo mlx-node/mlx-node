@@ -161,9 +161,15 @@ describe('runFirstRunWizard', () => {
     expect(hy4Line).not.toContain(' && ');
   });
 
-  it('omits darwin-only Hy4-flash from interactive choices and non-TTY hints on win32 and linux', async () => {
-    for (const platform of ['win32', 'linux'] as const) {
+  it('offers Hy4-flash SPARK-4Bit builds (and omits darwin Q4_K_M) on win32 and linux Spark hosts', async () => {
+    const cases: Array<readonly [NodeJS.Platform, { backend: string; totalMemoryBytes: number }]> = [
+      ['win32', { backend: 'cuda', totalMemoryBytes: 102 * GIB }],
+      ['linux', { backend: 'cuda', totalMemoryBytes: 128 * GIB }],
+    ];
+    for (const [platform, gpu] of cases) {
       const seenChoices: string[] = [];
+      const seenBuilds: string[] = [];
+      const downloads: string[][] = [];
       const select = vi
         .fn<
           ({
@@ -176,18 +182,39 @@ describe('runFirstRunWizard', () => {
         >()
         .mockImplementationOnce(async ({ choices }) => {
           seenChoices.push(...choices.map((c) => c.value));
-          return 'Qwen3.8-Flash-Next';
+          return 'Hy4-flash';
+        })
+        .mockImplementationOnce(async ({ choices }) => {
+          seenBuilds.push(...choices.map((c) => c.value));
+          return 'SPARK-4Bit';
         });
 
       const slug = await runFirstRunWizard({
         io: { select, isTTY: true, log: () => {} },
-        download: async () => {},
+        download: async (argv) => {
+          downloads.push(argv);
+        },
         modelsDir: MODELS_DIR,
         totalMemBytes: 128 * GIB,
         platform,
+        gpu,
       });
-      expect(slug).toBe('qwen3.8-flash-next-gguf');
-      expect(seenChoices, platform).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next']);
+      expect(slug, platform).toBe('hy4-flash-gguf-spark-4bit');
+      expect(seenChoices, platform).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next', 'Hy4-flash']);
+      expect(seenBuilds, platform).toEqual(['SPARK-4Bit', 'SPARK-4Bit-Fast']);
+      expect(downloads, platform).toEqual([
+        [
+          '-m',
+          'AngelSlim/Hy4-flash-GGUF',
+          '-g',
+          'Hy4-flash-SPARK-4Bit.gguf',
+          '--assets-repo',
+          'tencent/Hy4-flash',
+          '--complete',
+          '-o',
+          join(MODELS_DIR, 'hy4-flash-gguf-spark-4bit'),
+        ],
+      ]);
 
       const err = await runFirstRunWizard({
         io: { select: vi.fn(), isTTY: false, log: () => {} },
@@ -195,11 +222,67 @@ describe('runFirstRunWizard', () => {
         modelsDir: MODELS_DIR,
         totalMemBytes: 128 * GIB,
         platform,
+        gpu,
       }).catch((e: unknown) => e as Error);
       expect(err).toBeInstanceOf(Error);
       if (!(err instanceof Error)) return;
-      expect(err.message).not.toContain('AngelSlim/Hy4-flash-GGUF');
+      expect(err.message).toContain('Hy4-flash-SPARK-4Bit.gguf');
+      expect(err.message).not.toContain('*Q4_K_M*');
       expect(err.message).toContain('unsloth/Qwen3.8-Flash-Next-GGUF');
+    }
+  });
+
+  it('omits Hy4-flash on win32 and linux when GPU is a 24 GiB discrete CUDA card, CPU-only, or unknown', async () => {
+    const unsupportedGpus = [
+      ['24 GiB discrete CUDA', { backend: 'cuda', totalMemoryBytes: 24 * GIB }],
+      ['CPU-only 128 GiB', { backend: 'cpu', totalMemoryBytes: 128 * GIB }],
+      ['missing GPU info', undefined],
+    ] as const;
+    for (const platform of ['win32', 'linux'] as const) {
+      for (const [label, gpu] of unsupportedGpus) {
+        const seenChoices: string[] = [];
+        const select = vi
+          .fn<
+            ({
+              message,
+              choices,
+            }: {
+              message: string;
+              choices: Array<{ name: string; value: string }>;
+            }) => Promise<string>
+          >()
+          .mockImplementationOnce(async ({ choices }) => {
+            seenChoices.push(...choices.map((c) => c.value));
+            return 'Qwen3.8-Flash-Next';
+          });
+
+        await runFirstRunWizard({
+          io: { select, isTTY: true, log: () => {} },
+          download: async () => {},
+          modelsDir: MODELS_DIR,
+          totalMemBytes: 128 * GIB,
+          platform,
+          gpu,
+        });
+        expect(seenChoices, `${platform} ${label}`).toEqual([
+          'Qwen3.8-27B',
+          'Inkling-2-Mini',
+          'Qwen3.8-Flash-Next',
+        ]);
+
+        const err = await runFirstRunWizard({
+          io: { select: vi.fn(), isTTY: false, log: () => {} },
+          download: vi.fn(),
+          modelsDir: MODELS_DIR,
+          totalMemBytes: 128 * GIB,
+          platform,
+          gpu,
+        }).catch((e: unknown) => e as Error);
+        expect(err).toBeInstanceOf(Error);
+        if (!(err instanceof Error)) return;
+        expect(err.message, `${platform} ${label}`).not.toContain('AngelSlim/Hy4-flash-GGUF');
+        expect(err.message, `${platform} ${label}`).toContain('unsloth/Qwen3.8-Flash-Next-GGUF');
+      }
     }
   });
 });

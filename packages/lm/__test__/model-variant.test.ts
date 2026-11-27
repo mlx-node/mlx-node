@@ -6,6 +6,7 @@ import {
   ggufModelId,
   ggufNames,
   ggufVariant,
+  quantTag,
   settleVariants,
   splitNameTail,
   type VariantMember,
@@ -116,8 +117,20 @@ describe('the name tail', () => {
     ['m-Q4_K_M-Q8_0', { base: 'm-Q4_K_M', tag: 'Q8_0', qualifiers: [], saysGguf: false }],
     ['m-ud-mlx-Q4_K_M', { base: 'm-ud', tag: 'Q4_K_M', qualifiers: [], saysGguf: false }],
     ['Lumen-12B-KMix-9GB', { base: 'Lumen-12B-KMix-9GB', tag: undefined, qualifiers: [], saysGguf: false }],
+    ['Hy4-flash-SPARK-4Bit', { base: 'Hy4-flash', tag: 'SPARK-4Bit', qualifiers: [], saysGguf: false }],
+    ['Hy4-flash-SPARK-4Bit-Fast', { base: 'Hy4-flash', tag: 'SPARK-4Bit-Fast', qualifiers: [], saysGguf: false }],
+    ['hy4-flash-gguf-spark-4bit', { base: 'hy4-flash', tag: 'SPARK-4Bit', qualifiers: [], saysGguf: true }],
+    ['hy4-flash-gguf-spark-4bit-fast', { base: 'hy4-flash', tag: 'SPARK-4Bit-Fast', qualifiers: [], saysGguf: true }],
+    ['SPARK-4Bit', { base: '', tag: 'SPARK-4Bit', qualifiers: [], saysGguf: false }],
+    ['SPARK-4Bit-Fast', { base: '', tag: 'SPARK-4Bit-Fast', qualifiers: [], saysGguf: false }],
   ])('%s', (name, tail) => {
     expect(splitNameTail(name)).toEqual(tail);
+  });
+
+  it('normalizes SPARK-4Bit and SPARK-4Bit-Fast quant tags', () => {
+    expect(quantTag('SPARK-4Bit')).toBe('SPARK-4Bit');
+    expect(quantTag('spark-4bit-fast')).toBe('SPARK-4Bit-Fast');
+    expect(quantTag('4Bit')).toBe('4-bit');
   });
 });
 
@@ -291,6 +304,43 @@ describe('a GGUF', () => {
       variant: 'UD-Q4_K_XL',
     });
     expect(ggufVariant('Velda-40B-A4B-UD-Q4_K_XL-mtp', 'r', undefined, 'id').variant).toBe('UD-Q4_K_XL');
+  });
+
+  it('resolves SPARK-4Bit and SPARK-4Bit-Fast GGUFs under their base without breaking Spark model names', () => {
+    expect(gguf('hy4-flash-gguf-spark-4bit/Hy4-flash-SPARK-4Bit.gguf', 'hy_v4_flash')).toEqual({
+      name: 'Hy4-flash-SPARK-4Bit',
+      format: 'gguf',
+      modelType: 'hy_v4_flash',
+      base: 'Hy4-flash',
+      variant: 'SPARK-4Bit',
+    });
+    expect(gguf('hy4-flash-gguf-spark-4bit-fast/Hy4-flash-SPARK-4Bit-Fast.gguf', 'hy_v4_flash')).toEqual({
+      name: 'Hy4-flash-SPARK-4Bit-Fast',
+      format: 'gguf',
+      modelType: 'hy_v4_flash',
+      base: 'Hy4-flash',
+      variant: 'SPARK-4Bit-Fast',
+    });
+    expect(gguf('Hy4-flash-SPARK-4Bit.gguf', 'hy_v4_flash')).toEqual({
+      name: 'Hy4-flash-SPARK-4Bit',
+      format: 'gguf',
+      modelType: 'hy_v4_flash',
+      base: 'Hy4-flash',
+      variant: 'SPARK-4Bit',
+    });
+    expect(gguf('Hy4-flash-SPARK-4Bit-Fast.gguf', 'hy_v4_flash')).toEqual({
+      name: 'Hy4-flash-SPARK-4Bit-Fast',
+      format: 'gguf',
+      modelType: 'hy_v4_flash',
+      base: 'Hy4-flash',
+      variant: 'SPARK-4Bit-Fast',
+    });
+    expect(gguf('hy4-flash-gguf/Hy4-flash-SPARK-4Bit.gguf', 'hy_v4_flash').variant).toBe('SPARK-4Bit');
+    expect(gguf('hy4-flash-gguf/Hy4-flash-SPARK-4Bit-Fast.gguf', 'hy_v4_flash').variant).toBe('SPARK-4Bit-Fast');
+    expect(gguf('lumen-12b-gguf/Lumen-12B-Spark-Q5_K_M.gguf', 'lfm2')).toMatchObject({
+      base: 'Lumen-12B-Spark',
+      variant: 'Q5_K_M',
+    });
   });
 });
 

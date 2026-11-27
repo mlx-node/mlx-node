@@ -13,7 +13,7 @@ use napi::{Error, Result};
 use super::config::{Attn, HyV4FlashConfig};
 use crate::moe_stream::io::open_nocache;
 use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf_reader};
-use crate::utils::gguf_source::{check_split_parts, check_tensor_bounds};
+use crate::utils::gguf_source::{check_split_parts, check_tensor_bounds, reject_split};
 
 pub const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
 const EXP_PROBS_B: &str = "exp_probs_b.bias";
@@ -55,8 +55,12 @@ pub enum ExpertClass {
     Q6kDown,
     /// gate, up and down Q4_K.
     Q4kDown,
+    /// gate, up and down NVFP4 (trunk SPARK-4Bit / SPARK-4Bit-Fast).
+    Nvfp4,
     /// gate, up and down BF16 (MTP layer only).
     Bf16,
+    /// gate, up and down Q8_0 (MTP layer only, SPARK-4Bit / SPARK-4Bit-Fast).
+    Q8_0,
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +145,11 @@ impl Scan {
             .map(PathBuf::as_path)
             .zip(headers.iter().map(|(gguf, _)| gguf))
             .collect();
-        check_split_parts(&parts)?;
+        if parts.len() == 1 {
+            reject_split(parts[0].1, parts[0].0)?;
+        } else {
+            check_split_parts(&parts)?;
+        }
         for (path, (gguf, file_len)) in paths.iter().zip(headers) {
             check_bounds(gguf, *file_len, path)?;
         }
@@ -192,8 +200,12 @@ fn check_bounds(gguf: &GgufFile, file_len: u64, path: &Path) -> Result<()> {
     };
     check_tensor_bounds(&rest, file_len, path)?;
     if let Some(t) = gguf.tensors.iter().find(|t| t.name == ENGRAM_TABLE) {
-        let end = t
-            .num_elements()?
+        let size = match t.tensor_type {
+            GgufTensorType::MXFP8 => t.num_elements()?,
+            GgufTensorType::Q8_0 => t.data_size()?,
+            _ => t.num_elements()?,
+        };
+        let end = size
             .checked_add(gguf.data_offset)
             .and_then(|x| x.checked_add(t.offset));
         if end.is_none_or(|end| end > file_len) {
@@ -422,16 +434,19 @@ fn mtp_layer(cfg: &HyV4FlashConfig, tensors: &HashMap<String, Entry>) -> Result<
     Ok(Some(MtpLayer { layer, bytes }))
 }
 
-/// Type 43 is parsed as MXFP8; whether it is F8_E4M3 is decided by the row
-/// reader's size proof, not here.
+/// Type 43 is parsed as MXFP8 (validated as F8_E4M3 by the row reader's
+/// EOF extent proof); type 8 is Q8_0 (validated by `base + n_rows * row_bytes <= file_len`).
 fn table(tensors: &HashMap<String, Entry>) -> Result<Located> {
     let loc = tensors
         .get(ENGRAM_TABLE)
         .map(|e| e.loc.clone())
         .ok_or_else(|| bad("Engram table missing"))?;
-    if loc.info.tensor_type != GgufTensorType::MXFP8 {
+    if !matches!(
+        loc.info.tensor_type,
+        GgufTensorType::MXFP8 | GgufTensorType::Q8_0
+    ) {
         return Err(bad(format!(
-            "Engram table type {:?} is not GGUF type 43",
+            "Engram table type {:?} is not GGUF type 43 (F8_E4M3) or Q8_0",
             loc.info.tensor_type
         )));
     }
@@ -443,7 +458,7 @@ fn expert_layer(
     tensors: &HashMap<String, Entry>,
     il: usize,
 ) -> Result<Option<ExpertLayer>> {
-    use GgufTensorType::{BF16, Q4K, Q6K};
+    use GgufTensorType::{BF16, NVFP4, Q4K, Q6K, Q8_0};
     let l = &cfg.layers[il];
     if l.dense_ffn {
         return Ok(None);
@@ -464,7 +479,9 @@ fn expert_layer(
     let class = match (types, l.mtp) {
         ((Q4K, Q4K, Q6K), false) => ExpertClass::Q6kDown,
         ((Q4K, Q4K, Q4K), false) => ExpertClass::Q4kDown,
+        ((NVFP4, NVFP4, NVFP4), false) => ExpertClass::Nvfp4,
         ((BF16, BF16, BF16), true) => ExpertClass::Bf16,
+        ((Q8_0, Q8_0, Q8_0), true) => ExpertClass::Q8_0,
         (t, mtp) => {
             return Err(bad(format!(
                 "layer {il}{}: expert types {t:?} (gate, up, down) are not supported",

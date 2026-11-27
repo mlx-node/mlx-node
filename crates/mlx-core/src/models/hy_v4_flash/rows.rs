@@ -1,13 +1,16 @@
-//! Engram table rows (F8_E4M3, `head_dim` bytes per row) read by `pread`
-//! through the load's one shard set (`F_NOCACHE` + `F_RDAHEAD 0`; never
-//! mapped, never a Metal buffer). Misses are coalesced into 16 KiB-aligned
+//! Engram table rows (F8_E4M3 `head_dim` B/row or Q8_0 `(head_dim / 32) * 34`
+//! B/row) read by `pread` through the load's one shard set (`F_NOCACHE` +
+//! `F_RDAHEAD 0` on macOS, per-worker `FILE_FLAG_NO_BUFFERING` on Windows;
+//! never mapped, never a Metal buffer). Misses are coalesced into 16 KiB-aligned
 //! page spans up to `MAX_COALESCE_BYTES`, served by a persistent worker pool
-//! with one reusable `AlignedBuf` per worker and a bounded raw-F8 LRU cache.
+//! with one reusable `AlignedBuf` per worker and a bounded raw-row LRU cache.
 //!
-//! The file says type 43, which mlx-node parses as MXFP8. The table is read
-//! as F8_E4M3 only when its bytes to the end of the shard are exactly
-//! `rows · head_dim`; the MXFP8 size (`rows · head_dim / 32 · 33`) and any
-//! other size are refused.
+//! Supported on-disk encodings:
+//! - Type 43 (`GgufTensorType::MXFP8` tag): read as raw F8_E4M3 only when its
+//!   bytes to the end of the shard are exactly `rows · head_dim`; the MXFP8
+//!   size (`rows · head_dim / 32 · 33`) and any other size are refused.
+//! - Type 8 (`GgufTensorType::Q8_0`): `(head_dim / 32) * 34` bytes/row, located
+//!   anywhere in the shard (`base + rows * row_bytes <= file_len`, not EOF).
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -29,10 +32,386 @@ use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::GgufTensorType;
 
 const ALIGN: u64 = 16 << 10;
+#[cfg(not(target_os = "macos"))]
+const MMAP_PAGE: u64 = 4 << 10;
+#[cfg(not(target_os = "macos"))]
+const MIN_AUTO_MMAP_BYTES: u64 = 4 << 20;
 pub(crate) const MAX_COALESCE_BYTES: u64 = 256 << 10;
 pub const DEFAULT_ENGRAM_THREADS: usize = 16;
 pub const ENGRAM_CACHE_ENV: &str = "MLX_HY4_ENGRAM_CACHE_MB";
 pub const DEFAULT_ENGRAM_CACHE_MB: usize = 256;
+/// Opt-in / opt-out for OS page-cached mmap of `per_layer_token_embd.weight`
+/// on non-macOS CUDA hosts (`1`/`true` forces on, `0`/`false` forces off,
+/// unset auto-enables on CUDA when table size >= 4 MiB). Ignored on macOS.
+pub const ENGRAM_MMAP_ENV: &str = "MLX_HY4_ENGRAM_MMAP";
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MmapPolicy {
+    Auto,
+    ForceOn,
+    ForceOff,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_mmap_policy(raw: Option<&str>) -> MmapPolicy {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return MmapPolicy::Auto;
+    };
+    if v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("no")
+    {
+        MmapPolicy::ForceOff
+    } else if v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("yes")
+    {
+        MmapPolicy::ForceOn
+    } else {
+        MmapPolicy::Auto
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod os_mmap {
+    use std::fs::File;
+
+    use napi::Result;
+
+    use super::bad;
+
+    #[cfg(windows)]
+    mod imp {
+        use std::ffi::c_void;
+        use std::fs::File;
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr::null;
+        use std::sync::OnceLock;
+
+        use napi::Result;
+
+        use super::bad;
+
+        const PAGE_READONLY: u32 = 0x02;
+        const FILE_MAP_READ: u32 = 0x0004;
+
+        #[repr(C)]
+        struct Win32MemoryRangeEntry {
+            virtual_address: *mut c_void,
+            number_of_bytes: usize,
+        }
+
+        type PrefetchVirtualMemoryFn =
+            unsafe extern "system" fn(*mut c_void, usize, *mut Win32MemoryRangeEntry, u32) -> i32;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileMappingW(
+                hFile: *mut c_void,
+                lpFileMappingAttributes: *const c_void,
+                flProtect: u32,
+                dwMaximumSizeHigh: u32,
+                dwMaximumSizeLow: u32,
+                lpName: *const u16,
+            ) -> *mut c_void;
+            fn MapViewOfFile(
+                hFileMappingObject: *mut c_void,
+                dwDesiredAccess: u32,
+                dwFileOffsetHigh: u32,
+                dwFileOffsetLow: u32,
+                dwNumberOfBytesToMap: usize,
+            ) -> *mut c_void;
+            fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
+            fn CloseHandle(hObject: *mut c_void) -> i32;
+            fn GetCurrentProcess() -> *mut c_void;
+            fn GetModuleHandleA(lpModuleName: *const u8) -> *mut c_void;
+            fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *const c_void;
+        }
+
+        fn prefetch_virtual_memory_fn() -> Option<PrefetchVirtualMemoryFn> {
+            static FN: OnceLock<Option<PrefetchVirtualMemoryFn>> = OnceLock::new();
+            *FN.get_or_init(|| {
+                // SAFETY: `kernel32.dll` is always loaded in Win32 processes and
+                // both string literals are NUL-terminated ASCII.
+                unsafe {
+                    let hmod = GetModuleHandleA(c"kernel32.dll".as_ptr().cast());
+                    if hmod.is_null() {
+                        return None;
+                    }
+                    let proc = GetProcAddress(hmod, c"PrefetchVirtualMemory".as_ptr().cast());
+                    if proc.is_null() {
+                        return None;
+                    }
+                    Some(std::mem::transmute::<*const c_void, PrefetchVirtualMemoryFn>(proc))
+                }
+            })
+        }
+
+        pub(in super::super) struct MmapRegion {
+            ptr: *const u8,
+            len: usize,
+            mapping: *mut c_void,
+        }
+
+        // SAFETY: Read-only immutable view of an immutable GGUF shard file.
+        unsafe impl Send for MmapRegion {}
+        // SAFETY: Read-only immutable view shared across Engram decode workers.
+        unsafe impl Sync for MmapRegion {}
+
+        impl MmapRegion {
+            pub(in super::super) fn map_readonly(file: &File, file_len: u64) -> Result<Self> {
+                let len = usize::try_from(file_len)
+                    .map_err(|_| bad(format!("mmap length {file_len} exceeds usize")))?;
+                if len == 0 {
+                    return Err(bad("cannot mmap empty file"));
+                }
+                let handle = file.as_raw_handle();
+                // SAFETY: `handle` is a valid open read-only file handle; `CreateFileMappingW`
+                // and `MapViewOfFile` map the full file read-only (`PAGE_READONLY` / `FILE_MAP_READ`).
+                let mapping =
+                    unsafe { CreateFileMappingW(handle, null(), PAGE_READONLY, 0, 0, null()) };
+                if mapping.is_null() {
+                    return Err(bad(format!(
+                        "CreateFileMappingW failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                let ptr = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) };
+                if ptr.is_null() {
+                    let err = std::io::Error::last_os_error();
+                    unsafe {
+                        CloseHandle(mapping);
+                    }
+                    return Err(bad(format!("MapViewOfFile failed: {err}")));
+                }
+                Ok(Self {
+                    ptr: ptr.cast::<u8>(),
+                    len,
+                    mapping,
+                })
+            }
+
+            #[inline]
+            pub(in super::super) fn as_slice(&self) -> &[u8] {
+                // SAFETY: `self.ptr` is a valid read-only mapping of `self.len` bytes
+                // alive for `&self`.
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            }
+
+            pub(in super::super) fn prefetch_ranges(&self, ranges: &[(usize, usize)]) {
+                if ranges.is_empty() {
+                    return;
+                }
+                let Some(prefetch_fn) = prefetch_virtual_memory_fn() else {
+                    return;
+                };
+                let base = self.ptr as usize;
+                let mut entries: Vec<Win32MemoryRangeEntry> = Vec::with_capacity(ranges.len());
+                for &(off, len) in ranges {
+                    if len == 0 || off >= self.len {
+                        continue;
+                    }
+                    let clamped = len.min(self.len - off);
+                    entries.push(Win32MemoryRangeEntry {
+                        virtual_address: (base + off) as *mut c_void,
+                        number_of_bytes: clamped,
+                    });
+                }
+                if entries.is_empty() {
+                    return;
+                }
+                // SAFETY: Every entry points inside `[self.ptr, self.ptr + self.len)` and
+                // `PrefetchVirtualMemory` is a non-mutating OS page-in hint.
+                unsafe {
+                    let _ =
+                        prefetch_fn(GetCurrentProcess(), entries.len(), entries.as_mut_ptr(), 0);
+                }
+            }
+        }
+
+        impl Drop for MmapRegion {
+            fn drop(&mut self) {
+                // SAFETY: `ptr` came from `MapViewOfFile` and `mapping` from `CreateFileMappingW`.
+                unsafe {
+                    let _ = UnmapViewOfFile(self.ptr.cast::<c_void>());
+                    let _ = CloseHandle(self.mapping);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    mod imp {
+        use std::ffi::c_void;
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+        use std::ptr::null_mut;
+
+        use napi::Result;
+
+        use super::bad;
+
+        pub(in super::super) struct MmapRegion {
+            ptr: *const u8,
+            len: usize,
+        }
+
+        // SAFETY: Read-only immutable view of an immutable GGUF shard file.
+        unsafe impl Send for MmapRegion {}
+        // SAFETY: Read-only immutable view shared across Engram decode workers.
+        unsafe impl Sync for MmapRegion {}
+
+        impl MmapRegion {
+            pub(in super::super) fn map_readonly(file: &File, file_len: u64) -> Result<Self> {
+                let len = usize::try_from(file_len)
+                    .map_err(|_| bad(format!("mmap length {file_len} exceeds usize")))?;
+                if len == 0 {
+                    return Err(bad("cannot mmap empty file"));
+                }
+                // SAFETY: `file` is an open read-only file descriptor; `MAP_PRIVATE | PROT_READ`
+                // maps `[0, len)` read-only.
+                let ptr = unsafe {
+                    libc::mmap(
+                        null_mut(),
+                        len,
+                        libc::PROT_READ,
+                        libc::MAP_PRIVATE,
+                        file.as_raw_fd(),
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(bad(format!(
+                        "mmap failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                Ok(Self {
+                    ptr: ptr.cast::<u8>(),
+                    len,
+                })
+            }
+
+            #[inline]
+            pub(in super::super) fn as_slice(&self) -> &[u8] {
+                // SAFETY: `self.ptr` is a valid read-only mapping of `self.len` bytes
+                // alive for `&self`.
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            }
+
+            pub(in super::super) fn prefetch_ranges(&self, ranges: &[(usize, usize)]) {
+                let base = self.ptr as usize;
+                for &(off, len) in ranges {
+                    if len == 0 || off >= self.len {
+                        continue;
+                    }
+                    let clamped = len.min(self.len - off);
+                    // SAFETY: `[base + off, base + off + clamped)` lies inside the mapping;
+                    // `MADV_WILLNEED` is a non-mutating OS page-in hint.
+                    unsafe {
+                        let _ = libc::madvise(
+                            (base + off) as *mut c_void,
+                            clamped,
+                            libc::MADV_WILLNEED,
+                        );
+                    }
+                }
+            }
+        }
+
+        impl Drop for MmapRegion {
+            fn drop(&mut self) {
+                // SAFETY: `ptr` and `len` came from `libc::mmap`.
+                unsafe {
+                    let _ = libc::munmap(self.ptr as *mut c_void, self.len);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    mod imp {
+        use std::fs::File;
+
+        use napi::Result;
+
+        use super::bad;
+
+        pub(in super::super) struct MmapRegion;
+
+        impl MmapRegion {
+            pub(in super::super) fn map_readonly(_file: &File, _file_len: u64) -> Result<Self> {
+                Err(bad("mmap unsupported on this platform"))
+            }
+
+            pub(in super::super) fn as_slice(&self) -> &[u8] {
+                &[]
+            }
+
+            pub(in super::super) fn prefetch_ranges(&self, _ranges: &[(usize, usize)]) {}
+        }
+    }
+
+    pub(super) use imp::MmapRegion;
+
+    pub(super) fn try_map(file: &File, file_len: u64) -> Result<MmapRegion> {
+        MmapRegion::map_readonly(file, file_len)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn coalesce_mmap_ranges(
+    id_slices: &[&[u32]],
+    base: u64,
+    row_bytes: usize,
+    file_len: u64,
+) -> (Vec<(usize, usize)>, u64) {
+    if row_bytes == 0 || file_len == 0 {
+        return (Vec::new(), 0);
+    }
+    let total_ids: usize = id_slices.iter().map(|s| s.len()).sum();
+    if total_ids == 0 {
+        return (Vec::new(), 0);
+    }
+    let stride = row_bytes as u64;
+    let mut intervals: Vec<(u64, u64)> = Vec::with_capacity(total_ids);
+    for slice in id_slices {
+        for &id in *slice {
+            let off = base + u64::from(id) * stride;
+            let start = off & !(MMAP_PAGE - 1);
+            let end = (off + stride)
+                .checked_next_multiple_of(MMAP_PAGE)
+                .unwrap_or(file_len)
+                .min(file_len);
+            if end > start {
+                intervals.push((start, end));
+            }
+        }
+    }
+    if intervals.is_empty() {
+        return (Vec::new(), 0);
+    }
+    intervals.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+    let mut total_bytes = 0u64;
+    let (mut cur_s, mut cur_e) = intervals[0];
+    for (s, e) in intervals.into_iter().skip(1) {
+        if s <= cur_e {
+            cur_e = cur_e.max(e);
+        } else {
+            total_bytes += cur_e - cur_s;
+            merged.push((cur_s as usize, (cur_e - cur_s) as usize));
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    total_bytes += cur_e - cur_s;
+    merged.push((cur_s as usize, (cur_e - cur_s) as usize));
+    (merged, total_bytes)
+}
 
 const NONE: u32 = u32::MAX;
 /// Per-entry index budget alongside `head_dim` raw bytes and `LruNode` (12 B):
@@ -57,8 +436,107 @@ pub trait EngramRows {
         Ok(None)
     }
 
+    /// Prefetches multiple Engram layers together. On OS page-cached mmap
+    /// tables, issues one batched `PrefetchVirtualMemory` / `MADV_WILLNEED`
+    /// across all requested layers before dispatching decode jobs.
+    fn prefetch_all(&self, layers: &[(usize, &[u32])]) -> Result<Vec<Option<PrefetchHandle>>> {
+        layers
+            .iter()
+            .map(|&(layer, ids)| self.prefetch(layer, ids))
+            .collect()
+    }
+
     fn take_prefetched(&self, handle: PrefetchHandle) -> Result<Vec<f32>> {
         handle.wait()
+    }
+}
+
+const Q8_0_VALUES: usize = 32;
+const Q8_0_BYTES: usize = 34;
+
+/// On-disk encoding of `per_layer_token_embd.weight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngramRowFormat {
+    /// Raw F8_E4M3 (type 43 tag), 1 B/elem, located at shard EOF.
+    F8E4M3,
+    /// GGUF Q8_0 (type 8), `(head_dim / 32) * 34` B/row, located anywhere in shard.
+    Q8_0,
+}
+
+impl EngramRowFormat {
+    pub fn row_bytes(self, head_dim: usize) -> Result<usize> {
+        if head_dim == 0 {
+            return Err(bad("empty engram head_dim"));
+        }
+        match self {
+            Self::F8E4M3 => Ok(head_dim),
+            Self::Q8_0 => {
+                if !head_dim.is_multiple_of(Q8_0_VALUES) {
+                    return Err(bad(format!(
+                        "Q8_0 engram head_dim {head_dim} is not divisible by {Q8_0_VALUES}"
+                    )));
+                }
+                (head_dim / Q8_0_VALUES)
+                    .checked_mul(Q8_0_BYTES)
+                    .ok_or_else(|| bad("Q8_0 engram row_bytes overflows usize"))
+            }
+        }
+    }
+}
+
+/// Validates that a Q8_0 Engram table `[n_rows, head_dim]` fits inside `file_len`
+/// starting at `base` (does NOT require EOF) and returns `row_bytes`.
+pub fn prove_q8_0_extent(file_len: u64, base: u64, n_rows: u64, head_dim: usize) -> Result<usize> {
+    if n_rows == 0 || head_dim == 0 {
+        return Err(bad(format!("empty table [{n_rows}, {head_dim}]")));
+    }
+    let row_bytes = EngramRowFormat::Q8_0.row_bytes(head_dim)?;
+    let total = n_rows
+        .checked_mul(row_bytes as u64)
+        .ok_or_else(|| bad("Q8_0 engram table size overflows u64"))?;
+    let end = base
+        .checked_add(total)
+        .ok_or_else(|| bad("Q8_0 engram table end overflows u64"))?;
+    if end > file_len {
+        return Err(bad(format!(
+            "Q8_0 table [{n_rows}, {head_dim}] ({total} bytes at {base}) runs past file end ({file_len})"
+        )));
+    }
+    Ok(row_bytes)
+}
+
+/// Decodes one Q8_0 row (each 32-value block = LE f16 `d` + 32 signed i8 codes)
+/// into `out` (exact f32), refusing non-finite block scales.
+pub fn decode_q8_0_row(raw: &[u8], out: &mut [f32]) -> Result<()> {
+    let blocks = raw.len() / Q8_0_BYTES;
+    if !raw.len().is_multiple_of(Q8_0_BYTES) || blocks.checked_mul(Q8_0_VALUES) != Some(out.len()) {
+        return Err(bad(format!(
+            "Q8_0 row: {} bytes for {} values",
+            raw.len(),
+            out.len()
+        )));
+    }
+    for (b, o) in raw
+        .as_chunks::<Q8_0_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<Q8_0_VALUES>().0)
+    {
+        let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+        if !d.is_finite() {
+            return Err(bad("non-finite Q8_0 block scale"));
+        }
+        for (dst, &q) in o.iter_mut().zip(&b[2..]) {
+            *dst = d * f32::from(i8::from_le_bytes([q]));
+        }
+    }
+    Ok(())
+}
+
+fn decode_row(format: EngramRowFormat, raw: &[u8], out: &mut [f32]) -> Result<()> {
+    match format {
+        EngramRowFormat::F8E4M3 => decode_f8_rows(raw, out),
+        EngramRowFormat::Q8_0 => decode_q8_0_row(raw, out),
     }
 }
 
@@ -99,25 +577,26 @@ pub(crate) struct PageSpan {
 
 /// Coalesces unique miss row IDs into 16 KiB-aligned windows clipped at
 /// `file_len`, merging consecutive windows whenever `next_start <= cur_end`
-/// and the merged length is at most `MAX_COALESCE_BYTES`.
+/// and the merged length is at most `MAX_COALESCE_BYTES`. `row_bytes` is the
+/// byte stride per row (`head_dim` for F8_E4M3, `(head_dim / 32) * 34` for Q8_0).
 pub(crate) fn coalesce_spans(
     miss_ids: &[u32],
     base: u64,
-    head_dim: usize,
+    row_bytes: usize,
     file_len: u64,
 ) -> Vec<PageSpan> {
-    if miss_ids.is_empty() || head_dim == 0 {
+    if miss_ids.is_empty() || row_bytes == 0 {
         return Vec::new();
     }
     let mut sorted = miss_ids.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let hd = head_dim as u64;
+    let stride = row_bytes as u64;
     let mut spans: Vec<PageSpan> = Vec::new();
     for id in sorted {
-        let off = base + u64::from(id) * hd;
+        let off = base + u64::from(id) * stride;
         let win_start = off & !(ALIGN - 1);
-        let win_end = (off + hd)
+        let win_end = (off + stride)
             .checked_next_multiple_of(ALIGN)
             .unwrap_or(file_len)
             .min(file_len);
@@ -350,7 +829,11 @@ struct TableShared {
     /// File offset of row 0.
     base: u64,
     file_len: u64,
+    format: EngramRowFormat,
     head_dim: usize,
+    row_bytes: usize,
+    #[cfg(not(target_os = "macos"))]
+    mmap: Option<os_mmap::MmapRegion>,
     cache_enabled: bool,
     cache: Mutex<F8RowCache>,
     queue: Mutex<QueueState>,
@@ -374,6 +857,7 @@ struct BatchState {
 
 struct EngramBatch {
     cancelled: AtomicBool,
+    done_flag: AtomicBool,
     state: Mutex<BatchState>,
     done: Condvar,
     shared: Arc<TableShared>,
@@ -392,6 +876,11 @@ pub struct PrefetchHandle {
 }
 
 impl PrefetchHandle {
+    /// Non-blocking check whether all background span decodes for this handle
+    /// have completed (lock-free).
+    pub fn is_ready(&self) -> bool {
+        self.batch.done_flag.load(Ordering::Acquire)
+    }
     /// Waits for all coalesced miss spans to finish, inserts validated raw F8
     /// misses into the LRU cache, and returns `[ids.len(), head_dim]` f32 rows.
     pub fn wait(mut self) -> Result<Vec<f32>> {
@@ -416,10 +905,11 @@ impl PrefetchHandle {
         drop(st);
 
         let hd = self.batch.shared.head_dim;
+        let rb = self.batch.shared.row_bytes;
         if self.batch.shared.cache_enabled && !self.batch.miss_ids.is_empty() {
             let mut cache = lock(&self.batch.shared.cache);
             for (i, &row_id) in self.batch.miss_ids.iter().enumerate() {
-                cache.insert(row_id, &miss_raw[i * hd..(i + 1) * hd]);
+                cache.insert(row_id, &miss_raw[i * rb..(i + 1) * rb]);
             }
         }
 
@@ -491,31 +981,57 @@ fn run_span(
     shared: &TableShared,
     job: &SpanJob,
     buf: &mut AlignedBuf,
+    #[cfg(windows)] unbuf: Option<&std::fs::File>,
 ) -> Result<(Vec<u8>, Vec<f32>, u64)> {
+    let hd = shared.head_dim;
+    let rb = shared.row_bytes;
+    let n = job.targets.len();
+    #[cfg(not(target_os = "macos"))]
+    if let Some(mmap) = shared.mmap.as_ref() {
+        let span_len = job.end - job.start;
+        if job.batch.cancelled.load(Ordering::Relaxed) {
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
+        let slice = mmap.as_slice();
+        let mut dec_out = vec![0f32; n * hd];
+        for (i, &(_miss_idx, _uniq_idx, row_id)) in job.targets.iter().enumerate() {
+            let off = (shared.base + u64::from(row_id) * rb as u64) as usize;
+            let raw = &slice[off..off + rb];
+            decode_row(shared.format, raw, &mut dec_out[i * hd..(i + 1) * hd])
+                .map_err(|err| bad(format!("row {row_id}: {}", err.reason)))?;
+        }
+        shared.bytes.fetch_add(span_len, Ordering::Relaxed);
+        return Ok((Vec::new(), dec_out, span_len));
+    }
+
     let span_len = job.end - job.start;
     let e = Extent {
         shard: shared.shard,
         offset: job.start,
         len: span_len,
     };
+    #[cfg(windows)]
+    let page_bytes = match unbuf {
+        Some(f) => shared.shards.read_aligned_unbuffered(f, e, buf)?,
+        None => shared.shards.read_aligned(e, buf)?,
+    };
+    #[cfg(not(windows))]
     let page_bytes = shared.shards.read_aligned(e, buf)?;
     shared.bytes.fetch_add(span_len, Ordering::Relaxed);
     if job.batch.cancelled.load(Ordering::Relaxed) {
         return Ok((Vec::new(), Vec::new(), span_len));
     }
-    let hd = shared.head_dim;
-    let n = job.targets.len();
     let mut raw_out = if shared.cache_enabled {
-        Vec::with_capacity(n * hd)
+        Vec::with_capacity(n * rb)
     } else {
         Vec::new()
     };
     let mut dec_out = vec![0f32; n * hd];
     for (i, &(_miss_idx, _uniq_idx, row_id)) in job.targets.iter().enumerate() {
-        let off = shared.base + u64::from(row_id) * hd as u64;
+        let off = shared.base + u64::from(row_id) * rb as u64;
         let rel = (off - job.start) as usize;
-        let raw = &page_bytes[rel..rel + hd];
-        decode_f8_rows(raw, &mut dec_out[i * hd..(i + 1) * hd])
+        let raw = &page_bytes[rel..rel + rb];
+        decode_row(shared.format, raw, &mut dec_out[i * hd..(i + 1) * hd])
             .map_err(|err| bad(format!("row {row_id}: {}", err.reason)))?;
         if shared.cache_enabled {
             raw_out.extend_from_slice(raw);
@@ -526,7 +1042,17 @@ fn run_span(
 
 fn worker(shared: &TableShared) {
     let mut buf = AlignedBuf::new();
+    #[cfg(windows)]
+    let unbuf = if shared.mmap.is_some() {
+        None
+    } else {
+        shared
+            .shards
+            .path(shared.shard)
+            .and_then(|p| crate::moe_stream::io::open_unbuffered(p).ok())
+    };
     let hd = shared.head_dim;
+    let rb = shared.row_bytes;
     while let Some(job) = next_job(shared) {
         if job.batch.cancelled.load(Ordering::Relaxed) {
             let mut st = lock(&job.batch.state);
@@ -536,12 +1062,21 @@ fn worker(shared: &TableShared) {
                 {
                     st.done_seq = shared.next_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
                 }
+                job.batch.done_flag.store(true, Ordering::Release);
                 job.batch.done.notify_all();
             }
             continue;
         }
-        let res = catch_unwind(AssertUnwindSafe(|| run_span(shared, &job, &mut buf)))
-            .unwrap_or_else(|_| Err(bad("reader panicked")));
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            run_span(
+                shared,
+                &job,
+                &mut buf,
+                #[cfg(windows)]
+                unbuf.as_ref(),
+            )
+        }))
+        .unwrap_or_else(|_| Err(bad("reader panicked")));
         let mut st = lock(&job.batch.state);
         match res {
             Ok((raw_out, dec_out, bytes_read)) => {
@@ -551,8 +1086,8 @@ fn worker(shared: &TableShared) {
                         st.output[uniq_idx * hd..(uniq_idx + 1) * hd]
                             .copy_from_slice(&dec_out[i * hd..(i + 1) * hd]);
                         if shared.cache_enabled {
-                            st.miss_raw[miss_idx * hd..(miss_idx + 1) * hd]
-                                .copy_from_slice(&raw_out[i * hd..(i + 1) * hd]);
+                            st.miss_raw[miss_idx * rb..(miss_idx + 1) * rb]
+                                .copy_from_slice(&raw_out[i * rb..(i + 1) * rb]);
                         }
                     }
                 }
@@ -568,6 +1103,7 @@ fn worker(shared: &TableShared) {
             {
                 st.done_seq = shared.next_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
             }
+            job.batch.done_flag.store(true, Ordering::Release);
             job.batch.done.notify_all();
         }
     }
@@ -613,8 +1149,15 @@ impl F8Table {
         let budget_bytes = cache_mb
             .checked_mul(1 << 20)
             .ok_or_else(|| bad(format!("{ENGRAM_CACHE_ENV}={cache_mb}: overflows usize")))?;
-        let cache = F8RowCache::from_budget_bytes(budget_bytes, cfg.head_dim);
-        Self::build(shards, shard, loc, cfg, DEFAULT_ENGRAM_THREADS, cache)
+        Self::build(
+            shards,
+            shard,
+            loc,
+            cfg,
+            DEFAULT_ENGRAM_THREADS,
+            true,
+            |row_bytes| F8RowCache::from_budget_bytes(budget_bytes, row_bytes),
+        )
     }
 
     #[cfg(test)]
@@ -626,8 +1169,9 @@ impl F8Table {
         threads: usize,
         cache_rows: usize,
     ) -> Result<Self> {
-        let cache = F8RowCache::new(cache_rows, cfg.head_dim);
-        Self::build(shards, shard, loc, cfg, threads, cache)
+        Self::build(shards, shard, loc, cfg, threads, false, |row_bytes| {
+            F8RowCache::new(cache_rows, row_bytes)
+        })
     }
 
     fn build(
@@ -636,12 +1180,13 @@ impl F8Table {
         loc: &Located,
         cfg: &EngramConfig,
         threads: usize,
-        cache: F8RowCache,
+        allow_mmap: bool,
+        make_cache: impl FnOnce(usize) -> F8RowCache,
     ) -> Result<Self> {
         if threads == 0 {
             return Err(bad("0 engram worker threads"));
         }
-        let n_rows = table_rows(loc, cfg)?;
+        let (n_rows, format) = table_rows(loc, cfg)?;
         let columns = Columns::new(cfg, n_rows)?;
         let (file, path) = shards
             .file(shard)
@@ -652,20 +1197,81 @@ impl F8Table {
             .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?
             .len();
         let base = loc.abs_offset()?;
-        let extent = file_len.checked_sub(base).ok_or_else(|| {
-            bad(format!(
-                "'{}': table starts at {base}, past the end ({file_len})",
-                path.display()
-            ))
-        })?;
-        prove_f8_extent(extent, n_rows, cfg.head_dim)
-            .map_err(|e| bad(format!("'{}': {}", path.display(), e.reason)))?;
+        let row_bytes = match format {
+            EngramRowFormat::F8E4M3 => {
+                let extent = file_len.checked_sub(base).ok_or_else(|| {
+                    bad(format!(
+                        "'{}': table starts at {base}, past the end ({file_len})",
+                        path.display()
+                    ))
+                })?;
+                prove_f8_extent(extent, n_rows, cfg.head_dim)
+                    .map_err(|e| bad(format!("'{}': {}", path.display(), e.reason)))?;
+                cfg.head_dim
+            }
+            EngramRowFormat::Q8_0 => prove_q8_0_extent(file_len, base, n_rows, cfg.head_dim)
+                .map_err(|e| bad(format!("'{}': {}", path.display(), e.reason)))?,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mmap = {
+            let table_bytes = n_rows.saturating_mul(row_bytes as u64);
+            let policy = parse_mmap_policy(std::env::var(ENGRAM_MMAP_ENV).ok().as_deref());
+            let want_mmap = allow_mmap
+                && match policy {
+                    MmapPolicy::ForceOff => false,
+                    MmapPolicy::ForceOn => true,
+                    MmapPolicy::Auto => {
+                        crate::accelerator::cuda_ops_available()
+                            && table_bytes >= MIN_AUTO_MMAP_BYTES
+                    }
+                };
+            if want_mmap {
+                match os_mmap::try_map(file, file_len) {
+                    Ok(region) => {
+                        tracing::info!(
+                            "hy_v4_flash Engram mmap enabled: '{}' ({} MiB, OS page-cached)",
+                            path.display(),
+                            file_len >> 20
+                        );
+                        Some(region)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "hy_v4_flash Engram mmap failed on '{}' ({}), falling back to pread",
+                            path.display(),
+                            e.reason
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let _ = allow_mmap;
+        #[cfg(not(target_os = "macos"))]
+        let mmap_active = mmap.is_some();
+        #[cfg(target_os = "macos")]
+        let mmap_active = false;
+        // When OS page-cached mmap is active, bypass the tiny 256 MiB user LRU:
+        // OS page cache automatically holds tens of GiB of hot 4 KiB pages with
+        // zero user-space mutex contention.
+        let cache = if mmap_active {
+            F8RowCache::new(0, row_bytes)
+        } else {
+            make_cache(row_bytes)
+        };
         let shared = Arc::new(TableShared {
             shards,
             shard,
             base,
             file_len,
+            format,
             head_dim: cfg.head_dim,
+            row_bytes,
+            #[cfg(not(target_os = "macos"))]
+            mmap,
             cache_enabled: cache.capacity() > 0,
             cache: Mutex::new(cache),
             queue: Mutex::new(QueueState::default()),
@@ -697,6 +1303,18 @@ impl F8Table {
         self.columns.n_rows
     }
 
+    pub fn format(&self) -> EngramRowFormat {
+        self.shared.format
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.shared.head_dim
+    }
+
+    pub fn row_bytes(&self) -> usize {
+        self.shared.row_bytes
+    }
+
     /// Real aligned bytes read from disk and foreground nanoseconds spent, since open.
     pub fn read_stats(&self) -> (u64, u64) {
         (
@@ -715,9 +1333,13 @@ impl F8Table {
         lock(&self.shared.cache).capacity()
     }
 
-    /// Submits coalesced 16 KiB-aligned misses to the persistent worker pool
-    /// after serving raw-F8 LRU hits under a single lock.
-    pub fn prefetch_rows(&self, ids: &[u32]) -> Result<PrefetchHandle> {
+    #[cfg(not(target_os = "macos"))]
+    fn prefetch_rows_mmap(
+        &self,
+        mmap: &os_mmap::MmapRegion,
+        ids: &[u32],
+        already_prefetched: bool,
+    ) -> Result<PrefetchHandle> {
         let t0 = Instant::now();
         if let Some(&id) = ids.iter().find(|&&id| u64::from(id) >= self.columns.n_rows) {
             return Err(bad(format!(
@@ -728,6 +1350,7 @@ impl F8Table {
         if ids.is_empty() {
             let batch = Arc::new(EngramBatch {
                 cancelled: AtomicBool::new(false),
+                done_flag: AtomicBool::new(true),
                 state: Mutex::new(BatchState {
                     remaining: 0,
                     output: Vec::new(),
@@ -752,6 +1375,141 @@ impl F8Table {
         }
 
         let hd = self.shared.head_dim;
+        let rb = self.shared.row_bytes;
+        let ids_are_uniq_order = ids.windows(2).all(|w| w[0] < w[1]);
+        let uniq = if ids_are_uniq_order {
+            ids.to_vec()
+        } else {
+            let mut u = ids.to_vec();
+            u.sort_unstable();
+            u.dedup();
+            u
+        };
+
+        let total_page_bytes = if !already_prefetched {
+            let (ranges, bytes) =
+                coalesce_mmap_ranges(&[&uniq], self.shared.base, rb, self.shared.file_len);
+            mmap.prefetch_ranges(&ranges);
+            bytes
+        } else {
+            coalesce_mmap_ranges(&[&uniq], self.shared.base, rb, self.shared.file_len).1
+        };
+
+        let chunk_rows = if uniq.len() <= 64 {
+            (uniq.len() / 4).clamp(1, 4)
+        } else {
+            uniq.len().div_ceil(32).max(8)
+        };
+        let n_jobs = uniq.len().div_ceil(chunk_rows);
+        let uniq_dec = vec![0f32; uniq.len() * hd];
+        let batch = Arc::new(EngramBatch {
+            cancelled: AtomicBool::new(false),
+            done_flag: AtomicBool::new(n_jobs == 0),
+            state: Mutex::new(BatchState {
+                remaining: n_jobs,
+                output: uniq_dec,
+                miss_raw: Vec::new(),
+                err: None,
+                bytes_read: 0,
+                wait_ns: 0,
+                #[cfg(test)]
+                done_seq: 0,
+            }),
+            done: Condvar::new(),
+            shared: Arc::clone(&self.shared),
+            ids: if ids_are_uniq_order {
+                Vec::new()
+            } else {
+                ids.to_vec()
+            },
+            uniq: if ids_are_uniq_order {
+                Vec::new()
+            } else {
+                uniq.clone()
+            },
+            miss_ids: Vec::new(),
+            ids_are_uniq_order,
+        });
+
+        let mut jobs = Vec::with_capacity(n_jobs);
+        for (ji, chunk) in uniq.chunks(chunk_rows).enumerate() {
+            let base_idx = ji * chunk_rows;
+            let mut targets = Vec::with_capacity(chunk.len());
+            for (k, &row_id) in chunk.iter().enumerate() {
+                targets.push((0, base_idx + k, row_id));
+            }
+            let job_bytes = if ji == 0 { total_page_bytes } else { 0 };
+            jobs.push(SpanJob {
+                batch: Arc::clone(&batch),
+                start: 0,
+                end: job_bytes,
+                targets,
+            });
+        }
+        {
+            let mut q = lock(&self.shared.queue);
+            if q.shutdown {
+                return Err(bad("engram worker pool is shut down"));
+            }
+            q.jobs.extend(jobs);
+        }
+        if n_jobs == 1 {
+            self.shared.ready.notify_one();
+        } else {
+            self.shared.ready.notify_all();
+        }
+        self.shared
+            .ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(PrefetchHandle {
+            batch,
+            waited: false,
+        })
+    }
+
+    /// Submits coalesced 16 KiB-aligned misses to the persistent worker pool
+    /// after serving raw-F8 LRU hits under a single lock.
+    pub fn prefetch_rows(&self, ids: &[u32]) -> Result<PrefetchHandle> {
+        #[cfg(not(target_os = "macos"))]
+        if let Some(mmap) = self.shared.mmap.as_ref() {
+            return self.prefetch_rows_mmap(mmap, ids, false);
+        }
+        let t0 = Instant::now();
+        if let Some(&id) = ids.iter().find(|&&id| u64::from(id) >= self.columns.n_rows) {
+            return Err(bad(format!(
+                "row {id} outside the table ({} rows)",
+                self.columns.n_rows
+            )));
+        }
+        if ids.is_empty() {
+            let batch = Arc::new(EngramBatch {
+                cancelled: AtomicBool::new(false),
+                done_flag: AtomicBool::new(true),
+                state: Mutex::new(BatchState {
+                    remaining: 0,
+                    output: Vec::new(),
+                    miss_raw: Vec::new(),
+                    err: None,
+                    bytes_read: 0,
+                    wait_ns: 0,
+                    #[cfg(test)]
+                    done_seq: 0,
+                }),
+                done: Condvar::new(),
+                shared: Arc::clone(&self.shared),
+                ids: Vec::new(),
+                uniq: Vec::new(),
+                miss_ids: Vec::new(),
+                ids_are_uniq_order: true,
+            });
+            return Ok(PrefetchHandle {
+                batch,
+                waited: false,
+            });
+        }
+
+        let hd = self.shared.head_dim;
+        let rb = self.shared.row_bytes;
         let ids_are_uniq_order = ids.windows(2).all(|w| w[0] < w[1]);
         let uniq = if ids_are_uniq_order {
             ids.to_vec()
@@ -768,8 +1526,12 @@ impl F8Table {
             let mut cache = lock(&self.shared.cache);
             for (u_idx, &id) in uniq.iter().enumerate() {
                 if let Some(raw) = cache.get(id) {
-                    decode_f8_rows(raw, &mut uniq_dec[u_idx * hd..(u_idx + 1) * hd])
-                        .map_err(|err| bad(format!("row {id}: {}", err.reason)))?;
+                    decode_row(
+                        self.shared.format,
+                        raw,
+                        &mut uniq_dec[u_idx * hd..(u_idx + 1) * hd],
+                    )
+                    .map_err(|err| bad(format!("row {id}: {}", err.reason)))?;
                 } else {
                     misses.push((u_idx, id));
                 }
@@ -779,16 +1541,17 @@ impl F8Table {
         }
 
         let miss_ids: Vec<u32> = misses.iter().map(|&(_, id)| id).collect();
-        let spans = coalesce_spans(&miss_ids, self.shared.base, hd, self.shared.file_len);
+        let spans = coalesce_spans(&miss_ids, self.shared.base, rb, self.shared.file_len);
         let n_spans = spans.len();
         let miss_raw = if self.shared.cache_enabled && !miss_ids.is_empty() {
-            vec![0u8; miss_ids.len() * hd]
+            vec![0u8; miss_ids.len() * rb]
         } else {
             Vec::new()
         };
 
         let batch = Arc::new(EngramBatch {
             cancelled: AtomicBool::new(false),
+            done_flag: AtomicBool::new(n_spans == 0),
             state: Mutex::new(BatchState {
                 remaining: n_spans,
                 output: uniq_dec,
@@ -884,6 +1647,36 @@ impl EngramRows for F8Table {
         self.prefetch_rows(ids).map(Some)
     }
 
+    fn prefetch_all(&self, layers: &[(usize, &[u32])]) -> Result<Vec<Option<PrefetchHandle>>> {
+        for &(layer, ids) in layers {
+            self.columns.check(layer, ids)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        if let Some(mmap) = self.shared.mmap.as_ref() {
+            let t0 = Instant::now();
+            let id_slices: Vec<&[u32]> = layers.iter().map(|&(_, ids)| ids).collect();
+            let (ranges, _) = coalesce_mmap_ranges(
+                &id_slices,
+                self.shared.base,
+                self.shared.row_bytes,
+                self.shared.file_len,
+            );
+            mmap.prefetch_ranges(&ranges);
+            self.shared
+                .ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut out = Vec::with_capacity(layers.len());
+            for &(_, ids) in layers {
+                out.push(Some(self.prefetch_rows_mmap(mmap, ids, true)?));
+            }
+            return Ok(out);
+        }
+        layers
+            .iter()
+            .map(|&(_, ids)| self.prefetch_rows(ids).map(Some))
+            .collect()
+    }
+
     fn take_prefetched(&self, handle: PrefetchHandle) -> Result<Vec<f32>> {
         handle.wait()
     }
@@ -923,20 +1716,24 @@ impl EngramRows for ResidentF8Table {
     }
 }
 
-/// Name, type 43 and ggml dims `[head_dim, Σ head_vocab_sizes]`; the row
-/// count.
-fn table_rows(loc: &Located, cfg: &EngramConfig) -> Result<u64> {
+/// Name, supported type (43 = F8_E4M3 or 8 = Q8_0) and ggml dims
+/// `[head_dim, Σ head_vocab_sizes]`; returns `(n_rows, format)`.
+fn table_rows(loc: &Located, cfg: &EngramConfig) -> Result<(u64, EngramRowFormat)> {
     let info = &loc.info;
     if info.name != ENGRAM_TABLE {
         return Err(bad(format!("'{}' is not {ENGRAM_TABLE}", info.name)));
     }
-    if info.tensor_type != GgufTensorType::MXFP8 {
-        return Err(bad(format!(
-            "{}: type {} is not GGUF type 43",
-            info.name,
-            info.tensor_type.name()
-        )));
-    }
+    let format = match info.tensor_type {
+        GgufTensorType::MXFP8 => EngramRowFormat::F8E4M3,
+        GgufTensorType::Q8_0 => EngramRowFormat::Q8_0,
+        other => {
+            return Err(bad(format!(
+                "{}: type {} is not GGUF type 43 (F8_E4M3) or Q8_0",
+                info.name,
+                other.name()
+            )));
+        }
+    };
     let n_rows = cfg.head_vocab_sizes.iter().sum::<u64>();
     if info.dims != [cfg.head_dim as u64, n_rows] {
         return Err(bad(format!(
@@ -944,5 +1741,5 @@ fn table_rows(loc: &Located, cfg: &EngramConfig) -> Result<u64> {
             info.name, info.dims, cfg.head_dim
         )));
     }
-    Ok(n_rows)
+    Ok((n_rows, format))
 }

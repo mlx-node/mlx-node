@@ -45,12 +45,19 @@ export interface ModelsResponse {
   dir: string;
 }
 
-/** `GET /api/host`: this machine's memory, free space on the models disk, and OS platform. */
+/** Host GPU capability slice reported by `GET /api/host` on non-darwin hosts. */
+export interface HostGpuInfo {
+  backend: string;
+  totalMemoryBytes: number;
+}
+
+/** `GET /api/host`: this machine's memory, free space on the models disk, OS platform, and optional GPU info. */
 export interface HostResponse {
   totalMemBytes: number;
   /** `null` when the models folder cannot be read. */
   diskFreeBytes: number | null;
   platform?: string;
+  gpu?: HostGpuInfo;
 }
 
 export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
@@ -67,6 +74,8 @@ export interface CatalogBuildItem {
   note?: string;
   /** What comes with the weights. */
   included?: string;
+  /** Minimum CUDA device memory in GiB required on non-macOS hosts. */
+  minGpuMemoryGb?: number;
   /**
    * Base-model repo the build CURRENTLY sources its tokenizer sidecars from — compared against `localAssetsRepo` so
    * a switched source is itself an update (the marker's repo is what the probe map lacks).

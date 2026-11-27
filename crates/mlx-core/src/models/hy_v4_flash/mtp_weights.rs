@@ -16,14 +16,20 @@ use napi::{Error, Result};
 use super::moe::{AffineExperts, AffineProj};
 use super::scan::{ExpertClass, Located, Role, Scan};
 use super::weights::{
-    AttnWeights, Dense, Ffn, Form, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader,
-    Residual, dense_from_raw, held_shape, quantize_affine4_from_bf16_raw,
+    AttnWeights, CUDA_CLEAR_CACHE_BYTES, CUDA_REPACK_BAND_BYTES, CudaStaging, Dense, Ffn, Form,
+    IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader, Residual,
+    cuda_repack_from_shards, dense_from_raw, held_shape, quantize_affine4_from_bf16_raw,
     quantize_sym_q8_from_bf16_raw,
 };
+use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+use crate::utils::gguf_cpu_repack::decode_affine_band_into;
+use crate::utils::gguf_gpu::{
+    CudaDeviceBudget, GpuRepackKind, RepackDst, gpu_repack_available, gpu_repack_supports_kind,
+};
 
 /// Experts requantized per batch.
 pub const EXPERT_BATCH: usize = 32;
@@ -98,6 +104,8 @@ pub enum Held {
     F32,
     /// Affine-4 g64 codes, bf16 scales and biases.
     Affine4,
+    /// Affine-8 g32 codes, f16 scales and derived `-128 * scale` biases (Q8_0 MTP experts).
+    Affine8,
 }
 
 fn is_compressor_mat(name: &str) -> bool {
@@ -106,9 +114,10 @@ fn is_compressor_mat(name: &str) -> bool {
 
 /// The held form of an MTP tensor; `expert` for a routed expert tensor.
 pub fn held(info: &GgufTensorInfo, expert: bool) -> Result<Held> {
-    use GgufTensorType::{BF16, F32};
+    use GgufTensorType::{BF16, F32, Q8_0};
     Ok(match (info.tensor_type, expert) {
         (BF16, true) => Held::Affine4,
+        (Q8_0, true) => Held::Affine8,
         (BF16, false) if is_compressor_mat(&info.name) => Held::F32,
         (BF16, false) => match mtp_dense_mode()? {
             MtpDenseMode::Q4
@@ -120,6 +129,8 @@ pub fn held(info: &GgufTensorInfo, expert: bool) -> Result<Held> {
             }
             _ => Held::SymQ8,
         },
+        (Q8_0, false) if is_compressor_mat(&info.name) => Held::F32,
+        (Q8_0, false) => Held::SymQ8,
         (F32, false) => Held::F32,
         (t, _) => {
             return Err(bad(format!(
@@ -139,6 +150,7 @@ pub fn held_bytes(info: &GgufTensorInfo, expert: bool) -> Result<u64> {
         Held::SymQ8 => n.checked_add(n / 16),
         Held::F32 => n.checked_mul(4),
         Held::Affine4 => (n / 2).checked_add(n / 16),
+        Held::Affine8 => n.checked_add(n / 8),
     };
     b.ok_or_else(|| bad(format!("'{}': held size overflows u64", info.name)))
 }
@@ -160,12 +172,27 @@ struct Loader<'a> {
     shards: &'a ShardSet,
     il: usize,
     buf: AlignedBuf,
+    cuda_budget: Option<CudaDeviceBudget>,
+    cuda_staging: CudaStaging,
+    cuda_bytes_since_clear: u64,
     read: u64,
     bytes: u64,
     count: usize,
 }
 
 impl Loader<'_> {
+    fn maybe_clear_cuda_cache(&mut self, added_bytes: u64) {
+        if self.cuda_budget.is_some() {
+            self.cuda_bytes_since_clear += added_bytes;
+            if self.cuda_bytes_since_clear >= CUDA_CLEAR_CACHE_BYTES {
+                self.cuda_bytes_since_clear = 0;
+                if crate::array::get_cache_memory() >= CUDA_CLEAR_CACHE_BYTES as f64 {
+                    crate::array::clear_cache();
+                }
+            }
+        }
+    }
+
     fn located(&self, name: &str) -> Result<&Located> {
         let e = self
             .scan
@@ -181,37 +208,80 @@ impl Loader<'_> {
     fn tensor(&mut self, name: &str) -> Result<Dense> {
         let loc = self.located(name)?.clone();
         let info = &loc.info;
-        let e = Extent {
-            shard: loc.shard,
-            offset: loc.abs_offset()?,
-            len: info.data_size()?,
-        };
-        let raw = self.shards.read_aligned(e, &mut self.buf)?;
-        let d = match held(info, false)? {
-            Held::Affine4 => {
-                let shape = held_shape(info)?;
-                let &[rows, k] = shape.as_slice() else {
+        let held_form = held(info, false)?;
+        let (mut d, read_len) = if held_form == Held::SymQ8
+            && info.tensor_type == GgufTensorType::Q8_0
+            && let Some(budget) = &self.cuda_budget
+            && gpu_repack_available()
+            && gpu_repack_supports_kind(GpuRepackKind::Q8_0)
+        {
+            let (dst, rows, read_len) = cuda_repack_from_shards(
+                self.shards,
+                &loc,
+                GpuRepackKind::Q8_0,
+                budget,
+                &mut self.buf,
+                &mut self.cuda_staging,
+            )?;
+            let scales = dst
+                .scales
+                .ok_or_else(|| bad(format!("'{name}': Q8_0 CUDA repack gave no scales")))?;
+            let rows_i64 = i64::try_from(rows).map_err(|_| bad("row count exceeds i64"))?;
+            let fold = |a: &MxArray| -> Result<MxArray> {
+                let nd = a.ndim()?;
+                a.reshape(&[rows_i64, a.shape_at(nd.saturating_sub(1))?])
+            };
+            let (w, scales) = (fold(&dst.weight)?, fold(&scales)?);
+            MxArray::eval_arrays_with_context(&[&w, &scales], "hy_v4_flash MTP cuda q8 fold")?;
+            (Dense::SymQ8 { w, scales }, read_len)
+        } else {
+            let e = Extent {
+                shard: loc.shard,
+                offset: loc.abs_offset()?,
+                len: info.data_size()?,
+            };
+            let raw = self.shards.read_aligned(e, &mut self.buf)?;
+            let d = match held_form {
+                Held::Affine4 => {
+                    let shape = held_shape(info)?;
+                    let &[rows, k] = shape.as_slice() else {
+                        return Err(bad(format!(
+                            "'{}': Affine4 requires 2-D held shape, got {shape:?}",
+                            info.name
+                        )));
+                    };
+                    quantize_affine4_from_bf16_raw(raw, rows as usize, k as usize)?
+                }
+                Held::SymQ8 if info.tensor_type == GgufTensorType::Q8_0 => {
+                    dense_from_raw(info, raw, Form::Qmm)?
+                }
+                Held::SymQ8 => {
+                    let shape = held_shape(info)?;
+                    let &[rows, k] = shape.as_slice() else {
+                        return Err(bad(format!(
+                            "'{}': SymQ8 requires 2-D held shape, got {shape:?}",
+                            info.name
+                        )));
+                    };
+                    quantize_sym_q8_from_bf16_raw(raw, rows as usize, k as usize)?
+                }
+                Held::F32 => dense_from_raw(info, raw, Form::F32)?,
+                Held::Affine8 => {
                     return Err(bad(format!(
-                        "'{}': Affine4 requires 2-D held shape, got {shape:?}",
+                        "'{}': Affine8 is only supported for MTP routed experts",
                         info.name
                     )));
-                };
-                quantize_affine4_from_bf16_raw(raw, rows as usize, k as usize)?
-            }
-            Held::SymQ8 => {
-                let shape = held_shape(info)?;
-                let &[rows, k] = shape.as_slice() else {
-                    return Err(bad(format!(
-                        "'{}': SymQ8 requires 2-D held shape, got {shape:?}",
-                        info.name
-                    )));
-                };
-                quantize_sym_q8_from_bf16_raw(raw, rows as usize, k as usize)?
-            }
-            Held::F32 => dense_from_raw(info, raw, Form::F32)?,
+                }
+            };
+            (d, e.len)
         };
-        self.read += e.len;
-        self.bytes += d.nbytes() as u64;
+        if self.cuda_budget.is_some() {
+            d.ensure_cuda_device()?;
+        }
+        let nbytes = d.nbytes() as u64;
+        self.maybe_clear_cuda_cache(nbytes);
+        self.read += read_len;
+        self.bytes += nbytes;
         self.count += 1;
         Ok(d)
     }
@@ -358,8 +428,100 @@ impl Loader<'_> {
             lo = hi;
         }
         self.read += reader.read;
+        if self.cuda_budget.is_some() {
+            w.promote_cuda_device()?;
+            s.promote_cuda_device()?;
+            b.promote_cuda_device()?;
+        }
         let out = AffineProj { w, s, b };
-        self.bytes += out.nbytes() as u64;
+        let nbytes = out.nbytes() as u64;
+        self.maybe_clear_cuda_cache(nbytes);
+        self.bytes += nbytes;
+        Ok(out)
+    }
+
+    /// One Q8_0 routed expert tensor `[E, rows, k]` as affine-8 g32 codes +
+    /// f16 scales + derived `-128 * scale` f16 biases. On CUDA, repacks in
+    /// bands directly into GPU VRAM (`device == 0`) via `GpuRepackKind::Q8_0Bias`.
+    fn experts_q8_0(&mut self, loc: &Located) -> Result<AffineProj> {
+        let info = &loc.info;
+        if held(info, true)? != Held::Affine8 {
+            return Err(bad(format!("'{}' is not a Q8_0 expert tensor", info.name)));
+        }
+        let &[k, _rows, _n] = info.dims.as_slice() else {
+            return Err(bad(format!("'{}' is not a 3-D expert tensor", info.name)));
+        };
+        if !k.is_multiple_of(DENSE_GROUP as u64) {
+            return Err(bad(format!(
+                "'{}': {k} inputs do not fit group {DENSE_GROUP}",
+                info.name
+            )));
+        }
+        let (mut w, mut s, mut b, read_len) = if let Some(budget) = &self.cuda_budget
+            && gpu_repack_available()
+            && gpu_repack_supports_kind(GpuRepackKind::Q8_0Bias)
+        {
+            let (dst, _, read_len) = cuda_repack_from_shards(
+                self.shards,
+                loc,
+                GpuRepackKind::Q8_0Bias,
+                budget,
+                &mut self.buf,
+                &mut self.cuda_staging,
+            )?;
+            let s = dst
+                .scales
+                .ok_or_else(|| bad(format!("'{}': Q8_0Bias repack gave no scales", info.name)))?;
+            let b = dst
+                .biases
+                .ok_or_else(|| bad(format!("'{}': Q8_0Bias repack gave no biases", info.name)))?;
+            (dst.weight, s, b, read_len)
+        } else {
+            let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor)?;
+            let ty = info.tensor_type;
+            let row_bytes = (ptrs.k / ty.block_size()) * ty.type_size();
+            let band_rows = (CUDA_REPACK_BAND_BYTES / row_bytes).clamp(1, ptrs.rows);
+            let base_offset = loc.abs_offset()?;
+            let mut row0 = 0usize;
+            let mut read_len = 0u64;
+            while row0 < ptrs.rows {
+                let count = band_rows.min(ptrs.rows - row0);
+                let band_len = (count as u64) * (row_bytes as u64);
+                let raw = self.shards.read_aligned(
+                    Extent {
+                        shard: loc.shard,
+                        offset: base_offset + (row0 as u64) * (row_bytes as u64),
+                        len: band_len,
+                    },
+                    &mut self.buf,
+                )?;
+                decode_affine_band_into(ty, raw, row0, count, ptrs.k, &ptrs)?;
+                read_len += band_len;
+                row0 += count;
+            }
+            let s = dst
+                .scales
+                .ok_or_else(|| bad(format!("'{}': Q8_0 repack gave no scales", info.name)))?;
+            let b = s
+                .astype(DType::Float32)?
+                .mul_scalar(-128.0)?
+                .astype(DType::Float16)?;
+            MxArray::eval_arrays_with_context(
+                &[&dst.weight, &s, &b],
+                "hy_v4_flash MTP q8 experts",
+            )?;
+            (dst.weight, s, b, read_len)
+        };
+        if self.cuda_budget.is_some() {
+            w.promote_cuda_device()?;
+            s.promote_cuda_device()?;
+            b.promote_cuda_device()?;
+        }
+        self.read += read_len;
+        let out = AffineProj { w, s, b };
+        let nbytes = out.nbytes() as u64;
+        self.maybe_clear_cuda_cache(nbytes);
+        self.bytes += nbytes;
         Ok(out)
     }
 }
@@ -379,26 +541,50 @@ fn read(scan: &Scan, shards: &ShardSet) -> Result<MtpWeights> {
     let ex = scan
         .mtp_experts()
         .ok_or_else(|| bad("the MTP layer has no routed experts"))?;
-    if ex.class != ExpertClass::Bf16 {
-        return Err(bad(format!("MTP experts are {:?}, not BF16", ex.class)));
+    if !matches!(ex.class, ExpertClass::Bf16 | ExpertClass::Q8_0) {
+        return Err(bad(format!(
+            "MTP experts are {:?}, expected BF16 or Q8_0",
+            ex.class
+        )));
     }
     let t0 = std::time::Instant::now();
+    let cuda_budget =
+        crate::accelerator::cuda_ops_available().then(CudaDeviceBudget::for_current_device);
     let mut l = Loader {
         scan,
         shards,
         il: mtp.layer,
         buf: AlignedBuf::new(),
+        cuda_budget,
+        cuda_staging: CudaStaging::new(),
+        cuda_bytes_since_clear: 0,
         read: 0,
         bytes: 0,
         count: 0,
     };
     let weights = l.layer()?;
-    let projs = [
-        l.experts(&ex.gate)?,
-        l.experts(&ex.up)?,
-        l.experts(&ex.down)?,
-    ];
-    let experts = AffineExperts::new(projs, EXPERT_GROUP, EXPERT_BITS)?;
+    let (projs, group_size, bits) = match ex.class {
+        ExpertClass::Bf16 => (
+            [
+                l.experts(&ex.gate)?,
+                l.experts(&ex.up)?,
+                l.experts(&ex.down)?,
+            ],
+            EXPERT_GROUP,
+            EXPERT_BITS,
+        ),
+        ExpertClass::Q8_0 => (
+            [
+                l.experts_q8_0(&ex.gate)?,
+                l.experts_q8_0(&ex.up)?,
+                l.experts_q8_0(&ex.down)?,
+            ],
+            DENSE_GROUP,
+            DENSE_BITS,
+        ),
+        _ => unreachable!(),
+    };
+    let experts = AffineExperts::new(projs, group_size, bits)?;
     tracing::info!(
         "hy_v4_flash MTP layer {}: {} GGUF bytes read, {} bytes held, {:.1} s",
         mtp.layer,

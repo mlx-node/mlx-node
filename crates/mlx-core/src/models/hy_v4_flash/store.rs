@@ -42,11 +42,12 @@ use super::model::Model;
 use super::moe::ExpertSource;
 use super::mtp::SEEDS;
 use super::rows::{EngramRows, F8Table, PrefetchHandle};
-use super::scan::{Role, Scan};
+use super::scan::{ExpertClass, Role, Scan};
 use super::weights::{
     Form, MmapDense, Resident, form, mmap_dense_saved_bytes, mmap_dense_spec, role_resident,
 };
 use crate::cache_limit::{CacheLimitGuard, coordinator};
+use crate::engine::memory_plan::{Margin, working_set_margin_bytes};
 use crate::models::moe_common::POOL_LIMIT;
 use crate::moe_stream::budget::{
     Admission, Bound, DSV41, Limits, ModelSize, Own, Profile, Terms, Turn, admit_with,
@@ -294,7 +295,11 @@ pub fn splitk_min_m(raw: Option<&str>) -> Option<usize> {
 /// layer's BF16 matrices, held the same way.
 pub fn q8_shapes(scan: &Scan, mtp: bool) -> Result<Vec<(usize, usize)>> {
     let mut shapes = Vec::new();
-    for (role, held) in [(Role::Dense, Form::Qmm), (Role::Mtp, Form::Bf16)] {
+    for (role, held) in [
+        (Role::Dense, Form::Qmm),
+        (Role::Mtp, Form::Bf16),
+        (Role::Mtp, Form::Qmm),
+    ] {
         if role == Role::Mtp && !mtp {
             continue;
         }
@@ -349,27 +354,29 @@ pub fn q8_shapes(scan: &Scan, mtp: bool) -> Result<Vec<(usize, usize)>> {
         if il >= scan.cfg.n_layers && !mtp {
             continue;
         }
-        let (role, held) = if il < scan.cfg.n_layers {
-            (Role::Dense, Form::Qmm)
+        let forms: &[(Role, Form)] = if il < scan.cfg.n_layers {
+            &[(Role::Dense, Form::Qmm)]
         } else {
-            (Role::Mtp, Form::Bf16)
+            &[(Role::Mtp, Form::Bf16), (Role::Mtp, Form::Qmm)]
         };
-        push_fused(&mut shapes, role, held, il, &["attn_q_a", "attn_kv_a_mqa"])?;
-        push_fused(
-            &mut shapes,
-            role,
-            held,
-            il,
-            &["attn_q_a", "attn_kv_a_mqa", "attn_gate"],
-        )?;
-        push_fused(
-            &mut shapes,
-            role,
-            held,
-            il,
-            &["ffn_routed_down", "ffn_gate_shexp", "ffn_up_shexp"],
-        )?;
-        push_fused(&mut shapes, role, held, il, &["ffn_gate", "ffn_up"])?;
+        for &(role, held) in forms {
+            push_fused(&mut shapes, role, held, il, &["attn_q_a", "attn_kv_a_mqa"])?;
+            push_fused(
+                &mut shapes,
+                role,
+                held,
+                il,
+                &["attn_q_a", "attn_kv_a_mqa", "attn_gate"],
+            )?;
+            push_fused(
+                &mut shapes,
+                role,
+                held,
+                il,
+                &["ffn_routed_down", "ffn_gate_shexp", "ffn_up_shexp"],
+            )?;
+            push_fused(&mut shapes, role, held, il, &["ffn_gate", "ffn_up"])?;
+        }
     }
     shapes.sort_unstable();
     shapes.dedup();
@@ -423,8 +430,8 @@ pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
     }
     if let Some(l) = scan.mtp_experts() {
         for loc in [&l.gate, &l.up, &l.down] {
-            let v = loc.info.num_elements()?;
-            n = add(n, v / 2 + v / 16)?;
+            let b = super::mtp_weights::held_bytes(&loc.info, true)?;
+            n = add(n, b)?;
         }
     }
     if n > 0 {
@@ -433,7 +440,8 @@ pub fn mtp_bytes(scan: &Scan) -> Result<u64> {
     Ok(n)
 }
 
-/// Layers and bank bytes of one expert per streamed class (`CLASSES` order).
+/// Layers and bank bytes of one expert per streamed class (`CLASSES` order), or
+/// `[n_layers, 0]` for single-class CUDA direct expert formats (`Nvfp4`, `Q8_0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Classes {
     pub layers: [usize; 2],
@@ -447,6 +455,32 @@ impl Classes {
             .iter()
             .map(|l| l.as_ref().map(|l| l.class))
             .collect();
+        let cuda_class = classes
+            .iter()
+            .copied()
+            .flatten()
+            .find(|c| matches!(c, ExpertClass::Nvfp4 | ExpertClass::Q8_0));
+        if let Some(c) = cuda_class {
+            let mut count = 0usize;
+            for (il, opt) in classes.iter().enumerate() {
+                if let Some(got) = *opt {
+                    if got != c {
+                        return Err(bad(format!(
+                            "layer {il}: mixed trunk expert classes ({c:?} and {got:?}) are not supported"
+                        )));
+                    }
+                    count += 1;
+                }
+            }
+            let s = slot_bytes(&scan.cfg.moe, c)?;
+            if s == 0 {
+                return Err(bad(format!("{c:?}: empty expert slot")));
+            }
+            return Ok(Self {
+                layers: [count, 0],
+                slot: [s, 0],
+            });
+        }
         let layout = ClassLayout::new(&classes)?;
         let mut slot = [0u64; 2];
         for (s, &c) in slot.iter_mut().zip(&CLASSES) {
@@ -680,6 +714,33 @@ pub fn direct_kv_allowance(p: &Profile, max_ctx: usize) -> u64 {
 pub fn full_kv_allowance(p: &Profile, ctx: usize) -> u64 {
     p.kv_base
         .saturating_add(p.kv_per_ctx.saturating_mul(ctx as u64))
+}
+
+/// Minimum initial row allocation for growable CUDA latent / pooled KV slabs
+/// (`LatentBuf::cuda_ensure_buf` and `mtp::KvRows::cuda_ensure_buf`).
+const CUDA_SLAB_MIN_ROWS: usize = 4096;
+
+/// Largest prior slab row count kept alive in rollback snapshots (`saved_bufs`
+/// / `prev_kv` / `prev_pooled`) while the final growth step to `ctx` allocates
+/// and copies into the new slab. Returns `0` when `ctx` fits inside the initial
+/// [`CUDA_SLAB_MIN_ROWS`] slab without ever growing.
+fn cuda_kv_prev_slab_rows(ctx: usize) -> usize {
+    if ctx <= CUDA_SLAB_MIN_ROWS {
+        return 0;
+    }
+    // Largest power of two strictly less than `ctx` (always >= CUDA_SLAB_MIN_ROWS
+    // because `ctx > 4096` implies `ctx - 1 >= 4096`).
+    let shift = usize::BITS - 1 - (ctx - 1).leading_zeros();
+    1usize << shift
+}
+
+/// Peak CUDA flat-KV allowance for `ctx` tokens: full-context steady-state KV
+/// ([`full_kv_allowance`]) plus the peak growth-boundary overlap when
+/// `forward_trunk_cuda` keeps the previous slab alive for rollback while
+/// `cuda_ensure_buf` allocates and copies into the next doubled slab.
+pub fn cuda_direct_kv_bytes(p: &Profile, ctx: usize) -> u64 {
+    let overlap_rows = cuda_kv_prev_slab_rows(ctx) as u64;
+    full_kv_allowance(p, ctx).saturating_add(p.kv_per_ctx.saturating_mul(overlap_rows))
 }
 
 /// Maximum paged KV pool bytes `Paged::open` can grow to for `ctx` tokens
@@ -1290,20 +1351,273 @@ pub fn mmap_rset_budget(mode: MmapMode, gate_budget: u64, reserve_bytes: u64) ->
     }
 }
 
+/// Live CUDA memory snapshot for direct residency admission and per-turn
+/// headroom checks across unified-memory Spark and discrete CUDA GPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaMemorySnapshot {
+    /// Total CUDA device memory (`total_device_bytes`, or host physical fallback).
+    pub ws: u64,
+    /// Backing physical pool (`host.physical` on unified CUDA, `ws` on discrete CUDA).
+    pub physical: u64,
+    /// Non-reclaimable memory used across the backing pool.
+    pub host_used: u64,
+    /// Resident bytes already owned by this model inside `host_used`.
+    pub own: u64,
+    /// Co-resident workloads' memory (`host_used.saturating_sub(own)`).
+    pub others: u64,
+    /// Immediately available memory without evicting co-resident workloads.
+    pub available: u64,
+}
+
+impl CudaMemorySnapshot {
+    /// Synthetic zero-pressure snapshot (for static capacity checks and tests).
+    pub fn idle(ws: u64) -> Self {
+        Self {
+            ws,
+            physical: ws,
+            host_used: 0,
+            own: 0,
+            others: 0,
+            available: ws,
+        }
+    }
+
+    /// Snapshot with explicit backing pool size and co-resident memory usage.
+    pub fn with_pressure(ws: u64, physical: u64, others: u64) -> Self {
+        Self {
+            ws,
+            physical,
+            host_used: others,
+            own: 0,
+            others,
+            available: physical.saturating_sub(others),
+        }
+    }
+}
+
+/// Samples live CUDA memory pressure without invoking NVML on unified-memory
+/// Spark systems (where Windows WDDM NVML reports only an 8 GiB carveout).
+fn query_cuda_memory_snapshot(own_bytes: u64) -> Result<CudaMemorySnapshot> {
+    #[cfg(test)]
+    if let Some((h, ws)) = TEST_HOST.with(std::cell::Cell::get) {
+        let host_used = h.non_reclaimable();
+        let others = host_used.saturating_sub(own_bytes);
+        return Ok(CudaMemorySnapshot {
+            ws,
+            physical: h.physical,
+            host_used,
+            own: own_bytes,
+            others,
+            available: h.available(),
+        });
+    }
+    let caps = crate::accelerator::caps();
+    if caps.is_unified_memory {
+        let h = host_memory().ok_or_else(|| bad("no host memory reading for CUDA admission"))?;
+        let ws = if caps.total_device_bytes > 0 {
+            caps.total_device_bytes
+        } else {
+            h.physical
+        };
+        let host_used = h.non_reclaimable();
+        let others = host_used.saturating_sub(own_bytes);
+        Ok(CudaMemorySnapshot {
+            ws,
+            physical: h.physical,
+            host_used,
+            own: own_bytes,
+            others,
+            available: h.available(),
+        })
+    } else {
+        let ws = if caps.total_device_bytes > 0 {
+            caps.total_device_bytes
+        } else {
+            host_memory()
+                .ok_or_else(|| bad("no CUDA device or host memory reading for admission"))?
+                .physical
+        };
+        // Preserve a valid 0-byte reading instead of conflating it with a probe failure.
+        let mut free = 0u64;
+        // SAFETY: pure CUDA/NVML free-VRAM query writing to a valid out pointer.
+        let rc = unsafe { mlx_sys::mlx_device_free_memory(&mut free) };
+        if rc != 0 {
+            return Err(bad("no CUDA free VRAM reading for discrete GPU admission"));
+        }
+        let host_used = ws.saturating_sub(free);
+        let others = host_used.saturating_sub(own_bytes);
+        Ok(CudaMemorySnapshot {
+            ws,
+            physical: ws,
+            host_used,
+            own: own_bytes,
+            others,
+            available: free,
+        })
+    }
+}
+
+/// Result of CUDA direct residency admission (device memory sized with
+/// [`Margin::Ledger`] and live co-resident memory pressure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaDirectDecision {
+    pub admitted: bool,
+    pub ctx: usize,
+    pub chunk: usize,
+    pub ws: u64,
+    pub physical: u64,
+    pub host_used: u64,
+    pub own: u64,
+    pub others: u64,
+    pub available: u64,
+    pub budget: u64,
+    pub margin: u64,
+    pub dense_bytes: u64,
+    pub expert_bytes: u64,
+    pub kv_bytes: u64,
+    pub scratch_bytes: u64,
+    pub need: u64,
+}
+
+/// Evaluates CUDA direct full-expert residency against device memory `ws`
+/// (assuming an idle host) using [`Margin::Ledger`] (`max(1 GiB, 2%)`).
+pub fn pick_cuda_direct(
+    p: &Profile,
+    max_ctx: usize,
+    ws: u64,
+    dense_bytes: u64,
+    expert_bytes: u64,
+    max_memory: Option<u64>,
+) -> CudaDirectDecision {
+    pick_cuda_direct_with_pressure(
+        p,
+        max_ctx,
+        CudaMemorySnapshot::idle(ws),
+        dense_bytes,
+        expert_bytes,
+        max_memory,
+    )
+}
+
+/// Evaluates CUDA direct full-expert residency against both the CUDA device
+/// pool (`snap.ws`) and live available physical memory after co-resident
+/// workloads (`snap.physical - snap.others`) using [`Margin::Ledger`].
+pub fn pick_cuda_direct_with_pressure(
+    p: &Profile,
+    max_ctx: usize,
+    snap: CudaMemorySnapshot,
+    dense_bytes: u64,
+    expert_bytes: u64,
+    max_memory: Option<u64>,
+) -> CudaDirectDecision {
+    pick_cuda_direct_with_reserve(
+        p,
+        max_ctx,
+        snap,
+        dense_bytes,
+        expert_bytes,
+        None,
+        max_memory,
+    )
+}
+
+/// Evaluates CUDA direct full-expert residency against both the CUDA device
+/// pool (`snap.ws`) and live available physical memory after co-resident
+/// workloads (`snap.physical - snap.others`), keeping at least
+/// [`Margin::Ledger`] (`max(1 GiB, 2%)`) or `reserve_override` (whichever is
+/// larger, capped at `snap.ws`). Budgets peak growth-boundary flat KV
+/// ([`cuda_direct_kv_bytes`]) for the admitted `ctx`, walks the context ladder
+/// down to [`MIN_CONTEXT`], and picks the largest admitted chunk in [`CHUNKS`].
+pub fn pick_cuda_direct_with_reserve(
+    p: &Profile,
+    max_ctx: usize,
+    snap: CudaMemorySnapshot,
+    dense_bytes: u64,
+    expert_bytes: u64,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+) -> CudaDirectDecision {
+    let margin = working_set_margin_bytes(snap.ws, Margin::Ledger)
+        .max(reserve_override.unwrap_or(0))
+        .min(snap.ws);
+    let automatic = snap.ws.saturating_sub(margin);
+    let device_budget = match max_memory {
+        Some(max) if max > 0 && max < automatic => max,
+        _ => automatic,
+    };
+    let live_budget = snap
+        .physical
+        .saturating_sub(snap.others)
+        .saturating_sub(margin);
+    let budget = device_budget.min(live_budget);
+    let mut ctx = max_ctx;
+    let mut last = None;
+    loop {
+        let kv_bytes = cuda_direct_kv_bytes(p, ctx);
+        for &chunk in &CHUNKS {
+            let rows = chunk.min(ctx);
+            let scratch_bytes = direct_scratch_bytes(p, rows, ctx);
+            let need = dense_bytes
+                .saturating_add(expert_bytes)
+                .saturating_add(kv_bytes)
+                .saturating_add(scratch_bytes);
+            let d = CudaDirectDecision {
+                admitted: expert_bytes > 0 && need <= budget,
+                ctx,
+                chunk: rows,
+                ws: snap.ws,
+                physical: snap.physical,
+                host_used: snap.host_used,
+                own: snap.own,
+                others: snap.others,
+                available: snap.available,
+                budget,
+                margin,
+                dense_bytes,
+                expert_bytes,
+                kv_bytes,
+                scratch_bytes,
+                need,
+            };
+            if d.admitted {
+                return d;
+            }
+            last = Some(d);
+        }
+        let next = ctx / 2;
+        if next < MIN_CONTEXT {
+            return last.unwrap_or(CudaDirectDecision {
+                admitted: false,
+                ctx,
+                chunk: CHUNKS[CHUNKS.len() - 1].min(ctx),
+                ws: snap.ws,
+                physical: snap.physical,
+                host_used: snap.host_used,
+                own: snap.own,
+                others: snap.others,
+                available: snap.available,
+                budget,
+                margin,
+                dense_bytes,
+                expert_bytes,
+                kv_bytes,
+                scratch_bytes: 0,
+                need: dense_bytes.saturating_add(expert_bytes),
+            });
+        }
+        ctx = next;
+    }
+}
+
 /// Exact GGUF file bytes of all trunk routed-expert tensors in `scan`.
 pub fn mmap_expert_bytes(scan: &Scan) -> Result<u64> {
-    let classes = Classes::of(scan)?;
     let n = scan.cfg.moe.n_experts as u64;
-    let f0 = file_bytes(&scan.cfg.moe, CLASSES[0])?;
-    let f1 = file_bytes(&scan.cfg.moe, CLASSES[1])?;
-    Ok((classes.layers[0] as u64)
-        .saturating_mul(n)
-        .saturating_mul(f0)
-        .saturating_add(
-            (classes.layers[1] as u64)
-                .saturating_mul(n)
-                .saturating_mul(f1),
-        ))
+    let mut total = 0u64;
+    for layer in scan.trunk_experts().iter().flatten() {
+        let fb = file_bytes(&scan.cfg.moe, layer.class)?;
+        total = total.saturating_add(n.saturating_mul(fb));
+    }
+    Ok(total)
 }
 
 /// The admitted context, prefill chunk and admission.
@@ -1756,6 +2070,9 @@ impl Lease {
     }
 
     pub fn wired_limit(&self, bank: &KqBank) -> Option<u64> {
+        if bank.is_cuda_direct() {
+            return None;
+        }
         let a = self.turn().admission?;
         if bank.is_direct() {
             Some(direct_wired_limit(
@@ -1788,7 +2105,36 @@ impl Lease {
     pub fn begin_turn(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<()> {
         let mut t = self.turn();
         if bank.is_direct() {
-            if self.limits.is_some()
+            if bank.is_cuda_direct() {
+                if self.limits.is_some()
+                    && let Some(a) = t.admission
+                {
+                    let own_bytes = dense.saturating_add(bank.nbytes()).saturating_add(kv);
+                    let kv_rem = a.terms.kv.saturating_sub(kv);
+                    let need_turn = kv_rem
+                        .saturating_add(a.terms.compute)
+                        .saturating_add(a.reserve);
+                    let mut snap = query_cuda_memory_snapshot(own_bytes)?;
+                    let pool = free_pool();
+                    if snap.available.saturating_add(pool) < need_turn && pool > 0 {
+                        crate::array::clear_cache();
+                        snap = query_cuda_memory_snapshot(own_bytes)?;
+                    }
+                    let headroom = snap.available.saturating_add(free_pool());
+                    if headroom < need_turn {
+                        return Err(bad(format!(
+                            "CUDA turn refused: live headroom {:.2} GiB below turn kv_rem + scratch + margin {:.2} GiB \
+                             (kv_rem {:.2} GiB + compute {:.2} GiB + reserve {:.2} GiB, others {:.2} GiB)",
+                            headroom as f64 / GIB as f64,
+                            need_turn as f64 / GIB as f64,
+                            kv_rem as f64 / GIB as f64,
+                            a.terms.compute as f64 / GIB as f64,
+                            a.reserve as f64 / GIB as f64,
+                            snap.others as f64 / GIB as f64,
+                        )));
+                    }
+                }
+            } else if self.limits.is_some()
                 && t.wired.is_none()
                 && let Some(a) = t.admission
             {
@@ -2196,11 +2542,25 @@ impl Store {
         let sizes = Sizes::of(&scan)?;
         let mtp = opts.mtp && scan.mtp.is_some();
         let max_ctx = scan.cfg.max_context(opts.max_context)?;
-        let row_cap = row_cap(
-            &routing_arch()?,
-            splitk_min_m(std::env::var(SPLITK_ENV).ok().as_deref()),
-            &q8_shapes(&scan, mtp)?,
-        )?;
+        // SAFETY: pure process-wide Metal availability probe.
+        let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
+        let cuda_host = crate::accelerator::host_has_cuda() && !metal_available;
+        let _load_graphs_guard =
+            cuda_host.then(super::cuda_forward::disable_cuda_graphs_for_hy4_default);
+        let cuda_experts = scan
+            .trunk_experts()
+            .iter()
+            .flatten()
+            .any(|l| matches!(l.class, ExpertClass::Nvfp4 | ExpertClass::Q8_0));
+        let row_cap = if cuda_host {
+            1
+        } else {
+            row_cap(
+                &routing_arch()?,
+                splitk_min_m(std::env::var(SPLITK_ENV).ok().as_deref()),
+                &q8_shapes(&scan, mtp)?,
+            )?
+        };
         let want = if super::sched::paged_mode(false, row_cap) {
             super::sched::lanes(opts.lanes, row_cap)
         } else {
@@ -2225,6 +2585,7 @@ impl Store {
         };
         let smallest = CHUNKS[CHUNKS.len() - 1];
         enum BankInit {
+            CudaDirect,
             Mmap {
                 warm_budget: u64,
                 force_prewarm: bool,
@@ -2239,305 +2600,433 @@ impl Store {
         }
         let (mmap_dense_saved, mmap_dense_file) = mmap_dense_saved_bytes(&scan)?;
         let mmap_dense_bytes = base.dense.saturating_sub(mmap_dense_saved);
-        // SAFETY: pure process-wide Metal availability probe.
-        let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
-        let (lanes, ctx, admitted, admission, direct_budget, bank_init) = match (
-            &limits, &opts.plan,
-        ) {
-            (Some(l), _) => {
-                // nothing of this model exists yet: every byte in use is others'
-                let own = Own::default();
-                let direct_expert_bytes = sizes.direct_expert_bytes();
-                let mapped_bytes = mmap_expert_bytes(&scan)?.saturating_add(mmap_dense_file);
-                let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
-                let (h, ws, selected) = select_expert_mode_with_retry(
-                    opts.mmap,
-                    opts.direct,
-                    metal_available,
+        let (lanes, ctx, admitted, admission, direct_budget, bank_init) = if cuda_host {
+            if opts.mmap == MmapMode::On {
+                return Err(bad(format!("{MMAP_ENV}=1 requires Metal GPU support")));
+            }
+            if !cuda_experts {
+                return Err(bad(
+                    "CUDA requires SPARK NVFP4/Q8_0 experts; K-quant (Q4_K_M) is Metal-only",
+                ));
+            }
+            if opts.direct == DirectMode::Off {
+                return Err(bad(format!(
+                    "{DIRECT_ENV}=0 is incompatible with CUDA; SPARK NVFP4/Q8_0 experts require direct GPU residency"
+                )));
+            }
+            let direct_expert_bytes = sizes.direct_expert_bytes();
+            if let Some(cap) = limits.as_ref().and_then(|l| l.cache_cap)
+                && cap < direct_expert_bytes
+            {
+                return Err(bad(format!(
+                    "{CACHE_ENV} cap {:.2} GiB is below the {:.2} GiB required for CUDA direct expert residency",
+                    cap as f64 / GIB as f64,
+                    direct_expert_bytes as f64 / GIB as f64,
+                )));
+            }
+            // Nothing of this model is loaded yet: every live allocation belongs to others.
+            let mut snap = query_cuda_memory_snapshot(0)?;
+            let mut decision = pick_cuda_direct_with_reserve(
+                &one_lane,
+                max_ctx,
+                snap,
+                base.dense,
+                direct_expert_bytes,
+                reserve_override,
+                opts.max_memory,
+            );
+            if !decision.admitted && free_pool() > 0 {
+                crate::array::clear_cache();
+                snap = query_cuda_memory_snapshot(0)?;
+                decision = pick_cuda_direct_with_reserve(
                     &one_lane,
                     max_ctx,
-                    &own,
+                    snap,
                     base.dense,
-                    mmap_dense_bytes,
                     direct_expert_bytes,
-                    mapped_bytes,
-                    opts.mmap_chunk_max,
                     reserve_override,
                     opts.max_memory,
-                    l.cache_cap,
-                    || host_reading(opts.max_memory),
-                    free_pool,
-                    crate::array::clear_cache,
-                )?;
-                match selected {
-                    ExpertResidency::Mmap { chunk, gate } => {
-                        let ctx = max_ctx;
-                        let floor = lane_bytes(&scan.cfg, mtp, ctx);
-                        let extra_lane = floor.saturating_add(LADDER_BYTES);
-                        let mtp_row = kv_per_token(&scan.cfg, mtp)
-                            .saturating_sub(kv_per_token(&scan.cfg, false));
-                        let page_bytes = super::paged::PageGeometry::of(&scan.cfg)
-                            .and_then(|g| g.block_bytes())
-                            .unwrap_or(0);
-                        let rset_reserve_for = |n: usize| {
-                            let extra = n.saturating_sub(1) as u64 * extra_lane;
-                            let state = (n as u64)
-                                .saturating_mul(floor)
-                                .saturating_add(ladder_bytes_for(n))
-                                .saturating_add(mtp_row.saturating_mul(ctx as u64));
-                            let full_kv =
-                                mmap_full_kv_bytes(&one_lane, ctx, n, page_bytes, extra, state);
-                            gate.dense_bytes
-                                .saturating_add(full_kv)
-                                .saturating_add(gate.scratch_bytes)
-                        };
-                        let lanes = (1..=want)
-                            .rev()
-                            .find(|&n| {
-                                n == 1
-                                    || (gate
-                                        .need
-                                        .saturating_add(n.saturating_sub(1) as u64 * extra_lane)
-                                        <= gate.budget
-                                        && (opts.mmap != MmapMode::Auto
-                                            || rset_reserve_for(n) <= gate.budget))
-                            })
-                            .unwrap_or(1);
-                        let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
-                        let kv_total = kv_initial.saturating_add(extra_lanes);
-                        let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
-                        let mmap_fixed = gate.dense_bytes.saturating_add(kv_scratch);
-                        let rset_reserve = rset_reserve_for(lanes);
-                        let total_slots = sizes.total_experts();
-                        let rset_budget = mmap_rset_budget(opts.mmap, gate.budget, rset_reserve);
-                        let rset_bounded = opts.mmap == MmapMode::Auto;
-                        let warm_budget = mmap_warm_budget(
-                            opts.mmap_prewarm,
-                            &h,
-                            gate.dense_bytes,
-                            kv_total,
-                            gate.margin,
-                            mapped_bytes,
-                            Some(gate.budget),
-                        );
-                        let wired_cap = direct_wired_limit(mmap_fixed, ws);
-                        let a = Admission {
-                            physical: gate.physical,
-                            host_used: gate.host_used,
-                            own: 0,
-                            others: gate.others,
-                            reserve: gate.margin,
-                            live: gate.available,
-                            ws,
-                            terms: Terms {
-                                dense: gate.dense_bytes,
-                                staging_layer: 0,
-                                kv: kv_total,
-                                compute: gate.scratch_bytes,
-                                io: 0,
-                                driver: 0,
-                                pool: 0,
-                            },
-                            staging_layers: 0,
-                            fixed: mmap_fixed,
-                            slot: base.slot,
-                            cache_slots: (total_slots[0] + total_slots[1]) as u64,
-                            bound: if opts.max_memory.is_some_and(|m| m < gate.available) {
-                                Bound::Env
-                            } else {
-                                Bound::Live
-                            },
-                        };
-                        tracing::info!(
-                            "hy_v4_flash mmap residency at load: {lanes} lanes, context {ctx}, \
+                );
+            }
+            if !decision.admitted {
+                return Err(bad(format!(
+                    "CUDA direct residency refused at context {}: need {:.2} GiB \
+                     (dense {:.2} GiB + experts {:.2} GiB + kv {:.2} GiB + scratch {:.2} GiB) \
+                     vs budget {:.2} GiB (device {:.2} GiB, physical {:.2} GiB, others {:.2} GiB, margin {:.2} GiB)",
+                    decision.ctx,
+                    decision.need as f64 / GIB as f64,
+                    decision.dense_bytes as f64 / GIB as f64,
+                    decision.expert_bytes as f64 / GIB as f64,
+                    decision.kv_bytes as f64 / GIB as f64,
+                    decision.scratch_bytes as f64 / GIB as f64,
+                    decision.budget as f64 / GIB as f64,
+                    decision.ws as f64 / GIB as f64,
+                    decision.physical as f64 / GIB as f64,
+                    decision.others as f64 / GIB as f64,
+                    decision.margin as f64 / GIB as f64,
+                )));
+            }
+            let total_slots = sizes.total_experts();
+            let fixed = decision
+                .dense_bytes
+                .saturating_add(decision.kv_bytes)
+                .saturating_add(decision.scratch_bytes);
+            let live_budget = decision
+                .physical
+                .saturating_sub(decision.others)
+                .saturating_sub(decision.margin);
+            let a = Admission {
+                physical: decision.physical,
+                host_used: decision.host_used,
+                own: decision.own,
+                others: decision.others,
+                reserve: decision.margin,
+                live: live_budget,
+                ws: decision.ws,
+                terms: Terms {
+                    dense: decision.dense_bytes,
+                    staging_layer: 0,
+                    kv: decision.kv_bytes,
+                    compute: decision.scratch_bytes,
+                    io: 0,
+                    driver: 0,
+                    pool: 0,
+                },
+                staging_layers: 0,
+                fixed,
+                slot: base.slot,
+                cache_slots: (total_slots[0] + total_slots[1]) as u64,
+                bound: if opts.max_memory.is_some_and(|m| {
+                    m > 0 && m < decision.ws.saturating_sub(decision.margin).min(live_budget)
+                }) {
+                    Bound::Env
+                } else {
+                    Bound::Live
+                },
+            };
+            tracing::info!(
+                "hy_v4_flash CUDA direct residency at load: 1 lane, context {}, chunk {}: \
+                 dense {:.2} GiB + experts {:.2} GiB ({} slots) + kv {:.2} GiB + scratch {:.2} GiB \
+                 = {:.2} GiB vs budget {:.2} GiB (device {:.2} GiB, physical {:.2} GiB, others {:.2} GiB, margin {:.2} GiB)",
+                decision.ctx,
+                decision.chunk,
+                decision.dense_bytes as f64 / GIB as f64,
+                decision.expert_bytes as f64 / GIB as f64,
+                total_slots[0] + total_slots[1],
+                decision.kv_bytes as f64 / GIB as f64,
+                decision.scratch_bytes as f64 / GIB as f64,
+                decision.need as f64 / GIB as f64,
+                decision.budget as f64 / GIB as f64,
+                decision.ws as f64 / GIB as f64,
+                decision.physical as f64 / GIB as f64,
+                decision.others as f64 / GIB as f64,
+                decision.margin as f64 / GIB as f64,
+            );
+            (
+                1,
+                decision.ctx,
+                decision.chunk,
+                Some(a),
+                Some(decision.budget),
+                BankInit::CudaDirect,
+            )
+        } else {
+            match (&limits, &opts.plan) {
+                (Some(l), _) => {
+                    // nothing of this model exists yet: every byte in use is others'
+                    let own = Own::default();
+                    let direct_expert_bytes = sizes.direct_expert_bytes();
+                    let mapped_bytes = mmap_expert_bytes(&scan)?.saturating_add(mmap_dense_file);
+                    let kv_initial = direct_kv_allowance(&one_lane, max_ctx);
+                    let (h, ws, selected) = select_expert_mode_with_retry(
+                        opts.mmap,
+                        opts.direct,
+                        metal_available,
+                        &one_lane,
+                        max_ctx,
+                        &own,
+                        base.dense,
+                        mmap_dense_bytes,
+                        direct_expert_bytes,
+                        mapped_bytes,
+                        opts.mmap_chunk_max,
+                        reserve_override,
+                        opts.max_memory,
+                        l.cache_cap,
+                        || host_reading(opts.max_memory),
+                        free_pool,
+                        crate::array::clear_cache,
+                    )?;
+                    match selected {
+                        ExpertResidency::Mmap { chunk, gate } => {
+                            let ctx = max_ctx;
+                            let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                            let extra_lane = floor.saturating_add(LADDER_BYTES);
+                            let mtp_row = kv_per_token(&scan.cfg, mtp)
+                                .saturating_sub(kv_per_token(&scan.cfg, false));
+                            let page_bytes = super::paged::PageGeometry::of(&scan.cfg)
+                                .and_then(|g| g.block_bytes())
+                                .unwrap_or(0);
+                            let rset_reserve_for = |n: usize| {
+                                let extra = n.saturating_sub(1) as u64 * extra_lane;
+                                let state = (n as u64)
+                                    .saturating_mul(floor)
+                                    .saturating_add(ladder_bytes_for(n))
+                                    .saturating_add(mtp_row.saturating_mul(ctx as u64));
+                                let full_kv =
+                                    mmap_full_kv_bytes(&one_lane, ctx, n, page_bytes, extra, state);
+                                gate.dense_bytes
+                                    .saturating_add(full_kv)
+                                    .saturating_add(gate.scratch_bytes)
+                            };
+                            let lanes = (1..=want)
+                                .rev()
+                                .find(|&n| {
+                                    n == 1
+                                        || (gate.need.saturating_add(
+                                            n.saturating_sub(1) as u64 * extra_lane,
+                                        ) <= gate.budget
+                                            && (opts.mmap != MmapMode::Auto
+                                                || rset_reserve_for(n) <= gate.budget))
+                                })
+                                .unwrap_or(1);
+                            let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
+                            let kv_total = kv_initial.saturating_add(extra_lanes);
+                            let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
+                            let mmap_fixed = gate.dense_bytes.saturating_add(kv_scratch);
+                            let rset_reserve = rset_reserve_for(lanes);
+                            let total_slots = sizes.total_experts();
+                            let rset_budget =
+                                mmap_rset_budget(opts.mmap, gate.budget, rset_reserve);
+                            let rset_bounded = opts.mmap == MmapMode::Auto;
+                            let warm_budget = mmap_warm_budget(
+                                opts.mmap_prewarm,
+                                &h,
+                                gate.dense_bytes,
+                                kv_total,
+                                gate.margin,
+                                mapped_bytes,
+                                Some(gate.budget),
+                            );
+                            let wired_cap = direct_wired_limit(mmap_fixed, ws);
+                            let a = Admission {
+                                physical: gate.physical,
+                                host_used: gate.host_used,
+                                own: 0,
+                                others: gate.others,
+                                reserve: gate.margin,
+                                live: gate.available,
+                                ws,
+                                terms: Terms {
+                                    dense: gate.dense_bytes,
+                                    staging_layer: 0,
+                                    kv: kv_total,
+                                    compute: gate.scratch_bytes,
+                                    io: 0,
+                                    driver: 0,
+                                    pool: 0,
+                                },
+                                staging_layers: 0,
+                                fixed: mmap_fixed,
+                                slot: base.slot,
+                                cache_slots: (total_slots[0] + total_slots[1]) as u64,
+                                bound: if opts.max_memory.is_some_and(|m| m < gate.available) {
+                                    Bound::Env
+                                } else {
+                                    Bound::Live
+                                },
+                            };
+                            tracing::info!(
+                                "hy_v4_flash mmap residency at load: {lanes} lanes, context {ctx}, \
                              chunk {chunk}, wave rows {row_cap}: dense {:.2} GiB + mmap experts \
                              {:.2} GiB (nbytes=0, {} slots, prewarm {:.2} GiB) + kv/scratch {:.2} GiB \
                              vs available {:.2} GiB (others {:.2} GiB, margin {:.2} GiB); wired cap {:.2} GiB",
-                            gate.dense_bytes as f64 / GIB as f64,
-                            mapped_bytes as f64 / GIB as f64,
-                            total_slots[0] + total_slots[1],
-                            warm_budget as f64 / GIB as f64,
-                            kv_scratch as f64 / GIB as f64,
-                            gate.available as f64 / GIB as f64,
-                            gate.others as f64 / GIB as f64,
-                            gate.margin as f64 / GIB as f64,
-                            wired_cap as f64 / GIB as f64,
-                        );
-                        (
-                            lanes,
-                            ctx,
-                            chunk,
-                            Some(a),
-                            Some(gate.budget),
-                            BankInit::Mmap {
-                                warm_budget,
-                                force_prewarm: opts.mmap_prewarm == MmapMode::On,
-                                rset_budget,
-                                rset_bounded,
-                            },
-                        )
-                    }
-                    ExpertResidency::Direct { chunk, gate } => {
-                        let ctx = max_ctx;
-                        let floor = lane_bytes(&scan.cfg, mtp, ctx);
-                        let extra_lane = floor.saturating_add(LADDER_BYTES);
-                        let lanes = (1..=want)
-                            .rev()
-                            .find(|&n| {
-                                n == 1
-                                    || gate
-                                        .need
-                                        .saturating_add(n.saturating_sub(1) as u64 * extra_lane)
-                                        <= gate.budget
-                            })
-                            .unwrap_or(1);
-                        let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
-                        let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
-                        let direct_fixed = gate.dense_bytes.saturating_add(kv_scratch);
-                        let total_slots = sizes.total_experts();
-                        let wired_cap = direct_wired_limit(
-                            direct_fixed.saturating_add(direct_expert_bytes),
-                            ws,
-                        );
-                        let a = Admission {
-                            physical: gate.physical,
-                            host_used: gate.host_used,
-                            own: 0,
-                            others: gate.others,
-                            reserve: gate.margin,
-                            live: gate.available,
-                            ws,
-                            terms: Terms {
-                                dense: gate.dense_bytes,
-                                staging_layer: 0,
-                                kv: kv_initial.saturating_add(extra_lanes),
-                                compute: gate.scratch_bytes,
-                                io: 0,
-                                driver: 0,
-                                pool: 0,
-                            },
-                            staging_layers: 0,
-                            fixed: direct_fixed,
-                            slot: base.slot,
-                            cache_slots: (total_slots[0] + total_slots[1]) as u64,
-                            bound: if opts.max_memory.is_some_and(|m| m < gate.available) {
-                                Bound::Env
-                            } else {
-                                Bound::Live
-                            },
-                        };
-                        tracing::info!(
-                            "hy_v4_flash direct residency at load: {lanes} lanes, context {ctx}, \
-                             chunk {chunk}, wave rows {row_cap}: dense {:.2} GiB + direct experts \
-                             {:.2} GiB ({} slots) + kv/scratch {:.2} GiB vs available {:.2} GiB \
-                             (others {:.2} GiB, margin {:.2} GiB); wired cap {:.2} GiB",
-                            gate.dense_bytes as f64 / GIB as f64,
-                            direct_expert_bytes as f64 / GIB as f64,
-                            total_slots[0] + total_slots[1],
-                            kv_scratch as f64 / GIB as f64,
-                            gate.available as f64 / GIB as f64,
-                            gate.others as f64 / GIB as f64,
-                            gate.margin as f64 / GIB as f64,
-                            wired_cap as f64 / GIB as f64,
-                        );
-                        (
-                            lanes,
-                            ctx,
-                            chunk,
-                            Some(a),
-                            Some(gate.budget),
-                            BankInit::Direct,
-                        )
-                    }
-                    ExpertResidency::Streamed {
-                        direct_refusal,
-                        mmap_refusal,
-                    } => {
-                        if let Some(gate) = mmap_refusal {
-                            tracing::warn!(
-                                "hy_v4_flash mmap residency refused (need {:.2} GiB = dense {:.2} GiB \
-                                 + kv/scratch {:.2} GiB + 50% mapped {:.2} GiB vs budget {:.2} GiB, \
-                                 available {:.2} GiB, others {:.2} GiB, margin {:.2} GiB); \
-                                 falling back to partial streaming",
-                                gate.need as f64 / GIB as f64,
                                 gate.dense_bytes as f64 / GIB as f64,
-                                gate.kv_and_scratch as f64 / GIB as f64,
-                                (gate.mapped_bytes / 2) as f64 / GIB as f64,
-                                gate.budget as f64 / GIB as f64,
+                                mapped_bytes as f64 / GIB as f64,
+                                total_slots[0] + total_slots[1],
+                                warm_budget as f64 / GIB as f64,
+                                kv_scratch as f64 / GIB as f64,
                                 gate.available as f64 / GIB as f64,
                                 gate.others as f64 / GIB as f64,
                                 gate.margin as f64 / GIB as f64,
+                                wired_cap as f64 / GIB as f64,
                             );
+                            (
+                                lanes,
+                                ctx,
+                                chunk,
+                                Some(a),
+                                Some(gate.budget),
+                                BankInit::Mmap {
+                                    warm_budget,
+                                    force_prewarm: opts.mmap_prewarm == MmapMode::On,
+                                    rset_budget,
+                                    rset_bounded,
+                                },
+                            )
                         }
-                        if let Some(gate) = direct_refusal {
-                            tracing::warn!(
-                                "hy_v4_flash direct residency refused (need {:.2} GiB vs budget \
-                                 {:.2} GiB, available {:.2} GiB, others {:.2} GiB, cache cap {:?}); \
-                                 falling back to partial streaming",
-                                gate.need as f64 / GIB as f64,
-                                gate.budget as f64 / GIB as f64,
+                        ExpertResidency::Direct { chunk, gate } => {
+                            let ctx = max_ctx;
+                            let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                            let extra_lane = floor.saturating_add(LADDER_BYTES);
+                            let lanes = (1..=want)
+                                .rev()
+                                .find(|&n| {
+                                    n == 1
+                                        || gate
+                                            .need
+                                            .saturating_add(n.saturating_sub(1) as u64 * extra_lane)
+                                            <= gate.budget
+                                })
+                                .unwrap_or(1);
+                            let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
+                            let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
+                            let direct_fixed = gate.dense_bytes.saturating_add(kv_scratch);
+                            let total_slots = sizes.total_experts();
+                            let wired_cap = direct_wired_limit(
+                                direct_fixed.saturating_add(direct_expert_bytes),
+                                ws,
+                            );
+                            let a = Admission {
+                                physical: gate.physical,
+                                host_used: gate.host_used,
+                                own: 0,
+                                others: gate.others,
+                                reserve: gate.margin,
+                                live: gate.available,
+                                ws,
+                                terms: Terms {
+                                    dense: gate.dense_bytes,
+                                    staging_layer: 0,
+                                    kv: kv_initial.saturating_add(extra_lanes),
+                                    compute: gate.scratch_bytes,
+                                    io: 0,
+                                    driver: 0,
+                                    pool: 0,
+                                },
+                                staging_layers: 0,
+                                fixed: direct_fixed,
+                                slot: base.slot,
+                                cache_slots: (total_slots[0] + total_slots[1]) as u64,
+                                bound: if opts.max_memory.is_some_and(|m| m < gate.available) {
+                                    Bound::Env
+                                } else {
+                                    Bound::Live
+                                },
+                            };
+                            tracing::info!(
+                                "hy_v4_flash direct residency at load: {lanes} lanes, context {ctx}, \
+                             chunk {chunk}, wave rows {row_cap}: dense {:.2} GiB + direct experts \
+                             {:.2} GiB ({} slots) + kv/scratch {:.2} GiB vs available {:.2} GiB \
+                             (others {:.2} GiB, margin {:.2} GiB); wired cap {:.2} GiB",
+                                gate.dense_bytes as f64 / GIB as f64,
+                                direct_expert_bytes as f64 / GIB as f64,
+                                total_slots[0] + total_slots[1],
+                                kv_scratch as f64 / GIB as f64,
                                 gate.available as f64 / GIB as f64,
                                 gate.others as f64 / GIB as f64,
-                                l.cache_cap,
+                                gate.margin as f64 / GIB as f64,
+                                wired_cap as f64 / GIB as f64,
                             );
+                            (
+                                lanes,
+                                ctx,
+                                chunk,
+                                Some(a),
+                                Some(gate.budget),
+                                BankInit::Direct,
+                            )
                         }
-                        let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
-                        let at = ModelSize {
-                            ctx: one.ctx as u64,
-                            ..base
-                        };
-                        let floor =
-                            lane_bytes(&scan.cfg, mtp, one.ctx).saturating_add(LADDER_BYTES);
-                        let (lanes, p) = lanes_at(one, want, |n| {
-                            let lp = lane_profile(&one_lane, n, floor);
-                            admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
-                        });
-                        tracing::info!(
-                            "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
+                        ExpertResidency::Streamed {
+                            direct_refusal,
+                            mmap_refusal,
+                        } => {
+                            if let Some(gate) = mmap_refusal {
+                                tracing::warn!(
+                                    "hy_v4_flash mmap residency refused (need {:.2} GiB = dense {:.2} GiB \
+                                 + kv/scratch {:.2} GiB + 50% mapped {:.2} GiB vs budget {:.2} GiB, \
+                                 available {:.2} GiB, others {:.2} GiB, margin {:.2} GiB); \
+                                 falling back to partial streaming",
+                                    gate.need as f64 / GIB as f64,
+                                    gate.dense_bytes as f64 / GIB as f64,
+                                    gate.kv_and_scratch as f64 / GIB as f64,
+                                    (gate.mapped_bytes / 2) as f64 / GIB as f64,
+                                    gate.budget as f64 / GIB as f64,
+                                    gate.available as f64 / GIB as f64,
+                                    gate.others as f64 / GIB as f64,
+                                    gate.margin as f64 / GIB as f64,
+                                );
+                            }
+                            if let Some(gate) = direct_refusal {
+                                tracing::warn!(
+                                    "hy_v4_flash direct residency refused (need {:.2} GiB vs budget \
+                                 {:.2} GiB, available {:.2} GiB, others {:.2} GiB, cache cap {:?}); \
+                                 falling back to partial streaming",
+                                    gate.need as f64 / GIB as f64,
+                                    gate.budget as f64 / GIB as f64,
+                                    gate.available as f64 / GIB as f64,
+                                    gate.others as f64 / GIB as f64,
+                                    l.cache_cap,
+                                );
+                            }
+                            let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
+                            let at = ModelSize {
+                                ctx: one.ctx as u64,
+                                ..base
+                            };
+                            let floor =
+                                lane_bytes(&scan.cfg, mtp, one.ctx).saturating_add(LADDER_BYTES);
+                            let (lanes, p) = lanes_at(one, want, |n| {
+                                let lp = lane_profile(&one_lane, n, floor);
+                                admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
+                            });
+                            tracing::info!(
+                                "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
                              wave rows {row_cap}: {}",
-                            p.ctx,
-                            p.chunk,
-                            p.admission
-                        );
-                        let a = p.admission;
-                        let cache = sizes.classes.split(a.cache_bytes());
-                        (
-                            lanes,
-                            p.ctx,
-                            p.chunk,
-                            Some(a),
-                            None,
-                            BankInit::Streamed {
-                                cache,
-                                staging: a.staging_layers as usize,
-                            },
-                        )
+                                p.ctx,
+                                p.chunk,
+                                p.admission
+                            );
+                            let a = p.admission;
+                            let cache = sizes.classes.split(a.cache_bytes());
+                            (
+                                lanes,
+                                p.ctx,
+                                p.chunk,
+                                Some(a),
+                                None,
+                                BankInit::Streamed {
+                                    cache,
+                                    staging: a.staging_layers as usize,
+                                },
+                            )
+                        }
                     }
                 }
+                #[cfg(test)]
+                (None, CachePlan::Slots { cache, staging }) => (
+                    want,
+                    max_ctx,
+                    smallest.min(max_ctx),
+                    None,
+                    None,
+                    BankInit::Streamed {
+                        cache: *cache,
+                        staging: *staging,
+                    },
+                ),
+                _ => (
+                    want,
+                    max_ctx,
+                    smallest.min(max_ctx),
+                    None,
+                    None,
+                    BankInit::Streamed {
+                        cache: [0, 0],
+                        staging: 1,
+                    },
+                ),
             }
-            #[cfg(test)]
-            (None, CachePlan::Slots { cache, staging }) => (
-                want,
-                max_ctx,
-                smallest.min(max_ctx),
-                None,
-                None,
-                BankInit::Streamed {
-                    cache: *cache,
-                    staging: *staging,
-                },
-            ),
-            _ => (
-                want,
-                max_ctx,
-                smallest.min(max_ctx),
-                None,
-                None,
-                BankInit::Streamed {
-                    cache: [0, 0],
-                    staging: 1,
-                },
-            ),
         };
         let profile = lane_profile(
             &one_lane,
@@ -2572,6 +3061,14 @@ impl Store {
         let shards = Arc::new(ShardSet::open_with_cache(&scan.paths, &allow_cache)?);
         let t_bank = Instant::now();
         let (bank, mmap_dense) = match bank_init {
+            BankInit::CudaDirect => (
+                Arc::new(KqBank::new_cuda_direct(
+                    Arc::clone(&shards),
+                    &scan.cfg.moe,
+                    scan.trunk_experts(),
+                )?),
+                MmapDense::default(),
+            ),
             BankInit::Mmap {
                 warm_budget,
                 force_prewarm,
@@ -2645,13 +3142,14 @@ impl Store {
         let load_physical = admission.map_or(0, |a| a.physical);
         let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank)
             .with_max_memory(opts.max_memory);
-        let lease = if should_enable_direct_promotion(
-            opts.mmap,
-            opts.direct,
-            metal_available,
-            load_physical,
-            is_mmap,
-        ) {
+        let lease = if !bank.is_cuda_direct()
+            && should_enable_direct_promotion(
+                opts.mmap,
+                opts.direct,
+                metal_available,
+                load_physical,
+                is_mmap,
+            ) {
             lease.with_direct_promotion(
                 DirectPromotion {
                     mode: opts.direct,
@@ -2692,6 +3190,10 @@ impl Store {
 
     pub fn is_direct(&self) -> bool {
         self.bank.is_direct()
+    }
+
+    pub fn is_cuda_direct(&self) -> bool {
+        self.bank.is_cuda_direct()
     }
 
     pub fn is_mmap(&self) -> bool {

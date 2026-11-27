@@ -53,8 +53,8 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function buildItem(slug: string): CatalogBuildItem {
-  return catalogWithState(modelsDir)
+function buildItem(slug: string, platform: NodeJS.Platform = 'darwin'): CatalogBuildItem {
+  return catalogWithState(modelsDir, platform)
     .flatMap((item) => item.builds)
     .find((build) => build.slug === slug)!;
 }
@@ -199,7 +199,7 @@ describe('a GGUF model that Chat loads with no config.json', () => {
       blockedByForeignDir: false,
       blocker: null,
     });
-    expect(heldByOtherBuild(modelsDir, catalogBuildSlug(XL))).toBe('UD-Q4_K_M');
+    expect(heldByOtherBuild(modelsDir, catalogBuildSlug(XL), 'darwin')).toBe('UD-Q4_K_M');
     expect(buildItem(catalogBuildSlug(M))).toMatchObject({ present: true, installed: false, heldBy: null });
   });
 
@@ -254,7 +254,7 @@ describe('a GGUF with no config.json that is not the model of its catalog folder
       blocker: { kind: 'directory', holdsModel: true },
     });
     expect(catalogActionState(item, { job: undefined, updateAvailable: false })).toBe('adopt');
-    expect(heldByOtherBuild(modelsDir, slug)).toBeNull();
+    expect(heldByOtherBuild(modelsDir, slug, 'darwin')).toBeNull();
   });
 
   it('a full app record with no config.json of a GGUF of another family is not installed on the card', () => {

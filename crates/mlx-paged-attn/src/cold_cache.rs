@@ -3750,19 +3750,19 @@ fn persist_encoded(
 }
 
 fn is_space_io_error(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::StorageFull {
-        return true;
-    }
     #[cfg(unix)]
     {
-        let raw = error.raw_os_error();
-        if raw == Some(rustix::io::Errno::NOSPC.raw_os_error())
-            || raw == Some(rustix::io::Errno::DQUOT.raw_os_error())
-        {
+        if error.kind() == std::io::ErrorKind::StorageFull {
             return true;
         }
+        let raw = error.raw_os_error();
+        raw == Some(rustix::io::Errno::NOSPC.raw_os_error())
+            || raw == Some(rustix::io::Errno::DQUOT.raw_os_error())
     }
-    false
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::StorageFull
+    }
 }
 
 /// Why a persist failed: the room the write needs (Splash
@@ -4528,6 +4528,7 @@ fn read_state_header(
 /// that free no bytes — already missing, or quarantined rather than
 /// deleted — can never admit a write that would breach the reserve floor.
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
     evict_for_write_for(shared, None, incoming)
 }
@@ -12850,6 +12851,7 @@ mod tests {
         };
 
         type ErrorFactory = fn() -> std::io::Error;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut space_errors: Vec<(&str, ErrorFactory)> = vec![
             ("StorageFull", || {
                 std::io::Error::from(std::io::ErrorKind::StorageFull)

@@ -1546,6 +1546,9 @@ pub fn ring_write(buf: &MxArray, src: &MxArray, start_slot: usize, cap: usize) -
         .map_err(|_| bad(format!("ring_write start_slot {start_slot} exceeds i32")))?;
     let cap_i32 =
         i32::try_from(cap).map_err(|_| bad(format!("ring_write cap {cap} exceeds i32")))?;
+    if let Some(out) = crate::kernels::hy4::ring_write(buf, src, start_slot as i64, cap_i32)? {
+        return Ok(out);
+    }
     // SAFETY: buf and src are live array handles for the call.
     let handle = unsafe {
         mlx_sys::mlx_hy4_ring_write(buf.as_raw_ptr(), src.as_raw_ptr(), start_i32, cap_i32)

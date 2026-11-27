@@ -2164,6 +2164,60 @@ describe('dashboard api — host', () => {
       platform: process.platform,
     });
   });
+
+  it('includes detected gpu info when hostGpu resolves, and omits gpu on error or undefined', async () => {
+    const gpu = { backend: 'cuda', totalMemoryBytes: 102 * 1024 ** 3 };
+    const withGpu = await call(
+      { modelsDir: join(base, 'missing'), hostGpu: async () => gpu } as unknown as ApiContext,
+      'GET',
+      '/api/host',
+    );
+    expect(withGpu.ok ? withGpu.body : null).toEqual({
+      totalMemBytes: totalmem(),
+      diskFreeBytes: null,
+      platform: process.platform,
+      gpu,
+    });
+
+    const failing = await call(
+      {
+        modelsDir: join(base, 'missing'),
+        hostGpu: async () => {
+          throw new Error('probe failed');
+        },
+      } as unknown as ApiContext,
+      'GET',
+      '/api/host',
+    );
+    expect(failing.ok ? failing.body : null).toEqual({
+      totalMemBytes: totalmem(),
+      diskFreeBytes: null,
+      platform: process.platform,
+    });
+  });
+
+  it('memoizes probeHostGpu across GET /api/host calls on a dashboard runtime', async () => {
+    let calls = 0;
+    const probed = { backend: 'cuda', totalMemoryBytes: 24 * 1024 ** 3 };
+    const custom = createDashboardRuntime({
+      dbPath: ':memory:',
+      modelsDir,
+      tracesDir,
+      probeHostGpu: async () => {
+        calls += 1;
+        return probed;
+      },
+    });
+    try {
+      const first = await custom.call({ method: 'GET', path: '/api/host' });
+      const second = await custom.call({ method: 'GET', path: '/api/host' });
+      expect(first.ok && (first.body as { gpu?: unknown }).gpu).toEqual(probed);
+      expect(second.ok && (second.body as { gpu?: unknown }).gpu).toEqual(probed);
+      expect(calls).toBe(1);
+    } finally {
+      await custom.close();
+    }
+  });
 });
 
 describe('dashboard api — health and unknown paths', () => {

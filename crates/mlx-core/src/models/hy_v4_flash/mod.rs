@@ -9,6 +9,7 @@ pub mod block;
 pub mod cache;
 pub mod chat;
 pub mod config;
+pub mod cuda_forward;
 pub mod engram;
 pub mod f8;
 pub mod finalize;
@@ -36,6 +37,8 @@ pub mod stats;
 pub mod store;
 pub mod weights;
 
+#[cfg(test)]
+mod cuda_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

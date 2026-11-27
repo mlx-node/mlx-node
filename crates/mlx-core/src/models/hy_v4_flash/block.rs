@@ -187,9 +187,13 @@ impl Block {
 
     /// Empty state for a context of `cap` positions.
     pub fn new_state(&self, cap: usize) -> LayerState {
+        self.new_state_with_slack(cap, super::cache::WINDOW_SLACK)
+    }
+
+    pub(crate) fn new_state_with_slack(&self, cap: usize, window_slack: usize) -> LayerState {
         let g = self.mla.geometry();
         LayerState {
-            cache: LayerCache::new(g.attn, g.window, cap, g.row() as i64),
+            cache: LayerCache::new_with_slack(g.attn, g.window, window_slack, cap, g.row() as i64),
             index: self
                 .indexer
                 .as_ref()

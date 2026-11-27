@@ -20,7 +20,7 @@ use napi::{Error, Result};
 
 use super::config::{Attn, HyV4FlashConfig};
 use super::scan::{Located, Role, Scan};
-use crate::array::alloc::OutLayout;
+use crate::array::alloc::{OutLayout, SendPtr};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::moe_common::Weight;
@@ -28,7 +28,10 @@ use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 pub(crate) use crate::quant::gguf_mmap::{mmap_q8_0_gather_rows, mmap_raw_slice};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
-use crate::utils::gguf_gpu::RepackDst;
+use crate::utils::gguf_gpu::{
+    CudaDeviceBudget, GpuRepackKind, RepackDst, band_offset_rule, gpu_repack_available,
+    gpu_repack_band, gpu_repack_supports_kind,
+};
 
 pub const TOKEN_EMBD: &str = "token_embd.weight";
 pub const OUTPUT: &str = "output.weight";
@@ -50,6 +53,7 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// - `SymQ8`: symmetric Q8_0 codes + f16 scales with derived `-128 * scale` bias (34 B / 32 weights)
 /// - `Qmm`: affine-8 codes + explicit scales and biases (e.g. MTP requantized BF16)
 /// - `Qmm4`: affine-4 g64 codes (`[rows, k / 8]` u32) + bf16 scales and biases (`[rows, k / 64]` bf16)
+/// - `Nvfp4`: NVFP4 g16 codes (`[rows, k / 8]` u32) + u8 E4M3 scales (`[rows, k / 16]` u8)
 /// - `MmapBf16`: zero-copy read-only mmap BF16 matrix (`buf` uint8 + `byte_offset`)
 /// - `MmapQ8_0`: zero-copy read-only mmap GGUF Q8_0 table (`buf` uint8 + `byte_offset`)
 pub enum Dense {
@@ -71,6 +75,10 @@ pub enum Dense {
         w: MxArray,
         scales: MxArray,
         biases: MxArray,
+    },
+    Nvfp4 {
+        w: MxArray,
+        scales: MxArray,
     },
     MmapBf16 {
         buf: MxArray,
@@ -199,6 +207,71 @@ fn qmm4_t_mlx(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxAr
     }
 }
 
+fn dequant_nvfp4(w: &MxArray, scales: &MxArray) -> Result<MxArray> {
+    let mode = CString::new("nvfp4").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; biases is null for nvfp4; bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            std::ptr::null_mut(),
+            16,
+            4,
+            DType::Float32 as i32,
+            mode.as_ptr(),
+        )
+    };
+    let out = MxArray::from_handle(h, "hy_v4_flash nvfp4 dequantize")?;
+    if out.dtype()? == DType::Float32 {
+        Ok(out)
+    } else {
+        out.astype(DType::Float32)
+    }
+}
+
+fn qmm_nvfp4_t(x: &MxArray, w: &MxArray, scales: &MxArray) -> Result<MxArray> {
+    if crate::accelerator::cuda_ops_available() {
+        // Avoid MLX's CUDA NVRTC `qmm_naive_..._nvfp4` kernel which requires CUTLASS
+        // `cute/` headers not bundled at runtime on Windows; `mlx_dequantize` is AOT-compiled.
+        let wf = dequant_nvfp4(w, scales)?;
+        let xf = if x.dtype()? == DType::Float32 {
+            x.clone()
+        } else {
+            x.astype(DType::Float32)?
+        };
+        let wt = match wf.ndim()? {
+            2 => wf.transpose(Some(&[1, 0]))?,
+            3 => wf.transpose(Some(&[0, 2, 1]))?,
+            nd => {
+                let mut perm: Vec<i32> = (0..nd as i32).collect();
+                perm.swap(nd as usize - 2, nd as usize - 1);
+                wf.transpose(Some(&perm))?
+            }
+        };
+        return xf.matmul(&wt);
+    }
+    let mode = CString::new("nvfp4").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; biases is null for nvfp4; bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            std::ptr::null_mut(),
+            true,
+            16,
+            4,
+            mode.as_ptr(),
+        )
+    };
+    let out = MxArray::from_handle(h, "hy_v4_flash nvfp4 quantized_matmul")?;
+    if out.dtype()? == DType::Float32 {
+        Ok(out)
+    } else {
+        out.astype(DType::Float32)
+    }
+}
+
 impl Weight for Dense {
     fn f32(&self) -> Result<MxArray> {
         match self {
@@ -206,6 +279,7 @@ impl Weight for Dense {
             Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => dequant_q8(w, scales),
             Self::Qmm { w, scales, biases } => dequant_affine8(w, scales, biases),
             Self::Qmm4 { w, scales, biases } => dequant_affine4(w, scales, biases),
+            Self::Nvfp4 { w, scales } => dequant_nvfp4(w, scales),
             Self::MmapBf16 {
                 buf,
                 byte_offset,
@@ -262,6 +336,7 @@ impl Weight for Dense {
             }
             Self::Qmm { w, scales, biases } => qmm_t(x, w, scales, biases),
             Self::Qmm4 { w, scales, biases } => qmm4_t(x, w, scales, biases),
+            Self::Nvfp4 { w, scales } => qmm_nvfp4_t(x, w, scales),
             Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
                 x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?)
             }
@@ -277,6 +352,7 @@ impl Dense {
             | Self::SymQ8 { .. }
             | Self::Qmm { .. }
             | Self::Qmm4 { .. }
+            | Self::Nvfp4 { .. }
             | Self::MmapBf16 { .. }
             | Self::MmapQ8_0 { .. } => {
                 Err(bad("quantized or mmap tensor where an array is expected"))
@@ -287,7 +363,7 @@ impl Dense {
     pub fn is_qmm(&self) -> bool {
         matches!(
             self,
-            Self::SymQ8 { .. } | Self::Qmm { .. } | Self::Qmm4 { .. }
+            Self::SymQ8 { .. } | Self::Qmm { .. } | Self::Qmm4 { .. } | Self::Nvfp4 { .. }
         )
     }
 
@@ -299,9 +375,47 @@ impl Dense {
             Self::Array(_)
             | Self::Q8 { .. }
             | Self::Qmm4 { .. }
+            | Self::Nvfp4 { .. }
             | Self::MmapBf16 { .. }
             | Self::MmapQ8_0 { .. } => None,
         }
+    }
+
+    /// `(w, scales)` for NVFP4 g16 packed weights (`w` u32 `[N, K/8]`, `scales` u8 `[N, K/16]`).
+    pub fn nvfp4_parts(&self) -> Option<(&MxArray, &MxArray)> {
+        match self {
+            Self::Nvfp4 { w, scales } => Some((w, scales)),
+            _ => None,
+        }
+    }
+
+    /// `(w, scales)` for Q8_0 packed weights (`SymQ8` or `Q8` codes).
+    pub fn sym_q8_parts(&self) -> Option<(&MxArray, &MxArray)> {
+        match self {
+            Self::SymQ8 { w, scales } | Self::Q8 { w, scales } => Some((w, scales)),
+            _ => None,
+        }
+    }
+
+    /// Promotes any host-backed CUDA arrays (`device == -1`) inside `self` to
+    /// GPU device memory (`device == 0`), returning promoted bytes (0 on Metal/CPU
+    /// or when already device-resident).
+    pub fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        Ok(match self {
+            Self::Array(a) => a.promote_cuda_device()?,
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } | Self::Nvfp4 { w, scales } => {
+                w.promote_cuda_device()? + scales.promote_cuda_device()?
+            }
+            Self::Qmm { w, scales, biases } | Self::Qmm4 { w, scales, biases } => {
+                w.promote_cuda_device()?
+                    + scales.promote_cuda_device()?
+                    + biases.promote_cuda_device()?
+            }
+            Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => 0,
+        })
     }
 
     pub(crate) fn mmap_bf16_raw_slice(&self) -> Result<Option<(&[u8], usize, usize)>> {
@@ -334,10 +448,12 @@ impl Dense {
             Self::Qmm4 { w, scales, .. } if axis + 1 == w.ndim()? => {
                 Ok(scales.shape_at(axis)? * 64)
             }
+            Self::Nvfp4 { w, scales } if axis + 1 == w.ndim()? => Ok(scales.shape_at(axis)? * 16),
             Self::Q8 { w, .. }
             | Self::SymQ8 { w, .. }
             | Self::Qmm { w, .. }
-            | Self::Qmm4 { w, .. } => w.shape_at(axis),
+            | Self::Qmm4 { w, .. }
+            | Self::Nvfp4 { w, .. } => w.shape_at(axis),
             Self::MmapBf16 { rows, cols, .. } | Self::MmapQ8_0 { rows, cols, .. } => match axis {
                 0 => Ok(*rows),
                 1 => Ok(*cols),
@@ -362,6 +478,7 @@ impl Dense {
                 &scales.take(idx, 0)?,
                 &biases.take(idx, 0)?,
             ),
+            Self::Nvfp4 { w, scales } => dequant_nvfp4(&w.take(idx, 0)?, &scales.take(idx, 0)?),
             Self::MmapQ8_0 {
                 buf,
                 byte_offset,
@@ -393,6 +510,10 @@ impl Dense {
                 w: cut(w)?,
                 scales: cut(scales)?,
                 biases: cut(biases)?,
+            },
+            Self::Nvfp4 { w, scales } => Self::Nvfp4 {
+                w: cut(w)?,
+                scales: cut(scales)?,
             },
             Self::MmapBf16 {
                 buf,
@@ -456,6 +577,7 @@ impl Dense {
             Self::Qmm4 { w, scales, biases } => {
                 Ok(Some(qmm4_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
             }
+            Self::Nvfp4 { w, scales } => Ok(Some(qmm_nvfp4_t(x, &r(w)?, &r(scales)?)?)),
             Self::Array(_) | Self::Q8 { .. } | Self::MmapBf16 { .. } | Self::MmapQ8_0 { .. } => {
                 Ok(None)
             }
@@ -465,7 +587,9 @@ impl Dense {
     pub fn nbytes(&self) -> usize {
         match self {
             Self::Array(a) => a.nbytes(),
-            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => w.nbytes() + scales.nbytes(),
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } | Self::Nvfp4 { w, scales } => {
+                w.nbytes() + scales.nbytes()
+            }
             Self::Qmm { w, scales, biases } | Self::Qmm4 { w, scales, biases } => {
                 w.nbytes() + scales.nbytes() + biases.nbytes()
             }
@@ -481,7 +605,9 @@ pub enum Form {
     Codes,
     /// Q8_0 as symmetric affine-8 codes + f16 scales (`Dense::SymQ8`).
     Qmm,
-    /// An f32 array from F32, Q8_0 or BF16 data.
+    /// NVFP4 g16 packed u32 weights + u8 E4M3 scales (`Dense::Nvfp4`).
+    Nvfp4,
+    /// An f32 array from F32, Q8_0, BF16, or NVFP4 data.
     F32,
     /// An f16 array converted from F32 data.
     F16,
@@ -493,6 +619,12 @@ fn is_compressor_mat(name: &str) -> bool {
     COMPRESSOR_MATS
         .iter()
         .any(|s| name.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+}
+
+fn is_hc_fn_mat(name: &str) -> bool {
+    name == "output_hc_fn.weight"
+        || name.ends_with(".hc_attn_fn.weight")
+        || name.ends_with(".hc_ffn_fn.weight")
 }
 
 fn is_router_mat(name: &str) -> bool {
@@ -508,18 +640,23 @@ pub(crate) fn router_f16_enabled() -> bool {
 /// The form of a resident tensor; refuses experts, the Engram table and any
 /// type the file does not use for that role.
 pub fn form(role: Role, info: &GgufTensorInfo) -> Result<Form> {
-    use GgufTensorType::{BF16, F32, Q8_0};
+    use GgufTensorType::{BF16, F32, NVFP4, Q8_0};
     let name = info.name.as_str();
     let mat = is_compressor_mat(name);
+    let hc_fn = is_hc_fn_mat(name);
     Ok(match (role, info.tensor_type) {
         (Role::Dense, Q8_0) if name == TOKEN_EMBD => Form::Codes,
-        (Role::Dense, Q8_0) if mat => Form::F32,
+        (Role::Dense, Q8_0) if mat || hc_fn => Form::F32,
         (Role::Dense, Q8_0) => Form::Qmm,
+        (Role::Dense, NVFP4) if hc_fn => Form::F32,
+        (Role::Dense, NVFP4) if name != TOKEN_EMBD && !mat => Form::Nvfp4,
         (Role::Dense, F32) if is_router_mat(name) && router_f16_enabled() => Form::F16,
         (Role::Dense | Role::Mtp, F32) => Form::F32,
         (Role::Dense, BF16) if name == OUTPUT => Form::Bf16,
         (Role::Mtp, BF16) if mat => Form::F32,
         (Role::Mtp, BF16) => Form::Bf16,
+        (Role::Mtp, Q8_0) if mat => Form::F32,
+        (Role::Mtp, Q8_0) => Form::Qmm,
         (Role::Expert | Role::EngramTable, _) => {
             return Err(bad(format!("'{name}' is not a resident tensor")));
         }
@@ -537,6 +674,7 @@ pub fn resident_bytes(role: Role, info: &GgufTensorInfo) -> Result<u64> {
     let n = info.num_elements()?;
     let r = match form(role, info)? {
         Form::Codes | Form::Qmm => n.checked_add(n / 16),
+        Form::Nvfp4 => (n / 2).checked_add(n / 16),
         Form::F32 => n.checked_mul(4),
         Form::F16 | Form::Bf16 => n.checked_mul(2),
     };
@@ -1319,6 +1457,12 @@ fn elements(info: &GgufTensorInfo) -> Result<usize> {
 }
 
 fn f32_array(info: &GgufTensorInfo, raw: &[u8], shape: &[i64]) -> Result<MxArray> {
+    if info.tensor_type == GgufTensorType::NVFP4 {
+        let d = nvfp4_dense(info, raw)?;
+        let out = d.f32()?.reshape(shape)?;
+        MxArray::eval_arrays_with_context(&[&out], "hy_v4_flash nvfp4 f32")?;
+        return Ok(out);
+    }
     let decode: fn(&[u8], &mut [MaybeUninit<f32>]) -> Result<()> = match info.tensor_type {
         GgufTensorType::F32 => le_f32_into_slots,
         GgufTensorType::BF16 => bf16_into_f32_slots,
@@ -1388,6 +1532,341 @@ fn q8_dense(info: &GgufTensorInfo, raw: &[u8], form: Form) -> Result<Dense> {
     Ok(Dense::SymQ8 { w, scales })
 }
 
+fn nvfp4_dense(info: &GgufTensorInfo, raw: &[u8]) -> Result<Dense> {
+    if info.tensor_type != GgufTensorType::NVFP4 {
+        return Err(bad(format!(
+            "'{}': Nvfp4 needs NVFP4, not {}",
+            info.name,
+            info.tensor_type.name()
+        )));
+    }
+    let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor)?;
+    decode_affine_band_into(info.tensor_type, raw, 0, ptrs.rows, ptrs.k, &ptrs)?;
+    let scales = dst
+        .scales
+        .ok_or_else(|| bad(format!("'{}': NVFP4 repack gave no scales", info.name)))?;
+    let rows = i64::try_from(ptrs.rows).map_err(|_| bad("row count exceeds i64"))?;
+    let fold = |a: &MxArray| -> Result<MxArray> {
+        let nd = a.ndim()?;
+        a.reshape(&[rows, a.shape_at(nd.saturating_sub(1))?])
+    };
+    let (w, scales) = (fold(&dst.weight)?, fold(&scales)?);
+    MxArray::eval_arrays_with_context(&[&w, &scales], "hy_v4_flash nvfp4")?;
+    Ok(Dense::Nvfp4 { w, scales })
+}
+
+struct StageSlot {
+    arr: MxArray,
+    ptr: SendPtr<u8>,
+    cap: usize,
+}
+
+/// Reusable ping-pong 16 KiB-aligned staging `MxArray`s (uint8) + optional
+/// Windows unbuffered shard handles for streaming overlapped GPU repack bands
+/// directly from NVMe without double-copying through the OS page cache.
+pub(crate) struct CudaStaging {
+    slots: [Option<StageSlot>; 2],
+    #[cfg(windows)]
+    unbuffered: Vec<Option<std::fs::File>>,
+}
+
+impl CudaStaging {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: [None, None],
+            #[cfg(windows)]
+            unbuffered: Vec::new(),
+        }
+    }
+
+    fn ensure_slot(&mut self, idx: usize, min_bytes: usize) -> Result<()> {
+        const STAGE_ALIGN: usize = 16 << 10;
+        let need = min_bytes
+            .max(1)
+            .checked_next_multiple_of(STAGE_ALIGN)
+            .ok_or_else(|| bad("CUDA staging size overflows usize"))?;
+        let realloc = self.slots[idx].as_ref().is_none_or(|s| s.cap < need);
+        if realloc {
+            self.slots[idx] = None;
+            let (arr, ptr, bytes) = MxArray::alloc_uninit(&[need as i64], DType::Uint8)?;
+            arr.eval();
+            self.slots[idx] = Some(StageSlot {
+                arr,
+                ptr,
+                cap: bytes,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn ensure_unbuffered(&mut self, shards: &ShardSet) {
+        if self.unbuffered.len() == shards.len() {
+            return;
+        }
+        self.unbuffered.clear();
+        for i in 0..shards.len() {
+            let f = shards
+                .path(i)
+                .and_then(|p| crate::moe_stream::io::open_unbuffered(p).ok());
+            self.unbuffered.push(f);
+        }
+    }
+
+    #[cfg(windows)]
+    fn unbuffered_file(&self, shard: usize) -> Option<&std::fs::File> {
+        self.unbuffered.get(shard).and_then(Option::as_ref)
+    }
+}
+
+/// Default band size for streaming GPU repack (128 MiB per slot).
+pub(crate) const CUDA_REPACK_BAND_BYTES: usize = 128 << 20;
+/// MLX cache pool threshold for periodic flushes during CUDA weight loading (512 MiB).
+pub(crate) const CUDA_CLEAR_CACHE_BYTES: u64 = 512 << 20;
+
+#[cfg(windows)]
+fn try_read_unbuffered_into(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+    dst: SendPtr<u8>,
+    cap: usize,
+    min_src_align: usize,
+) -> Option<u64> {
+    use std::os::windows::fs::FileExt;
+    const SECTOR: u64 = 4096;
+    if !(dst.0 as usize).is_multiple_of(SECTOR as usize) {
+        return None;
+    }
+    let start = offset & !(SECTOR - 1);
+    let head = (offset - start) as usize;
+    if !head.is_multiple_of(min_src_align.max(1)) {
+        return None;
+    }
+    let need = head.checked_add(len)?;
+    let aligned_len = need.checked_next_multiple_of(SECTOR as usize)?;
+    if aligned_len > cap {
+        return None;
+    }
+    // SAFETY: `dst` points to `cap >= aligned_len` exclusively owned writable
+    // staging bytes for this band, and `dst` is 4 KiB-aligned.
+    let buf = unsafe { std::slice::from_raw_parts_mut(dst.0, aligned_len) };
+    let mut done = 0usize;
+    while done < need {
+        if !done.is_multiple_of(SECTOR as usize) {
+            return None;
+        }
+        match file.seek_read(&mut buf[done..aligned_len], start + done as u64) {
+            Ok(0) => return None,
+            Ok(n) => done += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(head as u64)
+}
+
+fn read_band_into_slot(
+    shards: &ShardSet,
+    #[cfg(windows)] unbuffered_file: Option<&std::fs::File>,
+    shard: usize,
+    offset: u64,
+    len: usize,
+    dst: SendPtr<u8>,
+    cap: usize,
+    min_src_align: usize,
+    read_buf: &mut AlignedBuf,
+) -> Result<u64> {
+    #[cfg(windows)]
+    if let Some(f) = unbuffered_file
+        && let Some(src_off) = try_read_unbuffered_into(f, offset, len, dst, cap, min_src_align)
+    {
+        return Ok(src_off);
+    }
+    let _ = (cap, min_src_align);
+    let raw = shards.read_aligned(
+        Extent {
+            shard,
+            offset,
+            len: len as u64,
+        },
+        read_buf,
+    )?;
+    // SAFETY: `dst` has at least `len == raw.len()` writable bytes exclusively
+    // owned by the caller for this band.
+    unsafe {
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), dst.0, raw.len());
+    }
+    Ok(0)
+}
+
+/// Streams one quantized GGUF tensor from `shards` in bands through `staging`
+/// and repacks directly into GPU device memory (`device == 0`) via
+/// `mlx_gguf_repack_band`, overlapping disk I/O for band `i + 1` with GPU
+/// repack of band `i`. Returns `(dst, total_rows, bytes_read)`.
+pub(crate) fn cuda_repack_from_shards(
+    shards: &ShardSet,
+    loc: &Located,
+    kind: GpuRepackKind,
+    budget: &CudaDeviceBudget,
+    read_buf: &mut AlignedBuf,
+    staging: &mut CudaStaging,
+) -> Result<(RepackDst, usize, u64)> {
+    let info = &loc.info;
+    let ty = info.tensor_type;
+    let total_bytes = info.data_size()?;
+    let (dst, meta) =
+        RepackDst::alloc_gpu_for_kind_with_budget(info, kind, OutLayout::RowMajor, budget)?;
+    let row_bytes = (meta.k / ty.block_size()) * ty.type_size();
+    if row_bytes == 0 || (meta.rows as u64).checked_mul(row_bytes as u64) != Some(total_bytes) {
+        return Err(bad(format!(
+            "'{}': {} rows × {row_bytes} B != {total_bytes} B",
+            info.name, meta.rows
+        )));
+    }
+    let band_rows = (CUDA_REPACK_BAND_BYTES / row_bytes).clamp(1, meta.rows);
+    let base_offset = loc.abs_offset()?;
+    let min_src_align = band_offset_rule(kind);
+    // Reserve up to 8 KiB extra per slot for 4 KiB sector head + tail padding.
+    let max_band_bytes = band_rows
+        .checked_mul(row_bytes)
+        .and_then(|n| n.checked_add(8192))
+        .ok_or_else(|| bad("CUDA repack band size overflows usize"))?;
+    let multi_band = band_rows < meta.rows;
+    staging.ensure_slot(0, max_band_bytes)?;
+    if multi_band {
+        staging.ensure_slot(1, max_band_bytes)?;
+    }
+    #[cfg(windows)]
+    staging.ensure_unbuffered(shards);
+    #[cfg(windows)]
+    let unbuf_file = staging.unbuffered_file(loc.shard);
+
+    let mut bands: Vec<(usize, usize, u64, usize)> = Vec::new();
+    let mut r = 0usize;
+    while r < meta.rows {
+        let rows = band_rows.min(meta.rows - r);
+        let band_len = rows
+            .checked_mul(row_bytes)
+            .ok_or_else(|| bad("CUDA repack band length overflows usize"))?;
+        let offset = base_offset
+            .checked_add((r as u64) * (row_bytes as u64))
+            .ok_or_else(|| bad("CUDA repack band offset overflows u64"))?;
+        bands.push((r, rows, offset, band_len));
+        r += rows;
+    }
+
+    if bands.is_empty() {
+        return Ok((dst, meta.rows, 0));
+    }
+
+    let slot_meta = |slots: &[Option<StageSlot>; 2], idx: usize| -> Result<(SendPtr<u8>, usize)> {
+        let s = slots[idx]
+            .as_ref()
+            .ok_or_else(|| bad("CUDA staging slot not allocated"))?;
+        Ok((s.ptr, s.cap))
+    };
+
+    let (ptr0, cap0) = slot_meta(&staging.slots, 0)?;
+    let (_, _, off0, len0) = bands[0];
+    let mut cur_src_off = read_band_into_slot(
+        shards,
+        #[cfg(windows)]
+        unbuf_file,
+        loc.shard,
+        off0,
+        len0,
+        ptr0,
+        cap0,
+        min_src_align,
+        read_buf,
+    )?;
+    let mut cur_slot = 0usize;
+    let mut read_total = len0 as u64;
+    let mut dst_opt = Some(dst);
+
+    for i in 0..bands.len() {
+        let (row0, rows, _, _) = bands[i];
+        let next_band = bands.get(i + 1).copied();
+        let next_slot = cur_slot ^ 1;
+        let next_meta = match next_band {
+            Some(_) => Some(slot_meta(&staging.slots, next_slot)?),
+            None => None,
+        };
+        let cur_arr = &staging.slots[cur_slot]
+            .as_ref()
+            .ok_or_else(|| bad("CUDA staging slot not allocated"))?
+            .arr;
+        let cur_dst = dst_opt
+            .take()
+            .ok_or_else(|| bad("CUDA repack destination missing"))?;
+
+        let rb = &mut *read_buf;
+        let (repack_res, io_out): (Result<RepackDst>, Option<Result<u64>>) =
+            std::thread::scope(|scope| {
+                let reader_handle =
+                    next_band
+                        .zip(next_meta)
+                        .map(|((_, _, noff, nlen), (nptr, ncap))| {
+                            let shard = loc.shard;
+                            scope.spawn(move || {
+                                read_band_into_slot(
+                                    shards,
+                                    #[cfg(windows)]
+                                    unbuf_file,
+                                    shard,
+                                    noff,
+                                    nlen,
+                                    nptr,
+                                    ncap,
+                                    min_src_align,
+                                    rb,
+                                )
+                            })
+                        });
+
+                let repack_res = (|| -> Result<RepackDst> {
+                    let next_dst = gpu_repack_band(
+                        cur_arr,
+                        cur_src_off,
+                        kind,
+                        OutLayout::RowMajor,
+                        meta.k as u32,
+                        row0 as u32,
+                        rows as u32,
+                        cur_dst,
+                    )?;
+                    let mut outs = Vec::with_capacity(3);
+                    outs.push(&next_dst.weight);
+                    if let Some(s) = next_dst.scales.as_ref() {
+                        outs.push(s);
+                    }
+                    if let Some(b) = next_dst.biases.as_ref() {
+                        outs.push(b);
+                    }
+                    MxArray::eval_arrays_with_context(&outs, "hy_v4_flash cuda repack band")?;
+                    crate::array::synchronize();
+                    Ok(next_dst)
+                })();
+
+                let io_out = reader_handle.map(|h| {
+                    h.join()
+                        .map_err(|_| bad("CUDA repack reader thread panicked"))?
+                });
+                (repack_res, io_out)
+            });
+
+        dst_opt = Some(repack_res?);
+        if let (Some((_, _, _, nlen)), Some(res)) = (next_band, io_out) {
+            cur_src_off = res?;
+            read_total += nlen as u64;
+            cur_slot = next_slot;
+        }
+    }
+    let dst = dst_opt.ok_or_else(|| bad("CUDA repack destination missing"))?;
+    Ok((dst, meta.rows, read_total))
+}
+
 /// One tensor's GGUF bytes as `form`. Model thread only (`alloc_uninit`).
 pub fn dense_from_raw(info: &GgufTensorInfo, raw: &[u8], form: Form) -> Result<Dense> {
     let want = info.data_size()?;
@@ -1401,6 +1880,7 @@ pub fn dense_from_raw(info: &GgufTensorInfo, raw: &[u8], form: Form) -> Result<D
     let shape = held_shape(info)?;
     Ok(match form {
         Form::Codes | Form::Qmm => q8_dense(info, raw, form)?,
+        Form::Nvfp4 => nvfp4_dense(info, raw)?,
         Form::F32 => Dense::Array(f32_array(info, raw, &shape)?),
         Form::F16 => Dense::Array(f16_array(info, raw, &shape)?),
         Form::Bf16 => Dense::Array(bf16_array(info, raw, &shape)?),
@@ -1420,6 +1900,9 @@ pub struct Reader<'a> {
     scan: &'a Scan,
     shards: &'a ShardSet,
     buf: AlignedBuf,
+    cuda_budget: Option<CudaDeviceBudget>,
+    cuda_staging: CudaStaging,
+    cuda_bytes_since_clear: u64,
     /// GGUF bytes read.
     pub read: u64,
     /// Bytes of the arrays made.
@@ -1431,10 +1914,15 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// `shards` must be opened from `scan.paths`.
     pub fn new(scan: &'a Scan, shards: &'a ShardSet) -> Self {
+        let cuda_budget =
+            crate::accelerator::cuda_ops_available().then(CudaDeviceBudget::for_current_device);
         Self {
             scan,
             shards,
             buf: AlignedBuf::new(),
+            cuda_budget,
+            cuda_staging: CudaStaging::new(),
+            cuda_bytes_since_clear: 0,
             read: 0,
             bytes: 0,
             count: 0,
@@ -1447,11 +1935,63 @@ impl<'a> Reader<'a> {
             .tensors
             .get(name)
             .ok_or_else(|| bad(format!("tensor '{name}' missing")))?;
-        let form = form(entry.role, &entry.loc.info)?;
-        let e = extent(&entry.loc)?;
-        let raw = self.shards.read_aligned(e, &mut self.buf)?;
-        let d = dense_from_raw(&entry.loc.info, raw, form)?;
-        self.read += e.len;
+        let loc = &entry.loc;
+        let form = form(entry.role, &loc.info)?;
+        let cuda_kind = match form {
+            Form::Codes | Form::Qmm if loc.info.tensor_type == GgufTensorType::Q8_0 => {
+                Some(GpuRepackKind::Q8_0)
+            }
+            Form::Nvfp4 if loc.info.tensor_type == GgufTensorType::NVFP4 => {
+                Some(GpuRepackKind::Nvfp4)
+            }
+            _ => None,
+        };
+        let (mut d, read_len) = if let (Some(budget), Some(kind)) = (&self.cuda_budget, cuda_kind)
+            && gpu_repack_available()
+            && gpu_repack_supports_kind(kind)
+        {
+            let (dst, rows, read_len) = cuda_repack_from_shards(
+                self.shards,
+                loc,
+                kind,
+                budget,
+                &mut self.buf,
+                &mut self.cuda_staging,
+            )?;
+            let scales = dst
+                .scales
+                .ok_or_else(|| bad(format!("'{name}': {kind:?} CUDA repack gave no scales")))?;
+            let rows_i64 = i64::try_from(rows).map_err(|_| bad("row count exceeds i64"))?;
+            let fold = |a: &MxArray| -> Result<MxArray> {
+                let nd = a.ndim()?;
+                a.reshape(&[rows_i64, a.shape_at(nd.saturating_sub(1))?])
+            };
+            let (w, scales) = (fold(&dst.weight)?, fold(&scales)?);
+            MxArray::eval_arrays_with_context(&[&w, &scales], "hy_v4_flash cuda dense fold")?;
+            let d = match form {
+                Form::Codes => Dense::Q8 { w, scales },
+                Form::Qmm => Dense::SymQ8 { w, scales },
+                Form::Nvfp4 => Dense::Nvfp4 { w, scales },
+                _ => unreachable!(),
+            };
+            (d, read_len)
+        } else {
+            let e = extent(loc)?;
+            let raw = self.shards.read_aligned(e, &mut self.buf)?;
+            let d = dense_from_raw(&loc.info, raw, form)?;
+            (d, e.len)
+        };
+        if self.cuda_budget.is_some() {
+            d.ensure_cuda_device()?;
+            self.cuda_bytes_since_clear += d.nbytes() as u64;
+            if self.cuda_bytes_since_clear >= CUDA_CLEAR_CACHE_BYTES {
+                self.cuda_bytes_since_clear = 0;
+                if crate::array::get_cache_memory() >= CUDA_CLEAR_CACHE_BYTES as f64 {
+                    crate::array::clear_cache();
+                }
+            }
+        }
+        self.read += read_len;
         self.bytes += d.nbytes() as u64;
         self.count += 1;
         Ok(d)
@@ -1556,8 +2096,8 @@ impl HcWeights {
     }
 }
 
-/// Concatenates 2-D `Dense::SymQ8`, `Dense::Qmm`, or `Dense::Qmm4` matrices
-/// along axis 0 into a single backing allocation and returns
+/// Concatenates 2-D `Dense::SymQ8`, `Dense::Qmm`, `Dense::Qmm4`, or `Dense::Nvfp4`
+/// matrices along axis 0 into a single backing allocation and returns
 /// `(fused, zero_copy_views)` so resident RAM stays 1.00x. Returns `None` if
 /// fewer than 2 parts or any part does not match the others' variant, rank,
 /// width, or dtypes.
@@ -1570,21 +2110,28 @@ pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense
         SymQ8,
         Qmm,
         Qmm4,
+        Nvfp4,
     }
     let kind = match parts[0] {
         Dense::SymQ8 { .. } => Kind::SymQ8,
         Dense::Qmm { .. } => Kind::Qmm,
         Dense::Qmm4 { .. } => Kind::Qmm4,
+        Dense::Nvfp4 { .. } => Kind::Nvfp4,
         _ => return Ok(None),
     };
     let mut ws = Vec::with_capacity(parts.len());
     let mut ss = Vec::with_capacity(parts.len());
-    let mut bs = Vec::with_capacity(if kind == Kind::SymQ8 { 0 } else { parts.len() });
+    let mut bs = Vec::with_capacity(if matches!(kind, Kind::SymQ8 | Kind::Nvfp4) {
+        0
+    } else {
+        parts.len()
+    });
     let mut rows = Vec::with_capacity(parts.len());
     let mut expected: Option<(i64, i64, Option<i64>, DType, DType, Option<DType>)> = None;
     for part in parts {
         let (w, scales, biases) = match (kind, part) {
-            (Kind::SymQ8, Dense::SymQ8 { w, scales }) => (w, scales, None),
+            (Kind::SymQ8, Dense::SymQ8 { w, scales })
+            | (Kind::Nvfp4, Dense::Nvfp4 { w, scales }) => (w, scales, None),
             (Kind::Qmm, Dense::Qmm { w, scales, biases })
             | (Kind::Qmm4, Dense::Qmm4 { w, scales, biases }) => (w, scales, Some(biases)),
             _ => return Ok(None),
@@ -1627,10 +2174,14 @@ pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense
     }
     let w = MxArray::concatenate_many(ws, Some(0))?;
     let s = MxArray::concatenate_many(ss, Some(0))?;
-    let fused = match kind {
+    let mut fused = match kind {
         Kind::SymQ8 => {
             MxArray::eval_arrays_with_context(&[&w, &s], "hy_v4_flash fuse sym q8")?;
             Dense::SymQ8 { w, scales: s }
+        }
+        Kind::Nvfp4 => {
+            MxArray::eval_arrays_with_context(&[&w, &s], "hy_v4_flash fuse nvfp4")?;
+            Dense::Nvfp4 { w, scales: s }
         }
         Kind::Qmm => {
             let b = MxArray::concatenate_many(bs, Some(0))?;
@@ -1651,6 +2202,7 @@ pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense
             }
         }
     };
+    fused.ensure_cuda_device()?;
     let mut views = Vec::with_capacity(rows.len());
     let mut lo = 0i64;
     for r in rows {
@@ -1695,6 +2247,13 @@ impl AttnWeights {
             self.gate = gate;
             self.q_kv = Some(q_kv);
             self.q_kv_gate = Some(fused);
+        } else if let Some((fused, mut views)) = fuse_qmm_rows(&[&self.q_a, &self.kv_a])? {
+            let kv_a = views.pop().ok_or_else(|| bad("missing kv_a view"))?;
+            let q_a = views.pop().ok_or_else(|| bad("missing q_a view"))?;
+            self.q_a = q_a;
+            self.kv_a = kv_a;
+            self.q_kv = Some(fused);
+            self.q_kv_gate = None;
         }
         Ok(())
     }
