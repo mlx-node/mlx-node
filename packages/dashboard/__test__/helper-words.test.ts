@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { progressLine } from '../ui/src/components/arc-x/activity-rail/progress-line.js';
+import { activityOf } from '../ui/src/lib/activity.js';
 import {
   type AgentEnd,
   type AgentNow,
@@ -16,10 +17,12 @@ import {
   runAgents,
 } from '../ui/src/lib/agents.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
-import type { HelperProgress } from '../ui/src/lib/chat-types.js';
+import { formatElapsed } from '../ui/src/lib/chat-turns.js';
+import type { HelperProgress, LiveActivity } from '../ui/src/lib/chat-types.js';
 import { formatDuration } from '../ui/src/lib/format.js';
 import { CONTEXT_WARN_PCT, errorWords, nowWords, readerWords, rowWords } from '../ui/src/lib/helper-words.js';
 import { pageOpened, readerFact } from '../ui/src/lib/pdf-run.js';
+import { runView } from './helpers/run-views.js';
 
 const T0 = 1_795_674_158_000;
 const RUN = 'wf_01a2168534c27fd1a477edb6fad7b0a4';
@@ -212,6 +215,45 @@ describe('a retried row counts every attempt', () => {
     expect(words.sub.slice(0, 2)).toEqual([fill(CHAT.activity.progressTurn, { n: 1 }), fill(s.toolCalls, { n: 4 })]);
     const untick = rowWords({ row, state: 'running', until: null }, { progress: null, now: A2_AT + 2_000 });
     expect(untick.facts[0]).toBe('0:42');
+  });
+
+  // Mutation: the rail row takes the raw tick → the rail reads `1 call` and 0:05 beside the card's 4 tool calls and 0:45.
+  it("the rail row of a running retry reads the card row's tool calls and time", () => {
+    const run: TranscriptEntry = {
+      kind: 'workflow',
+      ts: T0 - 1_000,
+      updatedTs: T0 - 1_000,
+      runId: RUN,
+      revision: 1,
+      name: 'review',
+      status: 'running',
+      elapsedMs: 0,
+      phases: [],
+      currentPhase: null,
+      agentBudget: null,
+      agentsUsed: 2,
+      agents: [],
+      phasesEntered: [],
+    };
+    const at = A2_AT + 5_000;
+    const progress = a2Tick(at);
+    const live: LiveActivity = {
+      helpers: [progress],
+      agents: [],
+      tasks: [],
+      schedules: [],
+      reports: [],
+      stoppedByYou: [],
+    };
+    const activity = activityOf({ entries: [run, a1, a2], runs: [runView(RUN)], live, turnRunning: true, now: at });
+    const rail = activity.running.find((row) => row.kind === 'workflow')!;
+    const agent = rail.kind === 'workflow' ? rail.listed[0]! : null;
+    const card = rowWords({ row: rowOf([a1, a2]), state: 'running', until: null }, { progress, now: at });
+    expect(agent?.attempts).toEqual(['a1', 'a2']);
+    expect(formatElapsed(at - agent!.startTs)).toBe(card.facts[0]);
+    expect(agent!.progress?.turns).toBe(1);
+    expect(progressLine(agent!.progress, at).text).toContain(fill(CHAT.activity.progressCalls, { n: '4' }));
+    expect(card.sub).toContain(fill(s.toolCalls, { n: 4 }));
   });
 
   // Mutation: the newest attempt's finish line in the earlier sums → `5 tool calls` while its finish line waits.

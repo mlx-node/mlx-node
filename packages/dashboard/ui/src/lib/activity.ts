@@ -417,7 +417,10 @@ function planOf(entries: readonly TranscriptEntry[], turnRunning: boolean): Acti
   return null;
 }
 
-/** An agent's rail row: `entry` its newest attempt's entry at `anchor`. */
+/**
+ * An agent's rail row: `entry` its newest attempt's entry at `anchor`. Its tool calls and time take in its earlier
+ * attempts; its turn is the running attempt's.
+ */
 function agentRailRow(
   entry: Extract<TranscriptEntry, { kind: 'subagent' }>,
   anchor: EntryAnchor,
@@ -425,6 +428,7 @@ function agentRailRow(
   title: string,
   live: LiveActivity | undefined,
   needs: readonly AskRow[],
+  earlier: { toolCalls: number; durationMs: number } = { toolCalls: 0, durationMs: 0 },
 ): AgentRailRow {
   const held = agentLiveOf(live, { attempts });
   const progress = progressOf(live, entry.childId);
@@ -432,9 +436,9 @@ function agentRailRow(
     id: entry.childId,
     attempts,
     title,
-    startTs: entry.ts,
+    startTs: entry.ts - earlier.durationMs,
     anchor,
-    progress,
+    progress: progress === null ? null : { ...progress, toolCalls: earlier.toolCalls + progress.toolCalls },
     live: held !== null,
     stopping: held?.stopping === true,
     messages: held?.messages ?? null,
@@ -505,7 +509,7 @@ function workflowsOf(
       const last = entryAt === undefined ? undefined : entries[entryAt];
       if (state !== 'running' || last?.kind !== 'subagent') continue;
       if (!run.live && agentLiveOf(live, row) === null) continue;
-      const rail = agentRailRow(last, entryAt!, row.attempts, row.label, live, needs);
+      const rail = agentRailRow(last, entryAt!, row.attempts, row.label, live, needs, row.earlier);
       (rail.waits ? asking : running).push(rail);
     }
     const listed = [...asking, ...running];
