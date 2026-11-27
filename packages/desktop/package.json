@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/desktop",
-  "version": "0.0.22",
+  "version": "0.0.23",
   "private": true,
   "description": "Portato desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
   "homepage": "https://github.com/mlx-node/mlx-node",
