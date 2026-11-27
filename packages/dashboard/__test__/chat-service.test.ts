@@ -1780,6 +1780,25 @@ describe('Chat service — Work', () => {
     });
   });
 
+  it("a service given its own home takes no folder rule from the user's home", async () => {
+    const user = mkdtempSync(join(tmpdir(), 'chat-user-home-'));
+    const folder = join(user, 'work');
+    mkdirSync(folder);
+    symlinkSync(folder, join(user, '.mlx-node'));
+    const before = process.env.HOME;
+    process.env.HOME = user;
+    try {
+      await withWork('work-always', async (fake) => {
+        process.env.HOME = before;
+        const { conversation } = await fake.service.create({ mode: 'work', text: 'list', cwd: folder });
+        expect(conversation.cwd).toBe(realpathSync(folder));
+      });
+    } finally {
+      process.env.HOME = before;
+      rmSync(user, { recursive: true, force: true });
+    }
+  });
+
   it('creates in the resolved folder, writes the index, and answers a card through the service', async () => {
     await withWork('work-always', async (fake, project) => {
       const svc = fake.service;

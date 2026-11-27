@@ -136,6 +136,9 @@ export default defineConfig({
     // Tests must never write inference telemetry to the developer's real
     // ~/.mlx-node. metrics-trace.test.ts manages this var itself (temp dirs).
     env: { MLX_AGENT_METRICS: '0' },
+    // Node 26 on arm64: two workers that type-strip .ts at once can SIGILL in V8's wasm-to-JS wrapper tier-up
+    // (nodejs/node#67467). Never tiering the wrapper removes the race; drop this once that issue is fixed.
+    execArgv: ['--wasm-wrapper-tiering-budget=1000000000'],
     watch: false,
     testTimeout: 120000, // 2 minutes
     // A `beforeAll` that loads a checkpoint needs the same budget as a test: the 10 s default is too short on a slow CI runner.

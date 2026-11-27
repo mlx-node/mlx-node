@@ -550,7 +550,6 @@ export class ChatService {
       refused: [
         options.paths.root,
         join(home, '.mlx-node'),
-        join(homedir(), '.mlx-node'),
         workHome,
         join(home, '.mlx-agent'),
         join(home, 'Library', 'Keychains'),
