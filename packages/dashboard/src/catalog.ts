@@ -125,7 +125,7 @@ export interface CatalogBuildItem {
   /**
    * Set when {@link installed} and neither the marker nor the folder holds a file named by a glob of the build with no
    * `*`: an install made before the catalog named that file. Only for a build of its own repository, and never when
-   * the marker lists a weight of another build, which an Update would delete.
+   * the marker or the folder holds a weight of another build, which an Update would delete.
    */
   lacksNamedFile?: true;
   /**
@@ -321,11 +321,12 @@ function buildWithState(
   // Read from the build's own folder ONLY — see `localRevision` for why a
   // provenance-matched renamed dir deliberately reports null.
   const completion = installed ? readCompletion(dir) : undefined;
+  const held = completion === undefined ? [] : [...completion.files, ...namesIn(dir)];
   const lacksNamedFile =
     completion !== undefined &&
     hfRepo === build.hfRepo &&
-    missingNamedFile(build.globs, [...completion.files, ...namesIn(dir)]) !== undefined &&
-    !updateDropsWeight(build.globs, completion.files);
+    missingNamedFile(build.globs, held) !== undefined &&
+    !updateDropsWeight(build.globs, held);
   const located = locatedState(dir, configless);
   return {
     id: build.id,

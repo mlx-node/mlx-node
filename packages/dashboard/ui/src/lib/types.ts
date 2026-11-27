@@ -110,7 +110,7 @@ export interface CatalogBuildItem {
   localAssetsRevision: string | null;
   /**
    * The install lacks a file the catalog names for the build (a glob with no `*`), in its marker and on disk, and an
-   * Update deletes no weight of another build; absent otherwise.
+   * Update deletes no weight of another build, in the marker or in the folder; absent otherwise.
    */
   lacksNamedFile?: true;
   /** The folder was made by Locate from model files elsewhere on this Mac; `null` otherwise. */

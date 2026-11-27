@@ -1365,6 +1365,13 @@ describe('catalogWithState — two builds of one repository', () => {
     expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
   });
 
+  it('an install with another build weight in the folder but not the marker does not read lacksNamedFile', () => {
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    writeFileSync(join(modelsDir, 'qwen3.8-27b-gguf', M_FILE), ggufHeader('qwen35'));
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ id: 'UD-Q4_K_XL', installed: true });
+    expect(buildItem('qwen3.8-27b-gguf').lacksNamedFile).toBeUndefined();
+  });
+
   it('a renamed install of one build makes only that build present', () => {
     writeGgufInstall('renamed-by-hand', M_FILE);
     expect(buildItem(catalogBuildSlug(M))).toMatchObject({ present: true, installed: false });
