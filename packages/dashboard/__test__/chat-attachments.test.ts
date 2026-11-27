@@ -37,11 +37,13 @@ import { normalizeMime } from '../ui/src/lib/file-read.js';
 import { type PdfCodec, type PdfOpenFailure, PdfOpenError } from '../ui/src/lib/pdf-pages.js';
 import { type AttachFacts, attachProblem } from '../ui/src/pages/chat/blockers.js';
 import {
+  drawingCount,
   forgetPlace,
   placeEpoch,
   type PendingPdf,
   readPending,
   stopPending,
+  writeAttachments,
   writePending,
 } from '../ui/src/pages/chat/drafts.js';
 
@@ -641,6 +643,20 @@ describe('pending PDFs', () => {
     expect(readPending('pending-2')).toEqual([]);
     writePending('pending-2', 'a', { ...a, done: 1, total: 3 }, epoch);
     expect(readPending('pending-2')).toEqual([]);
+  });
+
+  // Mutations: the count always 0 (Send ignores the store); the attached files not left out (Send stays off) → red.
+  it('a PDF not yet among the attached files holds Send, from any mount; once attached or stopped it does not', () => {
+    writePending('pending-3', 'a', entry('a'));
+    writePending('pending-3', 'b', entry('b'));
+    expect(drawingCount('pending-3')).toBe(2);
+    expect(attachProblem({ ...FACTS, files: [], reading: drawingCount('pending-3') })).toBe(CHAT.attach.reading);
+    writeAttachments('pending-3', [{ ...pdfDraft('a.pdf', 2), id: 'a' }]);
+    expect(drawingCount('pending-3')).toBe(1);
+    expect(stopPending('pending-3', 'b')).toBe(true);
+    expect(drawingCount('pending-3')).toBe(0);
+    expect(attachProblem({ ...FACTS, files: [], reading: drawingCount('pending-3') })).toBeNull();
+    forgetPlace('pending-3');
   });
 });
 

@@ -1196,7 +1196,8 @@ describe('the attachment input', () => {
       expect(both([...files, pdf(1)], 'y'.repeat(room + 1))).toEqual(['attachment-refused', 'attachment-refused']);
     });
 
-    // Mutations: the JPEG first-bytes check of a page dropped; a text file that starts with the note's line taken → red.
+    // Mutations: the JPEG first-bytes check of a page dropped; a page that is not padded base64 without whitespace
+    // taken; a text file that starts with the note's line taken → red.
     it('refuses a PDF past a limit, and a text file that starts like a note, as attachment-refused', () => {
       const cases: Array<[string, unknown[]]> = [
         ['an unknown key', [{ ...pdf(1), pages: 1 }]],
@@ -1211,6 +1212,8 @@ describe('the attachment input', () => {
         ['a page that is not base64', [{ kind: 'pdf', name: 'a.pdf', images: ['/9j/4AA!'] }]],
         ['a 589,825-byte page', [pdf(1, 589_825)]],
         ['a page over the base64 length', [{ kind: 'pdf', name: 'a.pdf', images: [`${jpeg(589_824)}AAAA`] }]],
+        ['a page with whitespace', [{ kind: 'pdf', name: 'a.pdf', images: [jpeg(64) + ' '.repeat(1000)] }]],
+        ['an unpadded page', [{ kind: 'pdf', name: 'a.pdf', images: [jpeg(64).replaceAll('=', '')] }]],
         ['an empty name', [pdf(1, 64, '')]],
         ['a name of 256 characters', [pdf(1, 64, 'n'.repeat(256))]],
         [

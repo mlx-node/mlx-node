@@ -1049,7 +1049,7 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   | pictures                                    | Chat only, model row `images: true`                                                       | page; service (`attachment-refused`); engine (400, below)             |
   | PDF file picked                             | 50 MiB; one of the 4 files whatever its pages                                             | page, before the open                                                 |
   | PDF pages in one message                    | 1 to 20; Chat and Work, model row `images: true`                                          | page; route; service (`attachment-refused`)                           |
-  | PDF page sent                               | JPEG, ≤ 589,824 bytes, the drawn size above, ≥ 8 px a side, ≥ 512 px                      | page; route checks length, base64, bytes and the first bytes          |
+  | PDF page sent                               | JPEG, ≤ 589,824 bytes, the drawn size above, ≥ 8 px a side, ≥ 512 px                      | page; route checks length, padded base64, bytes and the first bytes   |
   | page and picture base64 of one message      | 6 MiB (the agent trims old pictures from 13 MiB down to 8 MiB, so 2 MiB stay for text)    | page; route (`attachment-refused`)                                    |
   | images one conversation holds               | 64: picture blocks, PDF pages and tool-result pictures of its entries; Flash Next 4       | page; service (`pictures-full`, the 64)                               |
   | `/v1/messages`, `/v1/messages/count_tokens` | 16 MiB body (other engine routes 10 MiB), listed as `max_request_bytes` in `/v1/models`   | engine router; the agent drops old pictures from 13 MiB down to 8 MiB |
@@ -3242,9 +3242,9 @@ class of bug is deleted rather than mitigated. What remains:
 - **A PDF is drawn in the page and only its drawn pages leave it.** pdf.js runs under the same CSP (no WASM, no eval)
   with its worker started from `/assets/` by the page itself, the bytes passed as `data` (no URL fetch), no system
   fonts, no XFA, and no annotation or text layer, so `enableScripting` is never read. The route takes a `pdf` item
-  only as 1 to 20 base64 JPEG pages of at most 589,824 bytes with JPEG first bytes; the PDF's own bytes are never sent
-  or stored. The note the model reads names the file and its pages; text on a page reaches the model as pixels of a
-  picture, as data.
+  only as 1 to 20 base64 JPEG pages of at most 589,824 bytes with JPEG first bytes, padded and with no whitespace (a
+  page is stored as sent); the PDF's own bytes are never sent or stored. The note the model reads names the file and
+  its pages; text on a page reaches the model as pixels of a picture, as data.
 - **Git runs for the Work strip only, and only as written** (`src/chat/work-git.ts`). `spawn` with no shell, stdin
   closed, its own process group (killed whole at a deadline), stdout at most 4 MiB, stderr 64 KiB. Every call starts
   `git -C <dir> -c core.fsmonitor=false -c color.ui=false -c core.quotePath=false`, so the app starts no fsmonitor

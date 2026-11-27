@@ -160,6 +160,8 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
     for (const page of images as unknown[]) {
       if (typeof page !== 'string' || page.length < 4 || page.length > PAGE_MAX_BASE64_CHARS) throw refused;
       if (!isBase64(page) || base64Bytes(page) > PAGE_MAX_BYTES || !magicMatches('image/jpeg', page)) throw refused;
+      // A page is stored as sent and counted as padded base64, so it must be exactly that or it outgrows its count.
+      if (page.length !== Math.ceil(base64Bytes(page) / 3) * 4) throw refused;
       pages.push(page);
     }
     return { attachment: { kind: 'pdf', name: safeName(name), images: pages }, textBytes: 0 };
@@ -170,10 +172,10 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
 /**
  * The attachments of a message, every limit checked: at most {@link ATTACH_MAX}; a file is well-formed text with no
  * NUL and a cleaned name, and does not start like a PDF note; a picture is PNG or JPEG base64 whose first bytes match
- * its type; a PDF is 1 to 20 JPEG pages of at most {@link PAGE_MAX_BYTES} each. In all, at most
- * {@link PDF_MESSAGE_PAGES} pages, {@link MESSAGE_IMAGES_MAX_BASE64} of picture and page base64, and the message text
- * with the numbered file and note text under the agent's prompt cut. Empty is no attachments. Any failure is
- * `attachment-refused`.
+ * its type; a PDF is 1 to 20 JPEG pages of at most {@link PAGE_MAX_BYTES} each, as padded base64 with no whitespace.
+ * In all, at most {@link PDF_MESSAGE_PAGES} pages, {@link MESSAGE_IMAGES_MAX_BASE64} of picture and page base64, and
+ * the message text with the numbered file and note text under the agent's prompt cut. Empty is no attachments. Any
+ * failure is `attachment-refused`.
  */
 export function checkAttachments(value: unknown[], text: string): AttachmentInput[] | undefined {
   if (value.length === 0) return undefined;

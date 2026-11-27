@@ -159,6 +159,7 @@ import {
   attachDrafts,
   chooseFolder,
   chosenFolder,
+  drawingCount,
   firstModeDraft,
   type FolderPick,
   folderTooLong,
@@ -433,6 +434,8 @@ export default function Chat(): ReactElement {
   const failed = useSyncExternalStore(subscribeDrafts, () => readFailed(place));
   const held = useSyncExternalStore(subscribeDrafts, () => readAttachments(place));
   const drawing = useSyncExternalStore(subscribeDrafts, () => readPending(place));
+  // A read outlives the Chat mount that counted it, so a pending PDF in the store holds Send on its own.
+  const drawingHere = useSyncExternalStore(subscribeDrafts, () => drawingCount(place));
   /** Why the last files picked, pasted or dropped on a place were not added. */
   const [attachNote, setAttachNote] = useState<{ place: string; text: string } | null>(null);
   /** Files still being read, per place. */
@@ -875,7 +878,7 @@ export default function Chat(): ReactElement {
   if (blocked === undefined && modeUnknown) blocked = CHAT.threadLoading;
   if (blocked === undefined && slash.kind === 'unknown') blocked = CHAT.slash.unknown;
   if (blocked === undefined && appOff !== null) blocked = appOff;
-  const readingHere = reading.get(place) ?? 0;
+  const readingHere = (reading.get(place) ?? 0) + drawingHere;
   const threadEntries = isNew ? undefined : conv?.entries;
   const heldPictures = useMemo(
     () => (threadEntries === undefined ? 0 : heldPictureChars(threadEntries)),

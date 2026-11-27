@@ -132,6 +132,14 @@ export function writePending(
   changed();
 }
 
+/** The pending PDFs of a place whose draft is not among its attached files yet: a send now would go without them. */
+export function drawingCount(place: string): number {
+  const held = readAttachments(place);
+  let count = 0;
+  for (const entry of readPending(place)) if (!held.some((item) => item.id === entry.id)) count += 1;
+  return count;
+}
+
 /** Cancels the read of a pending PDF and drops its chip; false when no read of that id runs. */
 export function stopPending(place: string, id: string): boolean {
   const item = readPending(place).find((entry) => entry.id === id);
