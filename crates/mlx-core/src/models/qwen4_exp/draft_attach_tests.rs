@@ -554,6 +554,14 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
         let moe_base = moe_oracle.decoder.snapshot();
         let moe_first = target_dist(&moe_first_logits, &moe_params);
         unsafe { mlx_sys::mlx_seed(0x5EED_F4E2) };
+        struct LaneSeed;
+        impl Drop for LaneSeed {
+            fn drop(&mut self) {
+                crate::engine::hybrid_scheduler::TEST_LANE_SEED.with(|seed| seed.set(None));
+            }
+        }
+        let _lane_seed = LaneSeed;
+        crate::engine::hybrid_scheduler::TEST_LANE_SEED.with(|seed| seed.set(Some(0x5EED_F4E2)));
 
         // (1) Real non-injected `draft.propose_with` at depth 3 (4-row verify).
         let mut verified_moe_real = false;
@@ -771,17 +779,16 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
                         let g_vals = f32s(ga);
                         let w_vals = f32s(wa);
                         assert_eq!(g_vals.len(), w_vals.len(), "draft layer {layer} {name} len");
-                        let mut max_diff = 0.0f32;
                         for (elem_idx, (&a, &b)) in g_vals.iter().zip(&w_vals).enumerate() {
                             assert!(
                                 a.is_finite() && b.is_finite(),
                                 "non-finite recovered Flash Next draft layer {layer} {name}[{elem_idx}]: got={a}, want={b}"
                             );
-                            max_diff = max_diff.max((a - b).abs());
                         }
+                        let (hist, max_ulp) = bf16_ulp_histogram(&g_vals, &w_vals);
                         assert!(
-                            max_diff <= 1e-2,
-                            "recovered Flash Next draft layer {layer} {name} drifted from sequential oracle: max_diff={max_diff}"
+                            max_ulp <= 1,
+                            "recovered Flash Next draft layer {layer} {name} drifted from sequential oracle: {max_ulp} bf16 ULP, histogram {hist:?}"
                         );
                     }
                 }
