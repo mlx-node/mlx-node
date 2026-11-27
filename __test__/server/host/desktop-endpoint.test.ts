@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -208,11 +208,17 @@ describe('isPrivateWindowsSddl', () => {
 
 describe.runIf(windows)('Windows NTFS ACL hardening and verification', () => {
   function runConstrainedPowerShell(script: string, extraEnv: Record<string, string>) {
-    const ps = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const sysRoot = process.env.SystemRoot ?? 'C:\\Windows';
+    const ps = join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const guarded = `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n${script}`;
     const encoded = Buffer.from(guarded, 'utf16le').toString('base64');
+    const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase() === 'PSMODULEPATH') delete env[key];
+    }
+    env.PSModulePath = join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
     return spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-      env: { ...process.env, ...extraEnv },
+      env,
       windowsHide: true,
       encoding: 'utf8',
     });
@@ -292,6 +298,56 @@ describe.runIf(windows)('Windows NTFS ACL hardening and verification', () => {
       expect(await readFile(path, 'utf8')).not.toContain('never-written-through-junction');
     } finally {
       spawnSync(cmd, ['/c', 'rmdir', junction], { windowsHide: true });
+    }
+  });
+
+  it('ignores inherited PowerShell 7 PSModulePath and tolerates concurrent sibling writes in the endpoint directory', async () => {
+    const path = await location();
+    const dir = dirname(path);
+    await mkdir(dir, { recursive: true });
+
+    // Discover PowerShell 7's PSModulePath if installed (otherwise inject a realistic PowerShell 7 path).
+    const pwshProbe = spawnSync('pwsh.exe', ['-NoProfile', '-Command', '$env:PSModulePath'], {
+      windowsHide: true,
+      encoding: 'utf8',
+    });
+    const pollutedModulePath =
+      pwshProbe.status === 0 && pwshProbe.stdout.trim()
+        ? pwshProbe.stdout.trim()
+        : `C:\\Program Files\\PowerShell\\7\\Modules;${join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')}`;
+
+    const prevKeys: Array<[string, string | undefined]> = [];
+    for (const key of Object.keys(process.env)) {
+      if (key.toUpperCase() === 'PSMODULEPATH') {
+        prevKeys.push([key, process.env[key]]);
+        delete process.env[key];
+      }
+    }
+    process.env.PSModulePath = pollutedModulePath;
+
+    // Continuously write a sibling file (mirroring `supervisor.json` heartbeats) to advance `dir.ctimeNs`
+    // while `publishDesktopEndpoint` and `readDesktopEndpoint` run.
+    let stopSibling = false;
+    let siblingCounter = 0;
+    const siblingWriter = (async () => {
+      while (!stopSibling) {
+        const tmp = join(dir, `supervisor.${siblingCounter++}.tmp`);
+        await writeFile(tmp, '{"state":"starting"}', 'utf8');
+        await rename(tmp, join(dir, 'supervisor.json'));
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    })();
+
+    try {
+      await publishDesktopEndpoint(endpoint, path);
+      expect(await readDesktopEndpoint(path)).toEqual(endpoint);
+    } finally {
+      stopSibling = true;
+      await siblingWriter;
+      delete process.env.PSModulePath;
+      for (const [key, value] of prevKeys) {
+        if (value !== undefined) process.env[key] = value;
+      }
     }
   });
 });

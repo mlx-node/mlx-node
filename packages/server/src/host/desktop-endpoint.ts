@@ -278,12 +278,34 @@ export function isPrivateWindowsSddl(sddl: string, currentUserSid: string): Wind
   return { ok: true, protectedDacl };
 }
 
+function windowsSystemRoot(): string {
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.toUpperCase() === 'SYSTEMROOT' && value) return value;
+  }
+  return 'C:\\Windows';
+}
+
 function windowsSystem32Exe(name: string): string {
-  return join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', name);
+  return join(windowsSystemRoot(), 'System32', name);
 }
 
 function windowsPowerShellPath(): string {
-  return join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return join(windowsSystemRoot(), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+function buildWindowsToolEnv(extraEnv?: Record<string, string>): NodeJS.ProcessEnv {
+  if (!extraEnv) return process.env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [key, value] of Object.entries(extraEnv)) {
+    const upper = key.toUpperCase();
+    for (const existing of Object.keys(env)) {
+      if (existing !== key && existing.toUpperCase() === upper) {
+        delete env[existing];
+      }
+    }
+    env[key] = value;
+  }
+  return env;
 }
 
 async function execWindowsTool(
@@ -292,7 +314,7 @@ async function execWindowsTool(
   extraEnv?: Record<string, string>,
 ): Promise<string> {
   const { stdout } = await execFileAsync(exe, args, {
-    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    env: buildWindowsToolEnv(extraEnv),
     windowsHide: true,
     timeout: WINDOWS_ACL_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,
@@ -302,10 +324,14 @@ async function execWindowsTool(
 
 async function runWindowsPowerShell(script: string, extraEnv: Record<string, string>): Promise<string> {
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  // Pin PSModulePath strictly to Windows PowerShell 5.1's built-in system modules so an inherited PowerShell 7
+  // (`pwsh`) PSModulePath cannot break `Get-Acl` with `FormatXmlUpdateException` (`CouldNotAutoloadMatchingModule`),
+  // and no user or OneDrive module directory can shadow built-in cmdlets.
+  const systemModules = join(windowsSystemRoot(), 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
   return execWindowsTool(
     windowsPowerShellPath(),
     ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-    extraEnv,
+    { ...extraEnv, PSModulePath: systemModules },
   );
 }
 
@@ -596,10 +622,11 @@ export async function publishDesktopEndpoint(
           tempFinal.dev !== created.dev ||
           tempFinal.ino !== created.ino ||
           tempFinal.ctimeNs !== tempAfter.ctimeNs ||
+          // Note: do not require `dirFinal.ctimeNs === dirAfter.ctimeNs` because sibling files in the same
+          // `desktop/` directory (such as `supervisor.json`) legitimately advance the directory's `ctimeNs`.
           !dirFinal.isDirectory() ||
           dirFinal.dev !== dirBefore.dev ||
           dirFinal.ino !== dirBefore.ino ||
-          dirFinal.ctimeNs !== dirAfter.ctimeNs ||
           handleFinal.dev !== created.dev ||
           handleFinal.ino !== created.ino ||
           handleFinal.ctimeNs !== tempFinal.ctimeNs ||
@@ -660,8 +687,7 @@ export async function readDesktopEndpoint(path = desktopEndpointPath()): Promise
           opened.size !== fileBefore.size ||
           !dirPinned.isDirectory() ||
           dirPinned.dev !== dirBefore.dev ||
-          dirPinned.ino !== dirBefore.ino ||
-          dirPinned.ctimeNs !== dirBefore.ctimeNs
+          dirPinned.ino !== dirBefore.ino
         ) {
           return null;
         }
@@ -681,7 +707,6 @@ export async function readDesktopEndpoint(path = desktopEndpointPath()): Promise
           !dirAfter.isDirectory() ||
           dirAfter.dev !== dirPinned.dev ||
           dirAfter.ino !== dirPinned.ino ||
-          dirAfter.ctimeNs !== dirPinned.ctimeNs ||
           handleAfter.dev !== opened.dev ||
           handleAfter.ino !== opened.ino ||
           handleAfter.ctimeNs !== opened.ctimeNs ||
