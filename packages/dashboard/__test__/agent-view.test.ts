@@ -62,6 +62,7 @@ function row(childId: string, attempts: string[] = [childId], run: string | null
     continues: null,
     tokens: null,
     durationMs: 0,
+    earlier: { turns: 0, toolCalls: 0, durationMs: 0 },
   };
 }
 

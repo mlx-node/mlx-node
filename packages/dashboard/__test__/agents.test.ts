@@ -523,6 +523,19 @@ describe('runAgents keeps its lists while their rows stay the same', () => {
     const row = next.get(RUN)!.find((r) => r.childId === child(1))!;
     expect([agentState(row, STORED).state, row.durationMs]).toEqual(['done', 845_266]);
   });
+
+  // Mutation: leave the earlier attempts' counts out of the compare → the retried row keeps its old tool calls.
+  it("an earlier attempt's counts that change give the retried row a new list", () => {
+    const entries = read(RETRIED);
+    const first = runAgents(entries);
+    const end = indexOfChild(entries, child(0));
+    const moved = entries.map((entry, i): TranscriptEntry =>
+      i === end && entry.kind === 'subagent' ? { ...entry, toolCalls: 12 } : entry,
+    );
+    const next = runAgents(moved, first);
+    expect(next.get(RUN)).not.toBe(first.get(RUN));
+    expect(next.get(RUN)![0]!.earlier.toolCalls).toBe(12);
+  });
 });
 
 describe("the rail: a run's agents count on its row", () => {

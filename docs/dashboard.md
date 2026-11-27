@@ -2032,18 +2032,19 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   run card's running helper shows its step, its run time and tool calls, with context and tokens under it, while the
   host holds the run; a done helper keeps the numbers of `workflow_updated`. A conversation not loaded in a running
   agent lists no helper on the rail.
-- **A workflow run's helpers are drawn once (`ui/src/lib/run-helpers.ts`).** A helper's `subagent_spawned` names its
-  run (`workflow_run_id`); the reducer keeps it as the entry's `run` when the run's `workflow` entry came before it,
-  and the retried attempt as `resumedFrom` (`resumed_from`). Such a helper has no Subagent row in the thread or on the
-  Sessions transcript: its run card lists it. The card's rows are the run's roster (`agents` of `workflow_updated`, in
-  its order, each the latest attempt by child id) joined to the helpers' entries, then the run's helpers the roster
-  does not list, by spawn: the agent stores the roster only at the run's start, at each step and at its end, so a
-  transcript read from disk can hold helpers its roster does not name. A helper the run retried is one row, its latest
-  attempt; a roster row that still says running for a helper whose `subagent_finished` came after it takes that line's
-  facts. A script call that resumes a helper (`agent({resume_from})`) has a roster row of its own, so both rows stay,
-  each with its own call's attempts; a roster row folds into the spawn that resumed it only when that spawn is on no
-  roster row's line (a roster stored before the retry). A row built from the entries sums its attempts' run times. A
-  row with no end reads Running only while its run is live (not ended, and in the thread held by the host), else
+- **A workflow run's helpers are drawn once (`ui/src/lib/agents.ts`).** A helper's `subagent_spawned` names its run
+  (`workflow_run_id`); the reducer keeps it as the entry's `run`, the child it resumed as `resumedFrom`
+  (`resumed_from`), and the attempt a contract retry follows as `retryOf` (`retry_of`). Such a helper has no Subagent
+  row in the thread or on the Sessions transcript: its run card lists it. The card's rows are the helpers' entries,
+  one row per agent by spawn, joined to the run's roster (`agents` of `workflow_updated`, each row the newest attempt
+  by child id), then the roster rows with no spawn line: the agent stores the roster only at the run's start, at each
+  step and at its end, so a transcript read from disk can hold helpers its roster does not name. A spawn joins a row
+  only when its `retry_of` is that row's newest attempt; any other spawn is its own row, and one that resumed a child
+  (`agent({resume_from})`, also under the same label) reads "continues {label}". A roster row that still says running
+  for a helper whose `subagent_finished` came after it takes that line's facts. A retried row counts every attempt:
+  its tool calls and time while it runs (its turn stays the running attempt's), its turns, tool calls and time once
+  it ended. A row with no ended roster reads its attempts' billed tokens (`total_tokens_used`) summed as tokens used,
+  and no figure when an attempt has none. A row with no end reads Running only while its run is live (not ended, and in the thread held by the host), else
   "not finished". The thread keeps a run's list of rows while they stay the same, so streamed text does not redraw
   the run cards. A card row links to the helper's session like a Subagent row, and in the thread carries the helper's allowed
   and denied calls (all its attempts'). On the rail, a run the host holds is one row with "2 agents running" in its

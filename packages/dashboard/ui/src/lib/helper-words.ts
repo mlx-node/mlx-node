@@ -77,11 +77,17 @@ export interface RowWords {
 /** A context this full warns in place. */
 export const CONTEXT_WARN_PCT = 90;
 
+/** A running row's time: its earlier attempts' times plus the running attempt's. */
 function elapsedOf(agent: AgentNow, live: RowLive): string | null {
   const { progress, now } = live;
-  if (progress !== null) return formatElapsed(progress.durationMs + Math.max(0, now - progress.at));
+  const earlier = agent.row.earlier.durationMs;
+  if (progress !== null) return formatElapsed(earlier + progress.durationMs + Math.max(0, now - progress.at));
   const entry = agent.row.entry;
-  return entry === undefined ? null : formatElapsed(now - entry.ts);
+  return entry === undefined ? null : formatElapsed(earlier + now - entry.ts);
+}
+
+function plus(earlier: number, newest: number | undefined): number | undefined {
+  return newest === undefined && earlier === 0 ? undefined : earlier + (newest ?? 0);
 }
 
 /** A tick's errors, then its failed tool calls (`1 error`, `2 failed calls`); none at 0. */
@@ -114,7 +120,8 @@ function countsOf(
 /**
  * One row's words by its state: a running row says what it does now ({@link nowWords}), its time and how full its
  * context is; an ended workflow agent its step, time and total use; an ended subagent its time and its context at its
- * end; a failed row its reason on its own line. Counts and attempts go to the second line.
+ * end; a failed row its reason on its own line. Counts and attempts go to the second line. A retried row's tool calls,
+ * time and ended turns take in every attempt; a running row's turn is its running attempt's.
  */
 export function rowWords(agent: AgentNow, live: RowLive): RowWords {
   const { row, state } = agent;
@@ -128,14 +135,19 @@ export function rowWords(agent: AgentNow, live: RowLive): RowWords {
     word,
     tone,
     facts: facts.filter((fact): fact is string => fact !== null && fact !== ''),
-    sub: [...countsOf(false, entry?.turns, entry?.toolCalls), ...attempts],
+    sub: [
+      ...countsOf(false, plus(row.earlier.turns, entry?.turns), plus(row.earlier.toolCalls, entry?.toolCalls)),
+      ...attempts,
+    ],
     reason: null,
   });
   switch (state) {
     case 'running': {
       const progress = live.progress;
       const sub = [
-        ...(progress === null ? [] : countsOf(true, progress.turns, progress.toolCalls, progress)),
+        ...(progress === null
+          ? []
+          : countsOf(true, progress.turns, row.earlier.toolCalls + progress.toolCalls, progress)),
         ...attempts,
       ];
       const elapsed = elapsedOf(agent, live);

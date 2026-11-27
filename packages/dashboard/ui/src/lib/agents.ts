@@ -39,6 +39,8 @@ export interface AgentRow {
   tokens: { n: number; kind: 'used' | 'context' } | null;
   /** The roster's time once it ended, else the sum of its attempts' times. */
   durationMs: number;
+  /** Sums over its attempts before the newest (each ended): a retried row counts every attempt. */
+  earlier: { turns: number; toolCalls: number; durationMs: number };
 }
 
 /** An agent's open permission request: its row waits for the person. */
@@ -155,6 +157,13 @@ function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonl
   const ended = roster !== null && ROSTER_ENDS.has(roster.state);
   let durationMs = 0;
   for (const id of draft?.attempts ?? []) durationMs += draft!.entries.get(id)!.durationMs ?? 0;
+  const earlier = { turns: 0, toolCalls: 0, durationMs: 0 };
+  for (const id of draft?.attempts.slice(0, -1) ?? []) {
+    const attempt = draft!.entries.get(id)!;
+    earlier.turns += attempt.turns ?? 0;
+    earlier.toolCalls += attempt.toolCalls ?? 0;
+    earlier.durationMs += attempt.durationMs ?? 0;
+  }
   const runId = first?.run ?? run?.runId ?? null;
   const tokens: AgentRow['tokens'] = ended
     ? { n: roster.tokens, kind: 'used' }
@@ -176,6 +185,7 @@ function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonl
     continues: null,
     tokens,
     durationMs: ended ? roster.durationMs : durationMs,
+    earlier,
   };
 }
 
@@ -203,7 +213,10 @@ function sameRow(a: AgentRow, b: AgentRow): boolean {
     a.continues?.label === b.continues?.label &&
     a.tokens?.n === b.tokens?.n &&
     a.tokens?.kind === b.tokens?.kind &&
-    a.durationMs === b.durationMs
+    a.durationMs === b.durationMs &&
+    a.earlier.turns === b.earlier.turns &&
+    a.earlier.toolCalls === b.earlier.toolCalls &&
+    a.earlier.durationMs === b.earlier.durationMs
   );
 }
 

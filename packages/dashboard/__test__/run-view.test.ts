@@ -111,6 +111,7 @@ const agent = (phase: string | null, state: AgentEnd, over: Partial<AgentRow> = 
     continues: null,
     tokens: null,
     durationMs: 0,
+    earlier: { turns: 0, toolCalls: 0, durationMs: 0 },
     ...over,
   };
   return { row, state, until: null };
@@ -784,6 +785,7 @@ describe('a run of the PDF tool', () => {
         continues: null,
         tokens: null,
         durationMs: end === undefined ? 0 : end - start,
+        earlier: { turns: 0, toolCalls: 0, durationMs: 0 },
       },
       state,
       until: null,

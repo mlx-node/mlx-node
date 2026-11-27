@@ -5,8 +5,16 @@
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { progressLine } from '../ui/src/components/arc-x/activity-rail/progress-line.js';
-import type { AgentEnd, AgentNow, AgentRow } from '../ui/src/lib/agents.js';
+import {
+  type AgentEnd,
+  type AgentNow,
+  type AgentRow,
+  agentState,
+  FINISH_WAIT_MS,
+  runAgents,
+} from '../ui/src/lib/agents.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { HelperProgress } from '../ui/src/lib/chat-types.js';
 import { formatDuration } from '../ui/src/lib/format.js';
@@ -39,6 +47,7 @@ const now = (state: AgentEnd, over: Partial<AgentRow> = {}): AgentNow => ({
     continues: null,
     tokens: null,
     durationMs: 0,
+    earlier: { turns: 0, toolCalls: 0, durationMs: 0 },
     ...over,
   },
   state,
@@ -148,6 +157,87 @@ describe('rowWords', () => {
     expect(rowWords(now('stopped'), { progress: null, now: T0, stoppedByYou: true }).word).toBe(
       CHAT.agent.state.stoppedByYou,
     );
+  });
+});
+
+describe('a retried row counts every attempt', () => {
+  type Entry = Extract<TranscriptEntry, { kind: 'subagent' }>;
+  const A1_MS = 40_000;
+  const A2_AT = T0 + A1_MS + 47;
+  const a1: Entry = {
+    kind: 'subagent',
+    ts: T0,
+    childId: 'a1',
+    type: 'general-purpose',
+    description: 'alpha',
+    run: RUN,
+    endTs: T0 + A1_MS,
+    status: 'completed',
+    toolCalls: 3,
+    turns: 1,
+    durationMs: A1_MS,
+  };
+  const a2: Entry = {
+    kind: 'subagent',
+    ts: A2_AT,
+    childId: 'a2',
+    type: 'general-purpose',
+    description: 'alpha',
+    run: RUN,
+    resumedFrom: 'a1',
+    retryOf: 'a1',
+  };
+  const a2Ended: Entry = {
+    ...a2,
+    endTs: A2_AT + 5_000,
+    status: 'completed',
+    toolCalls: 1,
+    turns: 1,
+    durationMs: 5_000,
+  };
+  const rowOf = (entries: Entry[]): AgentRow => runAgents(entries).get(RUN)![0]!;
+  const a2Tick = (at: number) => tick({ childId: 'a2', turns: 1, toolCalls: 1, durationMs: 5_000, at });
+  const s = CHAT.subagent;
+
+  // Mutation: the tick's tool calls alone → `1 tool call`, and the time is the running attempt's alone (0:05).
+  // Mutation: the turns summed live → `turn 2` on the retry's first turn.
+  it("running: its earlier attempts' tool calls and time plus the tick's; the turn is the running attempt's", () => {
+    const row = rowOf([a1, a2]);
+    expect(row.attempts).toEqual(['a1', 'a2']);
+    const words = rowWords(
+      { row, state: 'running', until: null },
+      { progress: a2Tick(A2_AT + 5_000), now: A2_AT + 5_000 },
+    );
+    expect(words.facts[0]).toBe('0:45');
+    expect(words.sub.slice(0, 2)).toEqual([fill(CHAT.activity.progressTurn, { n: 1 }), fill(s.toolCalls, { n: 4 })]);
+    const untick = rowWords({ row, state: 'running', until: null }, { progress: null, now: A2_AT + 2_000 });
+    expect(untick.facts[0]).toBe('0:42');
+  });
+
+  // Mutation: the newest attempt's finish line in the earlier sums → `5 tool calls` while its finish line waits.
+  it('a finish line that waits for the roster adds nothing twice', () => {
+    const row = rowOf([a1, a2Ended]);
+    const end = a2Ended.endTs!;
+    const now = agentState(row, { live: true, now: end + 10 });
+    expect([now.state, now.until]).toEqual(['running', end + FINISH_WAIT_MS]);
+    const words = rowWords(now, { progress: a2Tick(end), now: end + 10 });
+    expect(words.sub).toContain(fill(s.toolCalls, { n: 4 }));
+  });
+
+  // Mutation: the newest attempt's counts alone → `1 turn · 1 tool call`.
+  it("ended: its turns and tool calls over every attempt; its time is the attempts' sum", () => {
+    const row = rowOf([a1, a2Ended]);
+    const words = rowWords({ row, state: 'done', until: null }, { progress: null, now: T0 });
+    expect(words.sub.slice(0, 2)).toEqual([fill(s.turns, { n: 2 }), fill(s.toolCalls, { n: 4 })]);
+    expect(words.facts).toContain('45.0 s');
+  });
+
+  // Mutation: the earlier sums over every attempt → a row of one ended attempt reads `2 turns · 6 tool calls`.
+  it('a row of one attempt reads its own counts alone', () => {
+    const row = rowOf([a1]);
+    expect(row.earlier).toEqual({ turns: 0, toolCalls: 0, durationMs: 0 });
+    const words = rowWords({ row, state: 'done', until: null }, { progress: null, now: T0 });
+    expect(words.sub).toEqual([s.turnsOne, fill(s.toolCalls, { n: 3 })]);
   });
 });
 
