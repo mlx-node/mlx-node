@@ -1283,7 +1283,9 @@ export class ChatService {
       throw chatRouteError('conversation-busy');
     }
     if (by === 'app' && this.modeOf(id) === 'ask') throw chatRouteError('conversation-busy');
-    return { turnId: this.startTurn(conversation, text, cwd).turnId };
+    // The host selects the model before the prompt goes: a move down to Ask during that wait counts too.
+    const sendable = by === 'app' ? () => this.modeOf(id) !== 'ask' : undefined;
+    return { turnId: this.startTurn(conversation, text, cwd, [], undefined, sendable).turnId };
   }
 
   /** {@link hostStartPdf} once the turn `turn` that sent `pdf` ends, kept in {@link hostStarts} from its start. */
@@ -3221,6 +3223,7 @@ export class ChatService {
     cwd?: string,
     attachments: readonly AttachmentInput[] = [],
     plan?: boolean,
+    sendable?: () => boolean,
   ): { turnId: string } {
     const id = conversation.info.id;
     const host = this.hosts[conversation.info.mode];
@@ -3240,7 +3243,7 @@ export class ChatService {
           ...(conversation.info.thinking === undefined ? {} : { thinking: conversation.info.thinking }),
         },
         attachments,
-        { plan: plan === true },
+        { plan: plan === true, ...(sendable === undefined ? {} : { sendable }) },
       );
     } catch (error) {
       if (error instanceof AgentHostError) throw chatRouteError(error.code);
@@ -3345,9 +3348,11 @@ export class ChatService {
           // A hook blocked the prompt: the agent stores none of it, so it leaves the thread and its text goes back to
           // the message box (not an automatic `continue`, which nobody typed).
           const blocked = result.outcome === 'hook-stopped' ? c.typedPrompt() : null;
+          // A start held back by its send gate: nobody typed it and it never went, so it leaves the thread.
+          const held = result.unsent === true && result.outcome === undefined && result.failure === undefined;
           if (result.unsent === true) c.promptUnsent();
           c.turnEnded(blocked === null || blocked.continued === true ? result : { ...result, blocked: blocked.text });
-          if (blocked !== null) c.dropTypedPrompt(hostView(this.hosts[mode], id));
+          if (blocked !== null || held) c.dropTypedPrompt(hostView(this.hosts[mode], id));
           c.info = { ...c.info, updatedAt: this.now(), hot: this.hosts[mode].isHot(id) };
           this.emitHost({ type: 'conversations-changed' });
         }

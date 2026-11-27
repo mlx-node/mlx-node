@@ -1264,10 +1264,11 @@ describe('Chat service — attachments', () => {
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
     // Mutations: the host start left out; the family check dropped; a start in Ask; a start after a move down to Ask
-    // during its checks; no start for a PDF sent inside a fork; Read it now in a fork on a PDF copied from the original
-    // (the session check dropped); a tool note that does not name the conversation it is sent in; a start after the
-    // model's call of the PDF, after any call of the tool, or after a deny; the start sent as the person's; Read it now
-    // while a run of the tool goes on; Read it now during the host's start not answered with its turn → red.
+    // during its checks, or while the host selects the model; that held start left in the thread; no start for a PDF
+    // sent inside a fork; Read it now in a fork on a PDF copied from the original (the session check dropped); a tool
+    // note that does not name the conversation it is sent in; a start after the model's call of the PDF, after any
+    // call of the tool, or after a deny; the start sent as the person's; Read it now while a run of the tool goes on;
+    // Read it now during the host's start not answered with its turn → red.
     it('Work Auto and Bypass: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
       const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
       const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
@@ -1354,6 +1355,35 @@ describe('Chat service — attachments', () => {
           await until(() => texts(movedDown.id).length === 2, 10_000);
           expect(texts(movedDown.id)).toEqual(['pdfnot', readPdfCommand(movedDown.pdf, 'pdfnot', 'report.pdf', 'you')]);
 
+          type Select = (
+            running: unknown,
+            session: { id: string },
+            turn: { turnId: string },
+            endpoint: unknown,
+          ) => Promise<unknown>;
+          const host = (svc as unknown as { hosts: { work: { selectFor: Select } } }).hosts.work;
+          const realSelect = host.selectFor.bind(host);
+          let selecting: { id: string; turnId: string } | null = null;
+          let loweredOnSelect = false;
+          host.selectFor = async (running, session, turn, endpoint) => {
+            if (!loweredOnSelect && session.id === selecting?.id && turn.turnId !== selecting.turnId) {
+              loweredOnSelect = true;
+              expect(await svc.setPermissionMode(session.id, 'ask', false)).toEqual({ mode: 'ask' });
+            }
+            return realSelect(running, session, turn, endpoint);
+          };
+          const lateMove = await send('pdfnot', GEMMA.name, 'bypass');
+          selecting = { id: lateMove.id, turnId: lateMove.turnId };
+          await until(() => loweredOnSelect, 10_000);
+          await settle();
+          host.selectFor = realSelect;
+          expect(texts(lateMove.id)).toEqual(['pdfnot']);
+          expect(interactionsOf(lateMove.page)).toEqual([]);
+          expect(lateMove.page.texts('user')).toEqual(['pdfnot']);
+          await svc.readPdf(lateMove.id, lateMove.pdf);
+          await until(() => texts(lateMove.id).length === 2, 10_000);
+          expect(texts(lateMove.id)).toEqual(['pdfnot', readPdfCommand(lateMove.pdf, 'pdfnot', 'report.pdf', 'you')]);
+
           const asked = await send('pdfnot', GEMMA.name, 'ask');
           await quiet(asked);
           expect(texts(asked.id)).toEqual(['pdfnot']);
@@ -1399,7 +1429,8 @@ describe('Chat service — attachments', () => {
           await answered(wrongDenied, 'reject-once');
           expect(wrongDenied.page.ends()[0]).toMatchObject({ outcome: 'denied' });
           expect(texts(wrongDenied.id)).toEqual(['pdfwrong']);
-          for (const p of [skipped, auto, movedDown, asked, other, own, called, wrong, wrongDenied]) p.page.detach();
+          for (const p of [skipped, auto, movedDown, lateMove, asked, other, own, called, wrong, wrongDenied])
+            p.page.detach();
         },
         { endpointModels: [GEMMA, INKLING] },
       );

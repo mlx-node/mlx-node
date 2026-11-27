@@ -1692,13 +1692,14 @@ export class AgentHost {
    * Starts a turn. Synchronous checks throw (`conversation-busy`); loading a cold session, the guard and the model
    * call run in the background, and `done` resolves when the turn ended. Work: the turn's first prompt names its mode,
    * `plan` when `opts.plan`, else `agent`; an automatic `continue` names none, so the agent keeps the mode it has.
+   * `opts.sendable`, read in the tick the prompt would go: false ends the turn unsent, with no outcome.
    */
   startTurn(
     sessionId: string,
     text: string,
     load: LoadInput,
     attachments: readonly AttachmentInput[] = [],
-    opts: { plan?: boolean } = {},
+    opts: { plan?: boolean; sendable?: () => boolean } = {},
   ): { turnId: string; done: Promise<TurnResult> } {
     if (this.closed) throw new AgentHostError('agent-crashed');
     const existing = this.sessions.get(sessionId);
@@ -1738,7 +1739,7 @@ export class AgentHost {
     this.emitState();
     const meta: PromptMeta | undefined =
       this.mode === 'work' ? { mode: opts.plan === true ? 'plan' : 'agent' } : undefined;
-    const done = this.runTurn(session, turn, text, load, attachments, meta).then((ended) => {
+    const done = this.runTurn(session, turn, text, load, attachments, meta, opts.sendable).then((ended) => {
       const result = turn.model === null ? ended : { ...ended, model: turn.model };
       this.finishTurn(session, turn, result);
       return result;
@@ -3155,6 +3156,7 @@ export class AgentHost {
     load: LoadInput,
     attachments: readonly AttachmentInput[],
     meta: PromptMeta | undefined,
+    sendable?: () => boolean,
   ): Promise<TurnResult> {
     const aborted = new Promise<TurnResult>((resolve) => {
       turn.abort = resolve;
@@ -3209,6 +3211,7 @@ export class AgentHost {
     const ready = await Promise.race([prepare(), aborted]);
     if (!('process' in ready)) return ready;
     if (turn.recorded !== null) return unsent({ outcome: causeOutcome(turn.recorded) });
+    if (sendable?.() === false) return unsent({});
     const running = ready;
     // An agent that does not take embedded resources would drop the file text and the PDF notes.
     if (running.embeddedContext !== true && attachments.some((a) => a.kind === 'file' || a.kind === 'pdf')) {
