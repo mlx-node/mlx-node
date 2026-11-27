@@ -3,7 +3,9 @@ import { Writable } from 'node:stream';
 
 import type { ToolCallResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { nestStrayArguments, withNestedArguments } from '../../packages/server/src/mappers/tool-arguments.js';

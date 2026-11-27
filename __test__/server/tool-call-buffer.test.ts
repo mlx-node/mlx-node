@@ -1,4 +1,4 @@
-import { ToolCallTagBuffer } from '@mlx-node/lm';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tool-call-buffer';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { recoverSuppressedToolCallText } from '../../packages/server/src/mappers/anthropic-response.js';

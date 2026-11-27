@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! MLX_KQUANT_SMALL_M_BENCH=1 cargo test -p mlx-core --release \
-//!   --test kquant_small_m_bench -- --ignored --nocapture
+//!   --features e2e-tests --test kquant_small_m_bench -- --ignored --nocapture
 //! ```
 //!
 //! Bench-only knobs (the `#[ignore]` tests read them; nothing else does):

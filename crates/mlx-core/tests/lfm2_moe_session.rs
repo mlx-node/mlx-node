@@ -12,7 +12,7 @@
 //!
 //! ```shell
 //! MLX_TEST_LFM2_MOE_MODEL_PATH=./.cache/models/lfm2.5-8b-a1b-mlx-bf16 \
-//!     cargo test -p mlx-core --test lfm2_moe_session -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test lfm2_moe_session -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_LFM2_MOE_MODEL_PATH` the test early-returns and passes

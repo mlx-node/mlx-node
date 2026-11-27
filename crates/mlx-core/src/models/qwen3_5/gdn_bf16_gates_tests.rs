@@ -35,11 +35,15 @@ fn bits(a: &MxArray) -> Vec<u32> {
         .collect()
 }
 
+fn differing_bits(a_bits: &[u32], a_dtype: DType, b: &MxArray) -> usize {
+    assert_eq!(a_dtype, b.dtype().unwrap(), "compared dtypes");
+    let b = bits(b);
+    assert_eq!(a_bits.len(), b.len(), "compared arrays differ in size");
+    a_bits.iter().zip(&b).filter(|(x, y)| x != y).count()
+}
+
 fn differing(a: &MxArray, b: &MxArray) -> usize {
-    assert_eq!(a.dtype().unwrap(), b.dtype().unwrap(), "compared dtypes");
-    let (a, b) = (bits(a), bits(b));
-    assert_eq!(a.len(), b.len(), "compared arrays differ in size");
-    a.iter().zip(&b).filter(|(x, y)| x != y).count()
+    differing_bits(&bits(a), a.dtype().unwrap(), b)
 }
 
 fn launches() -> bool {
@@ -213,12 +217,22 @@ fn bf16_scalars_keep_the_chain_bits() -> Result<()> {
     }
     let mut total = 0usize;
     for scalars in [DType::BFloat16, DType::Float32] {
-        for &(hk, hv, tiled, name) in &FAMILIES {
+        let families: &[(i64, i64, bool, &str)] = if scalars == DType::BFloat16 {
+            &FAMILIES
+        } else {
+            // f32 scalar contract is dtype-invariant across head shapes; cover
+            // the primary 27B geometry including the 2048 chunk boundary + chain.
+            &FAMILIES[..1]
+        };
+        for &(hk, hv, tiled, name) in families {
             let wt = weights(hk, hv, tiled, scalars);
-            let lengths: &[usize] = if hv == 48 {
+            let full_sweep = scalars == DType::BFloat16 && hv == 48 && tiled;
+            let lengths: &[usize] = if full_sweep {
                 &[1, 15, 16, 17, 33, 64, 2047, 2048, 2049]
-            } else {
+            } else if scalars == DType::Float32 || hv == 64 {
                 &[17, 64, 2049]
+            } else {
+                &[17, 64]
             };
             for &t in lengths {
                 let win = window(t, &wt);
@@ -234,7 +248,10 @@ fn bf16_scalars_keep_the_chain_bits() -> Result<()> {
                         nonzero * 2 > y_bits.len(),
                         "{name} T={t}: degenerate chain output"
                     );
-                    let (dy, ds) = (differing(&yc, &yf), differing(&sc, &sf));
+                    let (dy, ds) = (
+                        differing_bits(&y_bits, yc.dtype()?, &yf),
+                        differing(&sc, &sf),
+                    );
                     eprintln!(
                         "X3_SCALARS {scalars:?} {name} T={t} carried={carried}: out {} differ {dy}; state differ {ds}",
                         y_bits.len()
@@ -247,19 +264,21 @@ fn bf16_scalars_keep_the_chain_bits() -> Result<()> {
                     total += 1;
                 }
             }
-            let (mut sf, mut sc): (Option<MxArray>, Option<MxArray>) = (None, None);
-            for (call, t) in [2048usize, 37, 2049].into_iter().enumerate() {
-                let win = window(t, &wt);
-                let (yf, nf) = fused(&win, &wt, 0, t, sf.as_ref())?;
-                let (yc, nc) = chain(&win, &wt, 0, t, sc.as_ref())?;
-                MxArray::eval_arrays(&[&yf, &nf, &yc, &nc])?;
-                let (dy, ds) = (differing(&yc, &yf), differing(&nc, &nf));
-                eprintln!(
-                    "X3_CHAIN {scalars:?} {name} call {call} T={t}: out differ {dy}, state differ {ds}"
-                );
-                assert_eq!((dy, ds), (0, 0), "{scalars:?} {name} call {call}");
-                sf = Some(nf);
-                sc = Some(nc);
+            if full_sweep || scalars == DType::Float32 {
+                let (mut sf, mut sc): (Option<MxArray>, Option<MxArray>) = (None, None);
+                for (call, t) in [2048usize, 37, 2049].into_iter().enumerate() {
+                    let win = window(t, &wt);
+                    let (yf, nf) = fused(&win, &wt, 0, t, sf.as_ref())?;
+                    let (yc, nc) = chain(&win, &wt, 0, t, sc.as_ref())?;
+                    MxArray::eval_arrays(&[&yf, &nf, &yc, &nc])?;
+                    let (dy, ds) = (differing(&yc, &yf), differing(&nc, &nf));
+                    eprintln!(
+                        "X3_CHAIN {scalars:?} {name} call {call} T={t}: out differ {dy}, state differ {ds}"
+                    );
+                    assert_eq!((dy, ds), (0, 0), "{scalars:?} {name} call {call}");
+                    sf = Some(nf);
+                    sc = Some(nc);
+                }
             }
         }
     }

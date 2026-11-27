@@ -8,7 +8,7 @@ edition = "2024"
 version = "0.0.0"
 
 [workspace.dependencies]
-cc = "1.4"
+cc = { version = "1.4", features = ["parallel"] }
 criterion = "0.8.2"
 cmake = "0.1.58"
 futures = "0.3.34"
@@ -64,9 +64,14 @@ codegen-units = 1
 # The test suite's cost is host-side f64 reference loops and synthetic weight
 # generation (K-quant parity gates, int8 SDPA references, retention
 # simulations), not GPU work: the MLX C++ side is always built Release. At
-# opt-level 0 those loops dominate CI (one unit test = 336 s; the K-quant
-# integration binaries = 92% of their job). Measured on the hot tests:
-# 255 s -> 34 s and 253 s -> 30 s for ~1.5x the mlx-core compile time.
-# Debug assertions and overflow checks stay on (inherited from `dev`).
+# opt-level 0 those loops dominate CI; at opt-level 2 compiling mlx-core's
+# ~858k LOC (`--lib` incl. ~391k test LOC) burns ~1017 CPU-s (~18-25 min on a
+# 3-vCPU macOS runner). Using opt-level 1 for workspace crates while keeping
+# cached third-party dependencies at opt-level 2 cuts mlx-core --lib compile
+# CPU time nearly in half (1017s -> 531s) for only a few seconds on the trimmed
+# hot tests. Debug assertions and overflow checks stay on (inherited from `dev`).
 [profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
 opt-level = 2

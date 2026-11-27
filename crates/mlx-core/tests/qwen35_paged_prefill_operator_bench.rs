@@ -14,7 +14,7 @@
 //! MLX_QWEN35_PREFILL_BENCH_EXPECT=fused \
 //! MLX_QWEN35_PREFILL_BENCH_WARMUP=1 \
 //! MLX_QWEN35_PREFILL_BENCH_ITERS=3 \
-//! cargo test -p mlx-core --release --test qwen35_paged_prefill_operator_bench \
+//! cargo test -p mlx-core --release --features e2e-tests --test qwen35_paged_prefill_operator_bench \
 //!   qwen35_paged_prefill_operator_benchmark -- --ignored --exact --nocapture
 //! ```
 //!

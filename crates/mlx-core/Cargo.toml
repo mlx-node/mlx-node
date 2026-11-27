@@ -6,6 +6,14 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Real-checkpoint parity/session gates, hardware-specific golden gates, and
+# micro-benchmarks live in `tests/*.rs` and are gated behind `e2e-tests` so
+# `cargo test --workspace --test '*'` skips compiling and linking ~52 ignored
+# binaries on PR runs. Pass `--features e2e-tests` (or `--all-features`) to
+# build and run them.
+e2e-tests = []
+
 [dependencies]
 base64-simd = { workspace = true }
 futures = { workspace = true }
@@ -72,3 +80,207 @@ windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] 
 [[bench]]
 name = "attention_vjp_bench"
 harness = false
+
+[[test]]
+name = "affine_mixed_golden_gate"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "concurrent_batched_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "dflash2_replay_offline"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_assistant"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_grouped_cold_tier_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_paged_vs_flat_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_paged_vs_flat_vlm_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_session"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "gemma4_vl_image_chat"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "head_fp32"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "kquant_golden_gate"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "kquant_moe_bench"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "kquant_realdata_llamacpp_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "kquant_small_m_bench"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "kquant_tiled_bench"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "lfm2_cold_tier_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "lfm2_concurrent_batched_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "lfm2_moe_session"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "lfm2_session"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "muse_glimmer_cold_tier_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "nemotron_h_concurrent_batched_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "nemotron_h_paged_vs_flat_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "p2_paged_thinking_honors_enable"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "paged_prefill_route_bench"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "persistent_workspace"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "portable_d256_sdpa"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen35_d256_sdpa"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen35_paged_prefill_operator_bench"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_concurrent_batched_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_delta_chat"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_chunked_prefill"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_concurrent_batched_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_paged_mtp_midcycle"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_paged_mtp_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_reset_purge"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_session"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_moe_vl_image_chat"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_paged_mtp_midcycle"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_session"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_state_tier_restart"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_sym8_smoke"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_5_vl_image_chat"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_8_dflash2"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_cold_tier_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_paged_vs_flat_parity"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "qwen3_prefill_cancel"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "register_projection"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "sg8_split"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "sparse_input_budget"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "staged_spread"
+required-features = ["e2e-tests"]
+
+[[test]]
+name = "symmetric_import_gemma4_qat"
+required-features = ["e2e-tests"]

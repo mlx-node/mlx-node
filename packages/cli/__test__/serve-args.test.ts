@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { parseServeArgs } from '../src/commands/serve.js';
+import { parseServeArgs } from '../src/commands/serve-args.js';
 
 describe('mlx serve cache flags', () => {
   it('defaults to an automatic tier and leaves the switch to the host default (on)', () => {

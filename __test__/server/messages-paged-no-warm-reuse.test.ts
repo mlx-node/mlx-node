@@ -24,6 +24,8 @@ import type { ChatResult, ToolCallResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
@@ -335,7 +337,7 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // Pre-seed a warm entry under an arbitrary id with
     // `instructions === sysA`. We import `ChatSession` lazily to
     // avoid the heavyweight module-level import in the test header.
-    const { ChatSession } = await import('@mlx-node/lm');
+    const { ChatSession } = await import('@mlx-node/lm/chat-session');
     const preseedSession = new ChatSession(mockModel);
     sessionReg.adopt('resp_pre_seed', preseedSession, 'sysA', null);
     expect(sessionReg.size).toBe(1);

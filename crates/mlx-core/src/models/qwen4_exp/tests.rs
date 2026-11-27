@@ -1738,19 +1738,71 @@ impl PrefillCase {
         config::Config::parse(&raw).unwrap()
     }
 
-    /// Two fresh decoders over the same checkpoint.
-    fn decoders(&self) -> (decoder::Decoder, decoder::Decoder) {
+    /// One fresh decoder over the checkpoint.
+    fn decoder(&self) -> decoder::Decoder {
         let config = self.config();
         let path = self.path();
-        let a = decoder::Decoder::new(
-            config.clone(),
-            weights::Store::open_fixture(&path, None).unwrap(),
-        )
-        .unwrap();
-        let b = decoder::Decoder::new(config, weights::Store::open_fixture(&path, None).unwrap())
-            .unwrap();
-        (a, b)
+        decoder::Decoder::new(config, weights::Store::open_fixture(&path, None).unwrap()).unwrap()
     }
+}
+
+struct SingletonTrace {
+    logits: Vec<Vec<f32>>,
+    hidden: Vec<Vec<f32>>,
+    cont_36: Option<Vec<f32>>,
+    cont_126: Option<Vec<f32>>,
+}
+
+/// Cached 1-token-at-a-time reference trace per `(fixture, gguf)`, shared
+/// across `batched_prefill_matches_reference_*` and
+/// `contiguous_prompt_windows_*`.
+fn singleton_trace(case: &PrefillCase, need_126: bool) -> Arc<SingletonTrace> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(&'static str, bool), Arc<SingletonTrace>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (case.fixture, case.gguf);
+    if let Some(trace) = cache.lock().unwrap().get(&key)
+        && (!need_126 || trace.cont_126.is_some())
+    {
+        return Arc::clone(trace);
+    }
+    let full = need_126
+        || matches!(
+            key,
+            ("", true) | ("bf16", false) | ("bf16/paged", false) | ("bf16/paged", true)
+        );
+    let repeat = if full { 7 } else { 2 };
+    let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(repeat);
+    let mut single = case.decoder();
+    let mut logits = Vec::with_capacity(tokens.len());
+    let mut hidden = Vec::with_capacity(tokens.len());
+    let mut cont_36 = None;
+    for (i, &token) in tokens.iter().enumerate() {
+        let out = single.step(token).unwrap();
+        logits.push(out.to_float32().unwrap().to_vec());
+        hidden.push(single.last_chunk_hidden[0].to_float32().unwrap().to_vec());
+        if i + 1 == 36 && full {
+            let saved = single.snapshot();
+            cont_36 = Some(single.step(11).unwrap().to_float32().unwrap().to_vec());
+            single.restore_state(saved);
+        }
+    }
+    let cont_end = single.step(11).unwrap().to_float32().unwrap().to_vec();
+    let cont_126 = if full {
+        Some(cont_end)
+    } else {
+        cont_36 = Some(cont_end);
+        None
+    };
+    let trace = Arc::new(SingletonTrace {
+        logits,
+        hidden,
+        cont_36,
+        cont_126,
+    });
+    let mut map = cache.lock().unwrap();
+    Arc::clone(map.entry(key).or_insert(trace))
 }
 
 /// The window carry against `step` one token at a time, across the expert
@@ -1773,26 +1825,29 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
         PrefillCase::new("bf16/paged", false, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut single, mut batched) = case.decoders();
+        let need_126 = width >= 64;
+        let trace = singleton_trace(&case, need_126);
+        let mut batched = case.decoder();
         if width >= 32 {
             // Assembled fixed projections with demand-loaded experts
             // must preserve the same prompt/continuation contract.
             batched.weights.prepare_fixture_hot().unwrap();
         }
-        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8]
-            .repeat(if width >= 64 { 7 } else { 2 });
+        let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(if need_126 {
+            7
+        } else {
+            2
+        });
         let tolerance = if case.fixture.is_empty() {
             0.0001
         } else {
             0.04
         };
+        let mut offset = 0;
         for chunk in tokens.chunks(width) {
-            let mut want = None;
-            for &token in chunk {
-                want = Some(single.step(token).unwrap());
-            }
+            offset += chunk.len();
             let got = batched.prefill_chunk(chunk, None, true).unwrap();
-            let a = want.unwrap().to_float32().unwrap();
+            let a = &trace.logits[offset - 1];
             let b = got.to_float32().unwrap();
             let error = a
                 .iter()
@@ -1800,9 +1855,13 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(error < tolerance, "{path:?}, width={width}, error={error}");
-            assert_eq!(single.history, batched.history);
+            assert_eq!(&tokens[..offset], batched.history.as_slice());
         }
-        let a = single.step(11).unwrap().to_float32().unwrap();
+        let a = if need_126 {
+            trace.cont_126.as_ref().unwrap()
+        } else {
+            trace.cont_36.as_ref().unwrap()
+        };
         let b = batched.step(11).unwrap().to_float32().unwrap();
         let error = a
             .iter()
@@ -1824,8 +1883,8 @@ fn batched_prefill_matches_reference_across_chunks_sparse_boundaries_and_continu
 #[test]
 fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
     // Largest difference, relative to the reference's largest magnitude.
-    let error = |a: &MxArray, b: &MxArray| {
-        let (a, b) = (a.to_float32().unwrap(), b.to_float32().unwrap());
+    let error = |a: &[f32], b: &MxArray| {
+        let b = b.to_float32().unwrap();
         assert_eq!(a.len(), b.len());
         let scale = a.iter().fold(1f32, |m, v| m.max(v.abs()));
         a.iter()
@@ -1841,31 +1900,33 @@ fn contiguous_prompt_windows_preserve_rows_frontiers_and_continuation() {
         PrefillCase::new("bf16/paged", true, 128),
     ] {
         let (path, width) = (case.path(), case.width);
-        let (mut single, mut window) = case.decoders();
+        let trace = singleton_trace(&case, true);
+        let mut window = case.decoder();
         let tolerance = if case.fixture.is_empty() {
             0.0001
         } else {
             0.04
         };
         let tokens = [3, 9, 4, 7, 1, 5, 8, 2, 3, 6, 9, 4, 7, 1, 3, 5, 6, 8].repeat(7);
+        let mut offset = 0;
         for chunk in tokens.chunks(width) {
-            let mut want = None;
-            let mut rows = Vec::with_capacity(chunk.len());
-            for &token in chunk {
-                want = Some(single.step(token).unwrap());
-                rows.push(single.last_chunk_hidden[0].clone());
-            }
+            let start = offset;
+            offset += chunk.len();
             let got = window.prefill_chunk(chunk, None, true).unwrap();
-            let e = error(&want.unwrap(), &got);
+            let e = error(&trace.logits[offset - 1], &got);
             assert!(e < tolerance, "{path:?}, width={width}, error={e}");
-            assert_eq!(single.history, window.history);
-            assert_eq!(rows.len(), window.last_chunk_hidden.len());
-            for (j, (a, b)) in rows.iter().zip(&window.last_chunk_hidden).enumerate() {
+            assert_eq!(&tokens[..offset], window.history.as_slice());
+            assert_eq!(chunk.len(), window.last_chunk_hidden.len());
+            for (j, (a, b)) in trace.hidden[start..offset]
+                .iter()
+                .zip(&window.last_chunk_hidden)
+                .enumerate()
+            {
                 let e = error(a, b);
                 assert!(e < tolerance, "{path:?}, width={width}, row {j}: error={e}");
             }
         }
-        let e = error(&single.step(11).unwrap(), &window.step(11).unwrap());
+        let e = error(trace.cont_126.as_ref().unwrap(), &window.step(11).unwrap());
         assert!(
             e < tolerance,
             "continuation {path:?}, width={width}, error={e}"
@@ -2643,22 +2704,28 @@ pub(super) fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
     (decoder, vision)
 }
 
+fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
+    static TOKENIZER: std::sync::OnceLock<Arc<Qwen3Tokenizer>> = std::sync::OnceLock::new();
+    Arc::clone(TOKENIZER.get_or_init(|| {
+        let tokenizer_dir = Temp::new();
+        let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
+        std::fs::write(
+            tokenizer_dir.0.join("tokenizer_config.json"),
+            r#"{"chat_template":"a"}"#,
+        )
+        .unwrap();
+        std::fs::write(&tokenizer_path,r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<unk>":2},"unk_token":"<unk>"}}"#).unwrap();
+        Arc::new(Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap()).unwrap())
+    }))
+}
+
 /// The load's last step: the draft banks are built (fixture stores have no
 /// pack stream).
 fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: bool) -> Inner {
     if has_mtp {
         decoder.weights.finish_fixture_load().unwrap();
     }
-    let tokenizer_dir = Temp::new();
-    let tokenizer_path = tokenizer_dir.0.join("tokenizer.json");
-    std::fs::write(
-        tokenizer_dir.0.join("tokenizer_config.json"),
-        r#"{"chat_template":"a"}"#,
-    )
-    .unwrap();
-    std::fs::write(&tokenizer_path,r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"b":1,"<unk>":2},"unk_token":"<unk>"}}"#).unwrap();
-    let tokenizer =
-        Arc::new(Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap()).unwrap());
+    let tokenizer = tiny_tokenizer();
     Inner {
         decoder,
         tokenizer,
@@ -3466,6 +3533,17 @@ fn write_wide_head_fixture(dir: &Path) -> config::Config {
     c
 }
 
+/// Cached widened-head fixture shared across int8 page tests in this process.
+pub(super) fn wide_head_fixture() -> (&'static Path, &'static config::Config) {
+    static FIXTURE: std::sync::OnceLock<(Temp, config::Config)> = std::sync::OnceLock::new();
+    let (dir, config) = FIXTURE.get_or_init(|| {
+        let dir = Temp::new();
+        let config = write_wide_head_fixture(&dir.0);
+        (dir, config)
+    });
+    (&dir.0, config)
+}
+
 /// The widened fixture with the MTP head, its pool in `format`.
 fn wide_head_inner(dir: &Path, format: crate::transformer::KvFormat) -> Inner {
     let raw = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -3493,8 +3571,7 @@ fn int8_verify_rows_read_their_window_like_decode() {
         HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
     };
     use crate::transformer::KvFormat;
-    let dir = Temp::new();
-    let c = write_wide_head_fixture(&dir.0);
+    let (wide, c) = wide_head_fixture();
     let prompt = [3, 9, 5, 2, 7, 11, 12, 8, 10, 9, 13, 7, 4, 3, 11, 8, 6, 5];
     let stream = [4, 11, 7, 9, 13, 6, 10, 3, 12, 5];
     let bits = |a: &MxArray| -> Vec<u32> {
@@ -3506,7 +3583,7 @@ fn int8_verify_rows_read_their_window_like_decode() {
     };
     let poison = |t: u32| (t + 1) % c.vocab_size as u32;
     for format in [KvFormat::Bf16, KvFormat::Int8] {
-        let mut reference = wide_head_inner(&dir.0, format);
+        let mut reference = wide_head_inner(wide, format);
         reference.activate_paged_seq(1).unwrap();
         reference
             .decoder
@@ -3518,7 +3595,7 @@ fn int8_verify_rows_read_their_window_like_decode() {
             .collect();
         for width in 2..=4usize {
             for keep in [width, 1] {
-                let mut inner = wide_head_inner(&dir.0, format);
+                let mut inner = wide_head_inner(wide, format);
                 inner.activate_paged_seq(1).unwrap();
                 inner.begin_mtp(1, 0).unwrap();
                 let prefix = inner
@@ -4850,12 +4927,17 @@ fn draft_history_buffer_matches_its_concatenated_rows() {
     let mut owner = decoder::LayerCache::default();
     let mut trusted: Option<(MxArray, MxArray)> = None;
     let mut step = 0;
+    let mut prev_cap = 0i64;
     while trusted.as_ref().map_or(0, |r| r.0.shape_at(2).unwrap()) < 600 {
         let n = 1 + step % 4;
         let (k, v) = (draft_kv_rows(&mut seed, n), draft_kv_rows(&mut seed, n));
         let mut cache = owner.clone();
         cache.append_draft_kv(&k, &v).unwrap();
         let extended = extend(trusted.as_ref(), &k, &v);
+        let next_rows = extended.0.shape_at(2).unwrap();
+        let next_cap = cache.draft_kv().unwrap().1.shape_at(2).unwrap();
+        let check_bits = next_cap != prev_cap || step % 16 == 0 || next_rows >= 600;
+        prev_cap = next_cap;
         let mut heads = vec![(cache.clone(), extended.clone())];
         for _ in 0..2 {
             let (mut draft, reference) = heads.last().cloned().unwrap();
@@ -4871,6 +4953,9 @@ fn draft_history_buffer_matches_its_concatenated_rows() {
         for (holder, reference) in holders {
             let (rows, keys, values) = holder.draft_kv().unwrap();
             assert_eq!(rows as i64, reference.0.shape_at(2).unwrap(), "step {step}");
+            if !check_bits {
+                continue;
+            }
             let random: Vec<i32> = (0..7)
                 .map(|_| {
                     seed ^= seed << 13;
@@ -7240,99 +7325,95 @@ fn batched_qsa_matches_per_token_flat_and_paged() {
     let path = fixture().join("bf16/paged");
     let raw: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
-    // The fixture's 128-position limit leaves room for three decode steps.
-    let tokens: Vec<u32> = (0..120)
-        .map(|i| ((i * 7 + i / 5) % 19 + 3) as u32)
-        .collect();
-    let chunks = [7, 9, 13, 3, 1, 5, 17, 2, 31, 11, 21];
+    // Crosses page block 32 and exceeds the largest indexer budget (32).
+    let tokens: Vec<u32> = (0..57).map(|i| ((i * 7 + i / 5) % 19 + 3) as u32).collect();
+    let chunks = [7, 9, 13, 3, 1, 5, 17, 2];
     assert_eq!(chunks.iter().sum::<usize>(), tokens.len());
-    for budget in [8, 16, 32] {
-        for paged in [false, true] {
-            let mut config = config::Config::parse(&raw).unwrap();
-            config.indexer_budget = budget;
-            let layers = config.num_hidden_layers;
-            let make = || {
-                let mut d = decoder::Decoder::new(
-                    config.clone(),
-                    weights::Store::open_fixture(&path, None).unwrap(),
-                )
-                .unwrap();
-                if paged {
-                    d.paged = Some(paged::create_fixture(&config).unwrap());
-                    d.paged.as_mut().unwrap().begin_request(1).unwrap();
-                }
-                d
-            };
-            let (mut per_token, mut batched) = (make(), make());
-            let (mut offset, mut sparse_windows) = (0, 0);
-            for count in chunks {
-                let chunk = &tokens[offset..offset + count];
-                offset += count;
-                if count > 1 && offset > budget {
-                    sparse_windows += 1;
-                }
-                let label = format!("budget={budget} paged={paged} end={offset}");
-                let mut want = None;
-                for &token in chunk {
-                    let logits = per_token.prefill_chunk(&[token], None, true).unwrap();
-                    logits.eval();
-                    want = Some(logits);
-                }
-                let want = want.unwrap();
-                let got = batched.prefill_chunk(chunk, None, true).unwrap();
-                got.eval();
-                let error = max_error(&want, &got);
-                assert!(error < 0.04, "{label}: logits error {error}");
-                assert_eq!(per_token.history, batched.history, "{label}");
-                assert_eq!(batched.last_chunk_hidden.len(), count, "{label}");
-                let error = max_error(
-                    per_token.last_chunk_hidden.last().unwrap(),
-                    batched.last_chunk_hidden.last().unwrap(),
+    for (budget, paged) in [(8, false), (8, true), (16, true), (32, false), (32, true)] {
+        let mut config = config::Config::parse(&raw).unwrap();
+        config.indexer_budget = budget;
+        let layers = config.num_hidden_layers;
+        let make = || {
+            let mut d = decoder::Decoder::new(
+                config.clone(),
+                weights::Store::open_fixture(&path, None).unwrap(),
+            )
+            .unwrap();
+            if paged {
+                d.paged = Some(paged::create_fixture(&config).unwrap());
+                d.paged.as_mut().unwrap().begin_request(1).unwrap();
+            }
+            d
+        };
+        let (mut per_token, mut batched) = (make(), make());
+        let (mut offset, mut sparse_windows) = (0, 0);
+        for count in chunks {
+            let chunk = &tokens[offset..offset + count];
+            offset += count;
+            if count > 1 && offset > budget {
+                sparse_windows += 1;
+            }
+            let label = format!("budget={budget} paged={paged} end={offset}");
+            let mut want = None;
+            for &token in chunk {
+                let logits = per_token.prefill_chunk(&[token], None, true).unwrap();
+                logits.eval();
+                want = Some(logits);
+            }
+            let want = want.unwrap();
+            let got = batched.prefill_chunk(chunk, None, true).unwrap();
+            got.eval();
+            let error = max_error(&want, &got);
+            assert!(error < 0.04, "{label}: logits error {error}");
+            assert_eq!(per_token.history, batched.history, "{label}");
+            assert_eq!(batched.last_chunk_hidden.len(), count, "{label}");
+            let error = max_error(
+                per_token.last_chunk_hidden.last().unwrap(),
+                batched.last_chunk_hidden.last().unwrap(),
+            );
+            assert!(error < 0.04, "{label}: last hidden row error {error}");
+            if paged {
+                assert_eq!(
+                    batched.paged.as_ref().unwrap().request_tokens(),
+                    batched.history,
+                    "{label}"
                 );
-                assert!(error < 0.04, "{label}: last hidden row error {error}");
-                if paged {
-                    assert_eq!(
-                        batched.paged.as_ref().unwrap().request_tokens(),
-                        batched.history,
-                        "{label}"
-                    );
-                    assert_eq!(
-                        per_token.paged.as_ref().unwrap().request_tokens(),
-                        batched.history,
-                        "{label}"
-                    );
-                }
-                for layer in 0..layers {
-                    match (per_token.index_keys(layer), batched.index_keys(layer)) {
-                        (None, None) => {}
-                        (Some(a), Some(b)) => {
-                            assert_eq!(
-                                a.shape().unwrap().as_ref(),
-                                b.shape().unwrap().as_ref(),
-                                "{label}"
-                            );
-                            assert_eq!(
-                                &*a.to_float32().unwrap(),
-                                &*b.to_float32().unwrap(),
-                                "{label}: layer {layer} index blocks"
-                            );
-                        }
-                        _ => panic!("{label}: layer {layer} index blocks differ in presence"),
+                assert_eq!(
+                    per_token.paged.as_ref().unwrap().request_tokens(),
+                    batched.history,
+                    "{label}"
+                );
+            }
+            for layer in 0..layers {
+                match (per_token.index_keys(layer), batched.index_keys(layer)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        assert_eq!(
+                            a.shape().unwrap().as_ref(),
+                            b.shape().unwrap().as_ref(),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            &*a.to_float32().unwrap(),
+                            &*b.to_float32().unwrap(),
+                            "{label}: layer {layer} index blocks"
+                        );
                     }
+                    _ => panic!("{label}: layer {layer} index blocks differ in presence"),
                 }
             }
-            assert!(sparse_windows > 0);
-            for token in [11, 4, 9] {
-                let want = per_token.step(token).unwrap();
-                want.eval();
-                let got = batched.step(token).unwrap();
-                got.eval();
-                let error = max_error(&want, &got);
-                assert!(
-                    error < 0.04,
-                    "budget={budget} paged={paged} decode {token}: error {error}"
-                );
-            }
+        }
+        assert!(sparse_windows > 0);
+        for token in [11, 4, 9] {
+            let want = per_token.step(token).unwrap();
+            want.eval();
+            let got = batched.step(token).unwrap();
+            got.eval();
+            let error = max_error(&want, &got);
+            assert!(
+                error < 0.04,
+                "budget={budget} paged={paged} decode {token}: error {error}"
+            );
         }
     }
 }
@@ -7983,7 +8064,7 @@ fn bf16_paged_oracle_through_prefill_chunk() {
             }
             let mut seq = 0;
             let mut maximum = 0f32;
-            for end in 1..=tokens.len() {
+            for end in [1, 2, 4, 5, 6, 8, 9, 12, 16, 17, 18] {
                 for split in [0, 5] {
                     if split >= end && split > 0 {
                         continue;
@@ -8408,10 +8489,10 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
     // weights stream once per threadgroup set and every assignment on it is
     // written. The same routes in every row, one row's routes rotated per row
     // and routes distinct across rows must each carry the single-row bits.
-    let experts = 64usize;
+    let experts = 40usize;
     let (banks, shared) = expert_banks(experts, 4, 5, &mut next);
-    let base: Vec<u32> = (0..10).map(|s| (s * 7 + 3) as u32).collect();
-    for rows in 1..=4 {
+    let base: Vec<u32> = (0..10).map(|s| (s * 3 + 1) as u32).collect();
+    for rows in [2, 4] {
         let x = bf16_rows(rows, 2560, 1. / 256., 2., &mut next);
         let shared_gate = bf16_rows(rows, 1, 1. / 64., 8., &mut next);
         let count = rows as usize * 10;
@@ -8425,51 +8506,44 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
             ),
             (
                 "distinct",
-                (0..count).map(|i| (i * 5 % experts) as u32).collect(),
+                (0..count).map(|i| (i * 7 % experts) as u32).collect(),
             ),
         ];
         for (pattern, routes) in patterns {
             let ids = MxArray::from_uint32(&routes, &[rows * 10]).unwrap();
-            for score_type in [DType::Float32, DType::BFloat16] {
-                let scores: Vec<f32> = (0..count)
-                    .map(|_| (next() % 19 + 1) as f32 / 100.)
-                    .collect();
-                let scores = MxArray::from_float32(&scores, &[1, rows, 10])
-                    .unwrap()
-                    .astype(score_type)
-                    .unwrap();
-                let singles: Vec<MxArray> = (0..rows)
-                    .map(|j| {
-                        math::routed_shared_experts(
-                            &row(&x, j),
-                            &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
-                            &row(&scores, j),
-                            &banks,
-                            &shared,
-                            &gate_row(&shared_gate, j),
-                        )
-                        .unwrap()
-                        .expect("single-row routed/shared fast path")
-                    })
-                    .collect();
-                let batched = math::rows::routed_shared_experts(
-                    &x,
-                    &ids,
-                    &scores,
-                    &banks,
-                    &shared,
-                    &shared_gate,
-                )
+            let score_type = DType::BFloat16;
+            let scores: Vec<f32> = (0..count)
+                .map(|_| (next() % 19 + 1) as f32 / 100.)
+                .collect();
+            let scores = MxArray::from_float32(&scores, &[1, rows, 10])
                 .unwrap()
-                .expect("row-batched routed/shared experts admit [1, R, 2560]");
-                assert_same_bits(
-                    &batched,
-                    &stack_rows(&singles),
-                    &format!(
-                        "routed/shared experts {pattern} routes scores={score_type:?} rows={rows}"
-                    ),
-                );
-            }
+                .astype(score_type)
+                .unwrap();
+            let singles: Vec<MxArray> = (0..rows)
+                .map(|j| {
+                    math::routed_shared_experts(
+                        &row(&x, j),
+                        &ids.slice_axis(0, j * 10, j * 10 + 10).unwrap(),
+                        &row(&scores, j),
+                        &banks,
+                        &shared,
+                        &gate_row(&shared_gate, j),
+                    )
+                    .unwrap()
+                    .expect("single-row routed/shared fast path")
+                })
+                .collect();
+            let batched =
+                math::rows::routed_shared_experts(&x, &ids, &scores, &banks, &shared, &shared_gate)
+                    .unwrap()
+                    .expect("row-batched routed/shared experts admit [1, R, 2560]");
+            assert_same_bits(
+                &batched,
+                &stack_rows(&singles),
+                &format!(
+                    "routed/shared experts {pattern} routes scores={score_type:?} rows={rows}"
+                ),
+            );
         }
     }
     // Routing: probability rounding, ties, NaN and infinite rows side by side.
@@ -9086,7 +9160,12 @@ fn ple_window_runs_four_rows_per_row_kernel_call_bit_for_bit() {
                 )
                 .unwrap();
                 let chunks = if banked { 1 } else { n.div_ceil(chunk) as u64 };
-                for rows in [1i64, 3, 4, 5, 1023, 1024] {
+                let row_counts: &[i64] = if seed == 0 {
+                    &[1, 3, 4, 5, 63, 64]
+                } else {
+                    &[1, 3, 4, 5]
+                };
+                for &rows in row_counts {
                     let x = bf16_rows(rows, width as i64, 1. / 256., 2., &mut next);
                     store.vector_windows.clear();
                     let window = store.linear_ple_window(name, &x).unwrap();

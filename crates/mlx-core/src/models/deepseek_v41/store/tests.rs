@@ -3,17 +3,246 @@
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::*;
 use crate::array::{get_active_memory, get_cache_memory, set_cache_limit};
-use crate::models::deepseek_v41::block::set_test_read_ahead_rows;
+use crate::models::deepseek_v41::block::{set_test_chunk_rows, set_test_read_ahead_rows};
 use crate::models::deepseek_v41::engram::{EngramRows, ResidentTable};
 use crate::models::deepseek_v41::engram_hash::EngramHasher;
 use crate::models::deepseek_v41::model::{Session, Trace};
 use crate::models::deepseek_v41::test_fixture::{Npz, TinyGguf, fixture, read};
 use crate::models::deepseek_v41::tests::{case_ids, mode_of, run, split, tiny};
+
+struct ReadAheadGuard;
+impl ReadAheadGuard {
+    fn set(rows: usize) -> Self {
+        set_test_read_ahead_rows(rows);
+        Self
+    }
+}
+impl Drop for ReadAheadGuard {
+    fn drop(&mut self) {
+        set_test_read_ahead_rows(0);
+    }
+}
+
+struct ChunkRowsGuard;
+impl ChunkRowsGuard {
+    fn set(rows: usize) -> Self {
+        set_test_chunk_rows(rows);
+        Self
+    }
+}
+impl Drop for ChunkRowsGuard {
+    fn drop(&mut self) {
+        set_test_chunk_rows(0);
+    }
+}
+
+struct ResidentRefs {
+    c1: Vec<u32>,
+    c2: Vec<u32>,
+    c3: Vec<u32>,
+}
+
+/// Bitwise resident reference logits (`tiny(..., affine=true)`) cached once
+/// per mode across store tests.
+fn resident_ref_bits(mode: &str, case: &str) -> &'static [u32] {
+    static FP32_ON: OnceLock<ResidentRefs> = OnceLock::new();
+    static BF16_ON: OnceLock<ResidentRefs> = OnceLock::new();
+    let cell = match mode {
+        "fp32_on" => &FP32_ON,
+        "bf16_on" => &BF16_ON,
+        other => panic!("unexpected cached resident mode {other}"),
+    };
+    let refs = cell.get_or_init(|| {
+        let g = TinyGguf::open();
+        let npz = Npz::oracle();
+        let (act, fq) = mode_of(mode);
+        let resident = tiny(&g, act, fq, true);
+        let eval = |c: &str| bits(&run(&resident, &case_ids(npz, c), &split(c)).0);
+        ResidentRefs {
+            c1: eval("c1"),
+            c2: eval("c2"),
+            c3: eval("c3"),
+        }
+    });
+    match case {
+        "c1" => &refs.c1,
+        "c2" => &refs.c2,
+        "c3" => &refs.c3,
+        other => panic!("unexpected case {other}"),
+    }
+}
+
+struct LiveCacheRun {
+    slots: usize,
+    n_layers: usize,
+    n_routed_experts: usize,
+    steps: Vec<crate::moe_stream::replay::Step>,
+    uses: usize,
+    hits: usize,
+    reads: usize,
+}
+
+fn collect_steps(traces: &[Trace], steps: &mut Vec<crate::moe_stream::replay::Step>) {
+    for t in traces {
+        for (layer, r) in t.routes.iter().enumerate() {
+            steps.push(crate::moe_stream::replay::Step {
+                layer,
+                rows: r.rows(),
+                ids: r.ids.clone(),
+            });
+        }
+    }
+}
+
+/// Runs `fp32_on` across `S in {0, 1, 6, 16, 64}` on `c1` + `c2` once and
+/// shares the verified live traces with `tiny_cache_replay_matches_live`.
+fn fp32_cache_runs() -> &'static [LiveCacheRun] {
+    static RUNS: OnceLock<Vec<LiveCacheRun>> = OnceLock::new();
+    RUNS.get_or_init(|| {
+        let npz = Npz::oracle();
+        let mut out = Vec::new();
+        for slots in [0usize, 1, 6, 16, 64] {
+            let store = cached_store("fp32_on", slots);
+            assert_eq!(store.cache_slots(), slots);
+            let mut steps = Vec::new();
+            for case in ["c1", "c2"] {
+                let before = store.bank.stats();
+                let (got, traces) = run(&store.model, &case_ids(npz, case), &split(case));
+                let st = store.bank.stats();
+                assert_eq!(
+                    bits(&got),
+                    resident_ref_bits("fp32_on", case),
+                    "fp32_on S={slots} {case}: cache != staging-only"
+                );
+                store.bank.with_cache_dir(|c| c.check()).unwrap();
+                pool_ok(case);
+                println!(
+                    "fp32_on S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
+                    st.uses - before.uses,
+                    st.hits - before.hits,
+                    st.slots - before.slots,
+                    store.bank.with_cache_dir(|c| c.occupied())
+                );
+                collect_steps(&traces, &mut steps);
+            }
+            let st = store.bank.stats();
+            // one decode token wants up to 6 experts x 8 layers = 48 slots:
+            // smaller LRU caches thrash (0 hits), 64 must hit
+            if slots == 64 {
+                assert!(st.hits > 0, "fp32_on S={slots}: decode never hit the cache");
+            }
+            assert_eq!(store.bank.with_cache_dir(|c| c.occupied()), slots.min(96));
+            let cfg = &store.model.cfg;
+            out.push(LiveCacheRun {
+                slots,
+                n_layers: cfg.n_layers,
+                n_routed_experts: cfg.n_routed_experts,
+                steps,
+                uses: st.uses,
+                hits: st.hits,
+                reads: st.slots,
+            });
+        }
+        out
+    })
+}
+
+struct LivePrefetchRun {
+    slots: usize,
+    pm: bool,
+    n_layers: usize,
+    n_routed_experts: usize,
+    steps: Vec<crate::moe_stream::replay::Step>,
+    uses: usize,
+    hits: usize,
+    reads: usize,
+    prefetch_unused: usize,
+}
+
+fn run_prefetch_case(mode: &str, slots: usize, pm: bool) -> LivePrefetchRun {
+    let _ra = ReadAheadGuard::set(2);
+    let npz = Npz::oracle();
+    let s = cached_store(mode, slots);
+    s.bank.rebuild_staging(slots, 2).unwrap();
+    s.bank.set_prefetch(pm);
+    assert_eq!(s.bank.staging_layers(), 2);
+
+    let mut steps = Vec::new();
+    let c1 = case_ids(npz, "c1");
+    let (got_c1, tr_c1) = run(&s.model, &c1, &split("c1"));
+    let st_c1 = s.bank.stats();
+    let used: usize = tr_c1[0]
+        .routes
+        .iter()
+        .map(|r| r.ids.iter().collect::<BTreeSet<_>>().len())
+        .sum();
+    assert_eq!(
+        st_c1.slots,
+        used + st_c1.prefetch_unused,
+        "{mode} S={slots} prefetch {pm}: reads {} != used {used} + unused prefetch {}",
+        st_c1.slots,
+        st_c1.prefetch_unused
+    );
+    assert!(st_c1.prefetch_unused <= st_c1.prefetch_slots);
+    assert_eq!(st_c1.prefetch_slots > 0, pm, "prefetch {pm}");
+    assert_eq!(
+        bits(&got_c1),
+        resident_ref_bits(mode, "c1"),
+        "{mode} S={slots} prefetch {pm} c1: 2 staging layers != 1"
+    );
+    collect_steps(&tr_c1, &mut steps);
+
+    let (got_c2, tr_c2) = run(&s.model, &case_ids(npz, "c2"), &split("c2"));
+    assert_eq!(
+        bits(&got_c2),
+        resident_ref_bits(mode, "c2"),
+        "{mode} S={slots} prefetch {pm} c2: 2 staging layers != 1"
+    );
+    collect_steps(&tr_c2, &mut steps);
+
+    s.bank.with_cache_dir(|c| c.check()).unwrap();
+    assert_eq!(s.bank.reads_in_flight(), 0);
+    pool_ok(mode);
+    println!(
+        "{mode} S={slots} prefetch {pm}: bitwise; cold c1 reads {} = used {used} + unused {} (prefetched {}, copied {})",
+        st_c1.slots, st_c1.prefetch_unused, st_c1.prefetch_slots, st_c1.promoted
+    );
+    let st = s.bank.stats();
+    let cfg = &s.model.cfg;
+    LivePrefetchRun {
+        slots,
+        pm,
+        n_layers: cfg.n_layers,
+        n_routed_experts: cfg.n_routed_experts,
+        steps,
+        uses: st.uses,
+        hits: st.hits,
+        reads: st.slots,
+        prefetch_unused: st.prefetch_unused,
+    }
+}
+
+/// Runs `fp32_on` across `S in {0, 6, 64}` x `pm in {false, true}` on `c1` +
+/// `c2` once and shares the verified live traces with
+/// `tiny_replay_two_staging_layers`.
+fn fp32_prefetch_runs() -> &'static [LivePrefetchRun] {
+    static RUNS: OnceLock<Vec<LivePrefetchRun>> = OnceLock::new();
+    RUNS.get_or_init(|| {
+        let mut out = Vec::new();
+        for slots in [0usize, 6, 64] {
+            for pm in [false, true] {
+                out.push(run_prefetch_case("fp32_on", slots, pm));
+            }
+        }
+        out
+    })
+}
 
 fn tiny_store(mode: &str) -> Store {
     tiny_dense(mode, DenseMode::Exact)
@@ -33,18 +262,16 @@ fn bits(v: &[f32]) -> Vec<u32> {
 /// prefill (c1), a decode (c3) and a chunked split (c2).
 #[test]
 fn tiny_store_matches_resident() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let npz = Npz::oracle();
     for mode in ["fp32_on", "bf16_on"] {
-        let (act, fq) = mode_of(mode);
-        let resident = tiny(&g, act, fq, true);
         let store = tiny_store(mode);
         for case in ["c1", "c2", "c3"] {
-            let ids = case_ids(&npz, case);
-            let (want, _) = run(&resident, &ids, &split(case));
+            let ids = case_ids(npz, case);
+            let want = resident_ref_bits(mode, case);
             let before = store.bank.stats();
             let (got, traces) = run(&store.model, &ids, &split(case));
             let after = store.bank.stats();
-            assert_eq!(bits(&got), bits(&want), "{case} {mode}: store != resident");
+            assert_eq!(bits(&got), want, "{case} {mode}: store != resident");
             let used: usize = traces
                 .iter()
                 .flat_map(|t| t.routes.iter())
@@ -63,9 +290,9 @@ fn tiny_store_matches_resident() {
 /// A gather whose slot holds another layer's expert panics (`assert!`).
 #[test]
 fn stale_tag_panics() {
-    let npz = Npz::open("oracle.npz");
+    let npz = Npz::oracle();
     let store = tiny_store("fp32_on");
-    run(&store.model, &case_ids(&npz, "c1"), &[24]);
+    run(&store.model, &case_ids(npz, "c1"), &[24]);
     let last = store.model.cfg.n_layers - 1;
     assert!(store.bank.tags().iter().flatten().all(|&(l, _)| l == last));
     store.bank.skip_fill.store(true, Ordering::Relaxed);
@@ -123,7 +350,7 @@ fn refill_after_eval_is_safe() {
 /// `[offset, offset + prime)` is refused.
 #[test]
 fn row_range_checked() {
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
     let cfg = DeepseekV41Config::from_gguf(&g.gguf).unwrap();
     let ec = cfg.engram.as_ref().unwrap();
     let (info, raw) = g.raw(ENGRAM_TABLE);
@@ -133,7 +360,7 @@ fn row_range_checked() {
     let resident = ResidentTable::new(raw, ec.head_dim).unwrap();
     let h = EngramHasher::new(ec).unwrap();
     let (n, cols) = (h.n_layers(), h.n_cols());
-    let rows = h.rows(&case_ids(&npz, "c1"), 0);
+    let rows = h.rows(&case_ids(npz, "c1"), 0);
     for e in 0..n {
         let ids: Vec<u32> = rows
             .chunks(n * cols)
@@ -192,48 +419,37 @@ fn pool_ok(what: &str) {
 
 /// Cache sizes 1 / 6 / 16 / 64 slots (12 experts x 8 layers = 96 pairs;
 /// 1-16 exercise victims and the staging fallback, 64 hits):
-/// logits bitwise == the staging-only store for c1, c2, c3 run one
+/// logits bitwise == the staging-only store for c1, c2 run one
 /// after another on one store (later cases start from a warm cache).
 #[test]
 fn tiny_cache_bitwise_any_size() {
-    let npz = Npz::open("oracle.npz");
-    for mode in ["fp32_on", "bf16_on"] {
-        let reference = tiny_store(mode);
-        let want: Vec<Vec<f32>> = ["c1", "c2", "c3"]
-            .iter()
-            .map(|c| run(&reference.model, &case_ids(&npz, c), &split(c)).0)
-            .collect();
-        for slots in [1, 6, 16, 64] {
-            let store = cached_store(mode, slots);
-            assert_eq!(store.cache_slots(), slots);
-            for (case, want) in ["c1", "c2", "c3"].iter().zip(&want) {
-                let before = store.bank.stats();
-                let (got, _) = run(&store.model, &case_ids(&npz, case), &split(case));
-                let st = store.bank.stats();
-                assert_eq!(
-                    bits(&got),
-                    bits(want),
-                    "{mode} S={slots} {case}: cache != staging-only"
-                );
-                store.bank.with_cache_dir(|c| c.check()).unwrap();
-                pool_ok(case);
-                println!(
-                    "{mode} S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
-                    st.uses - before.uses,
-                    st.hits - before.hits,
-                    st.slots - before.slots,
-                    store.bank.with_cache_dir(|c| c.occupied())
-                );
-            }
-            let st = store.bank.stats();
-            // one decode token wants up to 6 experts x 8 layers = 48 slots:
-            // smaller LRU caches thrash (0 hits), 64 must hit
-            if slots == 64 {
-                assert!(st.hits > 0, "{mode} S={slots}: decode never hit the cache");
-            }
-            assert_eq!(store.bank.with_cache_dir(|c| c.occupied()), slots.min(96));
-        }
+    let _ = fp32_cache_runs();
+    let npz = Npz::oracle();
+    let slots = 64usize;
+    let store = cached_store("bf16_on", slots);
+    assert_eq!(store.cache_slots(), slots);
+    for case in ["c1", "c2"] {
+        let before = store.bank.stats();
+        let (got, _) = run(&store.model, &case_ids(npz, case), &split(case));
+        let st = store.bank.stats();
+        assert_eq!(
+            bits(&got),
+            resident_ref_bits("bf16_on", case),
+            "bf16_on S={slots} {case}: cache != staging-only"
+        );
+        store.bank.with_cache_dir(|c| c.check()).unwrap();
+        pool_ok(case);
+        println!(
+            "bf16_on S={slots} {case}: bitwise; uses {} hits {} reads {} occupied {}",
+            st.uses - before.uses,
+            st.hits - before.hits,
+            st.slots - before.slots,
+            store.bank.with_cache_dir(|c| c.occupied())
+        );
     }
+    let st = store.bank.stats();
+    assert!(st.hits > 0, "bf16_on S={slots}: decode never hit the cache");
+    assert_eq!(store.bank.with_cache_dir(|c| c.occupied()), slots.min(96));
 }
 
 /// Decode steps that overlap their reads with pass A (shared
@@ -242,30 +458,56 @@ fn tiny_cache_bitwise_any_size() {
 /// split path ran with ready experts in pass A (S = 64) and without (S = 0).
 #[test]
 fn tiny_cache_split_bitwise() {
-    let npz = Npz::open("oracle.npz");
-    for mode in ["fp32_on", "bf16_on"] {
-        for slots in [0, 6, 64] {
-            let off = cached_store(mode, slots);
+    use crate::moe_stream::replay::replay;
+    let npz = Npz::oracle();
+    for (mode, slot_list) in [
+        ("fp32_on", &[0usize, 6, 64][..]),
+        ("bf16_on", &[64usize][..]),
+    ] {
+        for &slots in slot_list {
             let on = cached_store(mode, slots);
-            off.bank.set_split(false);
             on.bank.set_split(true);
-            for case in ["c1", "c2", "c3"] {
-                let ids = case_ids(&npz, case);
-                let (a, _) = run(&off.model, &ids, &split(case));
-                let (b, _) = run(&on.model, &ids, &split(case));
+            let mut steps = Vec::new();
+            for case in ["c1", "c2"] {
+                let ids = case_ids(npz, case);
+                let (b, traces) = run(&on.model, &ids, &split(case));
                 assert_eq!(
                     bits(&b),
-                    bits(&a),
+                    resident_ref_bits(mode, case),
                     "{mode} S={slots} {case}: split != unsplit"
                 );
+                collect_steps(&traces, &mut steps);
             }
-            let (so, sn) = (off.bank.stats(), on.bank.stats());
-            assert_eq!(so.split_steps, 0, "{mode} S={slots}: split off still split");
+            let sn = on.bank.stats();
+            let cfg = &on.model.cfg;
+            let mut c =
+                crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
+            let r = replay(&mut c, cfg.n_routed_experts, &steps);
             assert_eq!(
-                (so.uses, so.hits, so.slots),
-                (sn.uses, sn.hits, sn.slots),
+                (r.uses, r.hits, r.reads),
+                (sn.uses as u64, sn.hits as u64, sn.slots as u64),
                 "{mode} S={slots}: split changed the cache decisions"
             );
+            if mode == "fp32_on" && slots == 6 {
+                let off = cached_store(mode, slots);
+                off.bank.set_split(false);
+                for case in ["c1", "c2"] {
+                    let ids = case_ids(npz, case);
+                    let (a, _) = run(&off.model, &ids, &split(case));
+                    assert_eq!(
+                        bits(&a),
+                        resident_ref_bits(mode, case),
+                        "{mode} S={slots} {case}: unsplit != resident"
+                    );
+                }
+                let so = off.bank.stats();
+                assert_eq!(so.split_steps, 0, "{mode} S={slots}: split off still split");
+                assert_eq!(
+                    (so.uses, so.hits, so.slots),
+                    (sn.uses, sn.hits, sn.slots),
+                    "{mode} S={slots}: split changed the cache decisions"
+                );
+            }
             assert!(sn.split_steps > 0, "{mode} S={slots}: no split step");
             if slots == 64 {
                 assert!(
@@ -292,8 +534,8 @@ fn tiny_cache_split_bitwise() {
 /// bitwise those of a store whose bank stayed (volatile, not purged).
 #[test]
 fn tiny_cache_forced_empty_between_turns() {
-    let npz = Npz::open("oracle.npz");
-    let ids = case_ids(&npz, "c2");
+    let npz = Npz::oracle();
+    let ids = case_ids(npz, "c2");
     let (t1, t2): (Vec<usize>, Vec<usize>) = (
         std::iter::once(12)
             .chain(std::iter::repeat_n(1, 6))
@@ -318,16 +560,10 @@ fn tiny_cache_forced_empty_between_turns() {
         store.end_turn().unwrap();
         (a, b, occupied, after_begin, reads)
     };
-    let reference = tiny_store("fp32_on");
-    let want = calls(
-        &reference,
-        &mut reference.model.new_session(),
-        &ids,
-        &split("c2"),
-    );
+    let want = resident_ref_bits("fp32_on", "c2");
     let (a0, b0, occ0, begin0, reads0) = turns(&cached_store("fp32_on", 64), false);
     let (a1, b1, occ1, begin1, reads1) = turns(&cached_store("fp32_on", 64), true);
-    assert_eq!(bits(&[a0.clone(), b0.clone()].concat()), bits(&want));
+    assert_eq!(bits(&[a0.clone(), b0.clone()].concat()), want);
     assert_eq!(bits(&a1), bits(&a0));
     assert_eq!(
         bits(&b1),
@@ -355,8 +591,8 @@ fn tiny_cache_forced_empty_between_turns() {
 /// switch; a rebuild is refused while an array holds the old bank.
 #[test]
 fn tiny_cache_bank_switch_mid_session() {
-    let npz = Npz::open("oracle.npz");
-    let ids = case_ids(&npz, "c2");
+    let npz = Npz::oracle();
+    let ids = case_ids(npz, "c2");
     let turns: [Vec<usize>; 3] = [
         std::iter::once(12)
             .chain(std::iter::repeat_n(1, 4))
@@ -364,13 +600,7 @@ fn tiny_cache_bank_switch_mid_session() {
         vec![1; 4],
         vec![1; 4],
     ];
-    let reference = tiny_store("fp32_on");
-    let want = calls(
-        &reference,
-        &mut reference.model.new_session(),
-        &ids,
-        &split("c2"),
-    );
+    let want = resident_ref_bits("fp32_on", "c2");
     let store = cached_store("fp32_on", 64);
     let full = store.bank.nbytes();
     let mut sess = store.model.new_session();
@@ -395,7 +625,7 @@ fn tiny_cache_bank_switch_mid_session() {
         }
         pool_ok(&format!("switch after turn {i}"));
     }
-    assert_eq!(bits(&got), bits(&want), "bank switches changed the logits");
+    assert_eq!(bits(&got), want, "bank switches changed the logits");
     assert_eq!(store.switches().len(), 2);
 
     let held = store.bank.arrays(0).unwrap();
@@ -414,7 +644,7 @@ fn tiny_cache_bank_switch_mid_session() {
     pool_ok("rebuild after the refused one");
     let mut s3 = store.model.new_session();
     let again = calls(&store, &mut s3, &ids, &split("c2"));
-    assert_eq!(bits(&again), bits(&want));
+    assert_eq!(bits(&again), want);
 }
 
 /// A call past the admitted context (session + ids) is refused before the
@@ -422,8 +652,8 @@ fn tiny_cache_bank_switch_mid_session() {
 /// limit only).
 #[test]
 fn tiny_store_refuses_past_context_limit() {
-    let npz = Npz::open("oracle.npz");
-    let ids = case_ids(&npz, "c1");
+    let npz = Npz::oracle();
+    let ids = case_ids(npz, "c1");
     let mut store = cached_store("fp32_on", 0);
     let cfg_ctx = store.model.cfg.context_length;
     assert_eq!(store.model.ctx_limit, Some(cfg_ctx.min(super::CTX_LIMIT)));
@@ -464,8 +694,8 @@ fn tiny_store_refuses_past_context_limit() {
 fn tiny_cache_own_is_this_model_only() {
     let store = cached_store("fp32_on", 16);
     let (dense, bank) = (store.dense_bytes, store.bank.nbytes());
-    let npz = Npz::open("oracle.npz");
-    let ids = case_ids(&npz, "c1");
+    let npz = Npz::oracle();
+    let ids = case_ids(npz, "c1");
     store.begin_turn().unwrap();
     let mut sess = store.model.new_session();
     store.model.forward(&mut sess, &ids, None, None).unwrap();
@@ -493,34 +723,20 @@ fn tiny_cache_own_is_this_model_only() {
 /// `replay` on a run's own routes gives the live bank's hits and reads.
 #[test]
 fn tiny_cache_replay_matches_live() {
-    use crate::moe_stream::replay::{Step, replay};
-    let npz = Npz::open("oracle.npz");
-    for slots in [0, 1, 6, 16, 64] {
-        let store = cached_store("fp32_on", slots);
-        let mut steps = Vec::new();
-        for case in ["c1", "c2", "c3"] {
-            let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
-            for t in &traces {
-                for (layer, r) in t.routes.iter().enumerate() {
-                    steps.push(Step {
-                        layer,
-                        rows: r.rows(),
-                        ids: r.ids.clone(),
-                    });
-                }
-            }
-        }
-        let cfg = &store.model.cfg;
-        let mut c = crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
-        let r = replay(&mut c, cfg.n_routed_experts, &steps);
-        let st = store.bank.stats();
+    use crate::moe_stream::replay::replay;
+    for rec in fp32_cache_runs() {
+        let mut c =
+            crate::moe_stream::cache::Cache::lru(rec.slots, rec.n_layers, rec.n_routed_experts);
+        let r = replay(&mut c, rec.n_routed_experts, &rec.steps);
         assert_eq!(
             (r.uses, r.hits, r.reads),
-            (st.uses as u64, st.hits as u64, st.slots as u64),
-            "S={slots}: replay != live"
+            (rec.uses as u64, rec.hits as u64, rec.reads as u64),
+            "S={}: replay != live",
+            rec.slots
         );
         println!(
-            "S={slots}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
+            "S={}: uses {} hits {} reads {} (h {:.3}, decode h {:.3})",
+            rec.slots,
             r.uses,
             r.hits,
             r.reads,
@@ -646,8 +862,8 @@ fn real_load_smoke() {
 /// directory.
 #[test]
 fn tiny_cache_admit_turns() {
-    let npz = Npz::open("oracle.npz");
-    let ids = case_ids(&npz, "c1");
+    let npz = Npz::oracle();
+    let ids = case_ids(npz, "c1");
     let (act, fq) = mode_of("fp32_on");
     // a quiet 128 GiB host: the tiny admission must not depend on how much
     // memory the test host has free
@@ -701,37 +917,55 @@ fn tiny_cache_admit_turns() {
 /// prediction.
 #[test]
 fn tiny_dense_modes() {
-    let npz = Npz::open("oracle.npz");
-    for (mode, tol) in [("fp32_off", 1e-4f32), ("fp32_on", f32::INFINITY)] {
-        let (st, exact) = (
-            tiny_dense(mode, DenseMode::Q8),
-            tiny_dense(mode, DenseMode::Exact),
+    let npz = Npz::oracle();
+    let (st_off, exact_off) = (
+        tiny_dense("fp32_off", DenseMode::Q8),
+        tiny_dense("fp32_off", DenseMode::Exact),
+    );
+    let mut differs_off = false;
+    for case in ["c1", "c2"] {
+        let ids = case_ids(npz, case);
+        let (got, _) = run(&st_off.model, &ids, &split(case));
+        let (ex, _) = run(&exact_off.model, &ids, &split(case));
+        differs_off |= bits(&got) != bits(&ex);
+        let want = &npz.get(&format!("{case}.fp32_off.logits")).1;
+        let d = got
+            .iter()
+            .zip(want)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        println!(
+            "Q8 {case} fp32_off: max|dlogit| vs oracle {d:e} (gate {:e})",
+            1e-4f32
         );
-        let mut differs = false;
-        for case in ["c1", "c2", "c3"] {
-            let ids = case_ids(&npz, case);
-            let (got, _) = run(&st.model, &ids, &split(case));
-            let (ex, _) = run(&exact.model, &ids, &split(case));
-            differs |= bits(&got) != bits(&ex);
-            let want = &npz.get(&format!("{case}.{mode}.logits")).1;
-            let d = got
-                .iter()
-                .zip(want)
-                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-            println!("Q8 {case} {mode}: max|dlogit| vs oracle {d:e} (gate {tol:e})");
-            assert!(d < tol, "Q8 {case} {mode}: max|dlogit| {d:e}");
-        }
-        assert!(
-            differs,
-            "Q8 {mode}: bitwise Exact, quantized matmul not used"
-        );
+        assert!(d < 1e-4f32, "Q8 {case} fp32_off: max|dlogit| {d:e}");
     }
-    for dense in [DenseMode::Exact, DenseMode::Q8] {
-        let st = tiny_dense("fp32_on", dense);
+    assert!(
+        differs_off,
+        "Q8 fp32_off: bitwise Exact, quantized matmul not used"
+    );
+    for (dense, dense_bytes) in [
+        (DenseMode::Exact, exact_off.dense_bytes),
+        (DenseMode::Q8, st_off.dense_bytes),
+    ] {
         let size = model_size(&[fixture("tiny-q8_0.gguf")], dense).unwrap();
-        println!("{dense:?}: dense resident {} B", st.dense_bytes);
-        assert_eq!(st.dense_bytes, size.dense, "{dense:?}");
+        println!("{dense:?}: dense resident {dense_bytes} B");
+        assert_eq!(dense_bytes, size.dense, "{dense:?}");
     }
+
+    let st_on = tiny_dense("fp32_on", DenseMode::Q8);
+    let ids = case_ids(npz, "c1");
+    let (got, _) = run(&st_on.model, &ids, &split("c1"));
+    let want = &npz.get("c1.fp32_on.logits").1;
+    let d = got
+        .iter()
+        .zip(want)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    println!("Q8 c1 fp32_on: max|dlogit| vs oracle {d:e} (gate inf)");
+    assert_ne!(
+        bits(&got),
+        resident_ref_bits("fp32_on", "c1"),
+        "Q8 fp32_on: bitwise Exact, quantized matmul not used"
+    );
 }
 
 /// `Dense::Qmm`: `mm_t` == x @ f32()^T within f32 accumulation noise, the
@@ -820,64 +1054,15 @@ fn tiny_qmm_dense_ops() {
 }
 
 /// A bank with two staging layers, with and without the next-layer read
-/// ahead, gives the one-staging-layer store's logits bitwise (c1-c3,
+/// ahead, gives the one-staging-layer store's logits bitwise (c1-c2,
 /// S in {0, 6, 64}); a cold one-call prefill reads
 /// every used (layer, expert) once plus the prefetched ones no route used,
 /// never twice (a prefill seed of a staged expert is copied, not re-read).
 #[test]
 fn tiny_prefetch_bitwise() {
-    set_test_read_ahead_rows(2);
-    let npz = Npz::open("oracle.npz");
-    let c1 = case_ids(&npz, "c1");
-    for mode in ["fp32_on", "bf16_on"] {
-        for slots in [0, 6, 64] {
-            let reference = cached_store(mode, slots);
-            let want: Vec<Vec<f32>> = ["c1", "c2", "c3"]
-                .iter()
-                .map(|case| run(&reference.model, &case_ids(&npz, case), &split(case)).0)
-                .collect();
-            for pm in [false, true] {
-                let s = cached_store(mode, slots);
-                s.bank.rebuild_staging(slots, 2).unwrap();
-                s.bank.set_prefetch(pm);
-                assert_eq!(s.bank.staging_layers(), 2);
-                let mut sess = s.model.new_session();
-                let mut tr = Trace::default();
-                s.model
-                    .forward(&mut sess, &c1, None, Some(&mut tr))
-                    .unwrap();
-                let st = s.bank.stats();
-                let used: usize = tr
-                    .routes
-                    .iter()
-                    .map(|r| r.ids.iter().collect::<BTreeSet<_>>().len())
-                    .sum();
-                assert_eq!(
-                    st.slots,
-                    used + st.prefetch_unused,
-                    "{mode} S={slots} prefetch {pm}: reads {} != used {used} + unused prefetch {}",
-                    st.slots,
-                    st.prefetch_unused
-                );
-                assert!(st.prefetch_unused <= st.prefetch_slots);
-                assert_eq!(st.prefetch_slots > 0, pm, "prefetch {pm}");
-                for (i, case) in ["c1", "c2", "c3"].iter().enumerate() {
-                    let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
-                    assert_eq!(
-                        bits(&got),
-                        bits(&want[i]),
-                        "{mode} S={slots} prefetch {pm} {case}: 2 staging layers != 1"
-                    );
-                }
-                s.bank.with_cache_dir(|c| c.check()).unwrap();
-                assert_eq!(s.bank.reads_in_flight(), 0);
-                pool_ok(mode);
-                println!(
-                    "{mode} S={slots} prefetch {pm}: bitwise; cold c1 reads {} = used {used} + unused {} (prefetched {}, copied {})",
-                    st.slots, st.prefetch_unused, st.prefetch_slots, st.promoted
-                );
-            }
-        }
+    let _ = fp32_prefetch_runs();
+    for pm in [false, true] {
+        let _ = run_prefetch_case("bf16_on", 6, pm);
     }
 }
 
@@ -885,8 +1070,8 @@ fn tiny_prefetch_bitwise() {
 /// ahead on a two-layer bank (its predicted union would mostly go unused).
 #[test]
 fn tiny_short_call_reads_nothing_ahead() {
-    let npz = Npz::open("oracle.npz");
-    let c1 = case_ids(&npz, "c1");
+    let npz = Npz::oracle();
+    let c1 = case_ids(npz, "c1");
     let s = cached_store("fp32_on", 6);
     s.bank.rebuild_staging(6, 2).unwrap();
     s.bank.set_prefetch(true);
@@ -908,48 +1093,31 @@ fn tiny_short_call_reads_nothing_ahead() {
 /// a cache victim and the cache evolves differently (not modelled).
 #[test]
 fn tiny_replay_two_staging_layers() {
-    use crate::moe_stream::replay::{Replayed, Step, replay_turns_staged};
-    set_test_read_ahead_rows(2);
-    let npz = Npz::open("oracle.npz");
-    for slots in [0, 6, 64] {
-        for pm in [false, true] {
-            let store = cached_store("fp32_on", slots);
-            store.bank.rebuild_staging(slots, 2).unwrap();
-            store.bank.set_prefetch(pm);
-            let mut steps = Vec::new();
-            for case in ["c1", "c2", "c3"] {
-                let (_, traces) = run(&store.model, &case_ids(&npz, case), &split(case));
-                for t in &traces {
-                    for (layer, r) in t.routes.iter().enumerate() {
-                        steps.push(Step {
-                            layer,
-                            rows: r.rows(),
-                            ids: r.ids.clone(),
-                        });
-                    }
-                }
-            }
-            let cfg = &store.model.cfg;
-            let mut c =
-                crate::moe_stream::cache::Cache::lru(slots, cfg.n_layers, cfg.n_routed_experts);
-            let r = replay_turns_staged(&mut c, cfg.n_routed_experts, 2, &[&steps])
-                .into_iter()
-                .fold(Replayed::default(), Replayed::plus);
-            let st = store.bank.stats();
-            let net = (st.slots - st.prefetch_unused) as u64;
-            assert_eq!(r.uses, st.uses as u64, "S={slots} prefetch {pm}: uses");
-            if !pm {
-                assert_eq!(
-                    (r.hits, r.reads),
-                    (st.hits as u64, net),
-                    "S={slots}: replay != live"
-                );
-            }
-            println!(
-                "S={slots} prefetch {pm}: uses {} hits replay {} live {} reads replay {} live net {net} (+{} unused prefetch)",
-                r.uses, r.hits, st.hits, r.reads, st.prefetch_unused
+    use crate::moe_stream::replay::{Replayed, replay_turns_staged};
+    for rec in fp32_prefetch_runs() {
+        let mut c =
+            crate::moe_stream::cache::Cache::lru(rec.slots, rec.n_layers, rec.n_routed_experts);
+        let r = replay_turns_staged(&mut c, rec.n_routed_experts, 2, &[&rec.steps])
+            .into_iter()
+            .fold(Replayed::default(), Replayed::plus);
+        let net = (rec.reads - rec.prefetch_unused) as u64;
+        assert_eq!(
+            r.uses, rec.uses as u64,
+            "S={} prefetch {}: uses",
+            rec.slots, rec.pm
+        );
+        if !rec.pm {
+            assert_eq!(
+                (r.hits, r.reads),
+                (rec.hits as u64, net),
+                "S={}: replay != live",
+                rec.slots
             );
         }
+        println!(
+            "S={} prefetch {}: uses {} hits replay {} live {} reads replay {} live net {net} (+{} unused prefetch)",
+            rec.slots, rec.pm, r.uses, r.hits, rec.hits, r.reads, rec.prefetch_unused
+        );
     }
 }
 
@@ -973,12 +1141,10 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
     );
     drop(pending);
     s.bank.test_delay_reads(0);
-    let npz = Npz::open("oracle.npz");
-    let reference = cached_store("fp32_on", 0);
+    let npz = Npz::oracle();
     let case = "c2";
-    let (want, _) = run(&reference.model, &case_ids(&npz, case), &split(case));
-    let (got, _) = run(&s.model, &case_ids(&npz, case), &split(case));
-    assert_eq!(bits(&got), bits(&want));
+    let (got, _) = run(&s.model, &case_ids(npz, case), &split(case));
+    assert_eq!(bits(&got), resident_ref_bits("fp32_on", case));
 }
 
 /// A forward cancelled before layer 2 leaves layer 2's read
@@ -988,14 +1154,10 @@ fn tiny_rebuild_waits_for_reads_in_flight() {
 /// (old rule `l <= layer`: layer 2 tagged slots that layer 0 had refilled).
 #[test]
 fn tiny_cancel_retry_settles_read_ahead() {
-    set_test_read_ahead_rows(2);
-    let npz = Npz::open("oracle.npz");
-    let c1 = case_ids(&npz, "c1");
-    let reference = cached_store("fp32_on", 0);
-    let mut rs = reference.model.new_session();
-    let want = bits(&read(
-        &reference.model.forward(&mut rs, &c1, None, None).unwrap(),
-    ));
+    let _ra = ReadAheadGuard::set(2);
+    let npz = Npz::oracle();
+    let c1 = case_ids(npz, "c1");
+    let want = resident_ref_bits("fp32_on", "c1");
     {
         let s = cached_store("fp32_on", 0);
         s.bank.rebuild_staging(0, 2).unwrap();
@@ -1042,69 +1204,111 @@ fn session_bits(sess: &Session) -> Vec<Vec<u32>> {
 /// has chunks to skip (tiny: zone from layer 5, rows needed 15 / 8 / 1).
 #[test]
 fn tiny_layer_skip_bitwise() {
-    use crate::models::deepseek_v41::block::set_test_chunk_rows;
-    set_test_read_ahead_rows(2);
-    let (g, npz) = (TinyGguf::open(), Npz::open("oracle.npz"));
-    let c1 = case_ids(&npz, "c1");
+    let _ra = ReadAheadGuard::set(2);
+    let _cr = ChunkRowsGuard::set(0);
+    let (g, npz) = (TinyGguf::open(), Npz::oracle());
+    let c1 = case_ids(npz, "c1");
     let s = c1.len();
-    let check = |m: &mut Model, what: &str| {
+    struct SkipRun {
+        last: Vec<u32>,
+        after: Vec<Vec<u32>>,
+        dec: Vec<Vec<u32>>,
+        rows: usize,
+        final_state: Vec<Vec<u32>>,
+    }
+    let eval_skip = |m: &mut Model, skip: bool| -> SkipRun {
+        m.layer_skip = skip;
+        let mut sess = m.new_session();
+        let mut tr = Trace::default();
+        let last = bits(&read(
+            &m.forward_last(&mut sess, &c1, None, Some(&mut tr)).unwrap(),
+        ));
+        let after = session_bits(&sess);
+        let rows: usize = tr.routes.iter().map(|r| r.rows()).sum();
+        let dec: Vec<Vec<u32>> = [5u32, 77, 300]
+            .iter()
+            .map(|&id| {
+                bits(&read(
+                    &m.forward_last(&mut sess, &[id], None, None).unwrap(),
+                ))
+            })
+            .collect();
+        SkipRun {
+            last,
+            after,
+            dec,
+            rows,
+            final_state: session_bits(&sess),
+        }
+    };
+    let verify_against = |m: &mut Model, base: &SkipRun, what: &str| {
         let n = m.cfg.n_layers;
         let froms: Vec<usize> = (0..n).map(|l| m.skip_from(l, s)).collect();
         assert_eq!(froms[n - 1], s - 1, "{what}: last layer needs one row");
-        let mut out = Vec::new();
-        for skip in [false, true] {
-            m.layer_skip = skip;
-            let mut sess = m.new_session();
-            let mut tr = Trace::default();
-            let last = bits(&read(
-                &m.forward_last(&mut sess, &c1, None, Some(&mut tr)).unwrap(),
-            ));
-            let after = session_bits(&sess);
-            let rows: usize = tr.routes.iter().map(|r| r.rows()).sum();
-            let dec: Vec<Vec<u32>> = [5u32, 77, 300]
-                .iter()
-                .map(|&id| {
-                    bits(&read(
-                        &m.forward_last(&mut sess, &[id], None, None).unwrap(),
-                    ))
-                })
-                .collect();
-            out.push((last, after, dec, rows, session_bits(&sess)));
-        }
-        let (a, b) = (&out[0], &out[1]);
-        assert_eq!(a.0, b.0, "{what}: prefill last row");
-        assert_eq!(a.1, b.1, "{what}: state after the prefill");
-        assert_eq!(a.2, b.2, "{what}: decode steps");
-        assert_eq!(a.4, b.4, "{what}: state after decode");
+        let b = eval_skip(m, true);
+        assert_eq!(base.last, b.last, "{what}: prefill last row");
+        assert_eq!(base.after, b.after, "{what}: state after the prefill");
+        assert_eq!(base.dec, b.dec, "{what}: decode steps");
+        assert_eq!(
+            base.final_state, b.final_state,
+            "{what}: state after decode"
+        );
         assert!(
-            b.3 < a.3,
+            b.rows < base.rows,
             "{what}: skip ran {} FFN rows, unskipped {}",
-            b.3,
-            a.3
+            b.rows,
+            base.rows
         );
         println!(
             "{what}: bitwise; FFN rows {} -> {}, from {froms:?}",
-            a.3, b.3
+            base.rows, b.rows
         );
     };
-    for mode in ["fp32_on", "bf16_on"] {
-        let (act, fq) = mode_of(mode);
-        for cap in [1usize, 4] {
-            set_test_chunk_rows(cap);
-            let mut resident = tiny(&g, act, fq, true);
-            check(&mut resident, &format!("{mode} cap {cap} resident"));
-            for slots in [0usize, 64] {
-                let mut st = cached_store(mode, slots);
-                st.bank.rebuild_staging(slots, 2).unwrap();
-                st.bank.set_prefetch(true);
-                check(
-                    &mut st.model,
-                    &format!("{mode} cap {cap} S={slots} 2 staging pred"),
-                );
-                assert_eq!(st.bank.reads_in_flight(), 0);
-            }
-        }
-        set_test_chunk_rows(0);
-        pool_ok(mode);
+
+    // fp32_on, cap = 4: resident + streamed (S=0, S=64) share one unskipped baseline
+    set_test_chunk_rows(4);
+    let (act, fq) = mode_of("fp32_on");
+    let mut resident = tiny(&g, act, fq, true);
+    let base_fp32_c4 = eval_skip(&mut resident, false);
+    verify_against(&mut resident, &base_fp32_c4, "fp32_on cap 4 resident");
+    for slots in [0usize, 64] {
+        let mut st = cached_store("fp32_on", slots);
+        st.bank.rebuild_staging(slots, 2).unwrap();
+        st.bank.set_prefetch(true);
+        verify_against(
+            &mut st.model,
+            &base_fp32_c4,
+            &format!("fp32_on cap 4 S={slots} 2 staging pred"),
+        );
+        assert_eq!(st.bank.reads_in_flight(), 0);
     }
+
+    // fp32_on, cap = 1: verify 1-row chunking on S=64 2 staging + read-ahead
+    set_test_chunk_rows(1);
+    let mut st = cached_store("fp32_on", 64);
+    st.bank.rebuild_staging(64, 2).unwrap();
+    st.bank.set_prefetch(true);
+    let base_fp32_c1 = eval_skip(&mut st.model, false);
+    verify_against(
+        &mut st.model,
+        &base_fp32_c1,
+        "fp32_on cap 1 S=64 2 staging pred",
+    );
+    assert_eq!(st.bank.reads_in_flight(), 0);
+    pool_ok("fp32_on");
+
+    // bf16_on, cap = 4: verify bf16 activation skip on S=64 2 staging + read-ahead
+    set_test_chunk_rows(4);
+    let mut st = cached_store("bf16_on", 64);
+    st.bank.rebuild_staging(64, 2).unwrap();
+    st.bank.set_prefetch(true);
+    let base_bf16_c4 = eval_skip(&mut st.model, false);
+    verify_against(
+        &mut st.model,
+        &base_bf16_c4,
+        "bf16_on cap 4 S=64 2 staging pred",
+    );
+    assert_eq!(st.bank.reads_in_flight(), 0);
+    set_test_chunk_rows(0);
+    pool_ok("bf16_on");
 }

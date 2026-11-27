@@ -1857,6 +1857,116 @@ fn merged_draft_projections_match_separate_bits() {
     }
 }
 
+/// A compact quantized merged draft (`hidden=512`, 2 layers, 4/2 heads of 64,
+/// affine Q4/g64 Tiled64) used for GPU-agnostic slot/padding invariance probes
+/// (including unsplit `qmm_t_t64` at M = 544 where `17 * 16 = 272 >= 257`)
+/// without allocating the 27B 5120x25600 probe matrices.
+fn compact_quantized_merged_draft() -> super::DFlash2Model {
+    use super::{DFlash2Attention, DFlash2Layer, DFlash2Mlp, GroupedDynamicCausalConv};
+    use crate::nn::{RMSNorm, RoPE};
+    let (hidden, intermediate, layers, heads, kv_heads, head_dim) =
+        (512usize, 512usize, 2usize, 4i64, 2i64, 64i64);
+    let eps = 1e-6;
+    let quantized = |input: usize, output: usize| -> LinearProj {
+        let weight = MxArray::random_normal(
+            &[output as i64, input as i64],
+            0.0,
+            0.02,
+            Some(DType::BFloat16),
+        )
+        .unwrap();
+        LinearProj::Quantized(super::quantize_draft_weight(&weight, "compact probe").unwrap())
+    };
+    let norm = |size: i64| {
+        RMSNorm::from_weight(
+            &MxArray::random_normal(&[size], 1.0, 0.2, Some(DType::BFloat16)).unwrap(),
+            Some(eps),
+        )
+        .unwrap()
+    };
+    let conv = || GroupedDynamicCausalConv {
+        base_kernel: MxArray::random_normal(
+            &[2, 2, hidden as i64],
+            0.0,
+            0.02,
+            Some(DType::BFloat16),
+        )
+        .unwrap(),
+        kernel_projection: quantized(hidden, 4 * (hidden / 16)),
+        kernel_size: 2,
+        group_size: 16,
+    };
+    let config = super::DFlash2Config {
+        block_size: 7,
+        mask_token_id: 0,
+        target_layers: vec![0, 1],
+        target_num_layers: 4,
+        hidden_size: hidden,
+        intermediate_size: intermediate,
+        num_hidden_layers: layers,
+        num_attention_heads: heads as usize,
+        num_key_value_heads: kv_heads as usize,
+        head_dim: head_dim as usize,
+        vocab_size: 64,
+        rms_norm_eps: eps,
+        max_position_embeddings: 262_144,
+        sliding_window: 2048,
+        conv_group_size: 16,
+        conv_kernel_size: 2,
+        selector_rank: 8,
+        selector_top_k: 4,
+        rope_theta: 10_000_000.0,
+        final_logit_softcapping: None,
+        selector_softcap_mode: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
+    };
+    let execution_policy = super::DraftExecutionPolicy::capture();
+    let mut model = super::DFlash2Model {
+        execution_policy,
+        fc: quantized(hidden * 2, hidden),
+        hidden_norm: norm(hidden as i64),
+        norm: norm(hidden as i64),
+        selector: test_selector(64, 4, 8, hidden),
+        mask_embedding: None,
+        layers: (0..layers)
+            .map(|_| DFlash2Layer {
+                attention: DFlash2Attention {
+                    tensor_attention_enabled: execution_policy.tensor_attention(),
+                    q_proj: quantized(hidden, (heads * head_dim) as usize),
+                    k_proj: quantized(hidden, (kv_heads * head_dim) as usize),
+                    v_proj: quantized(hidden, (kv_heads * head_dim) as usize),
+                    o_proj: quantized((heads * head_dim) as usize, hidden),
+                    qkv_proj: None,
+                    q_norm: norm(head_dim),
+                    k_norm: norm(head_dim),
+                    rope: RoPE::new(head_dim as i32, Some(false), Some(config.rope_theta), None),
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim,
+                },
+                mlp: DFlash2Mlp {
+                    gate_proj: quantized(hidden, intermediate),
+                    up_proj: quantized(hidden, intermediate),
+                    down_proj: quantized(intermediate, hidden),
+                    gate_up: None,
+                },
+                input_norm: norm(hidden as i64),
+                post_attention_norm: norm(hidden as i64),
+                attention_conv: conv(),
+                mlp_conv: conv(),
+            })
+            .collect(),
+        config,
+        weight_bytes: 0,
+        context_kv: None,
+        compiled: super::CompiledDraft::default(),
+    };
+    model.merge_projections().unwrap();
+    model
+}
+
 /// A draft at the published Qwen3.8 DFlash2 geometry, merged as
 /// `load_dflash2` merges it: five layers (merged context `k|v` of
 /// N = 10240) fed by five 5120-wide target taps (fc `[5120, 25600]`).
@@ -1941,11 +2051,221 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
         eprintln!("skipping: Metal only");
         return;
     }
+    let base = 40_000i32;
+
+    // Probes (iii) & (iv): slot and padding invariance hold on every Metal GPU.
+    // Run them on a compact merged quantized draft so every GPU checks the full
+    // slot/padding contract without paying the 27B 5120x25600 allocation cost.
+    {
+        unsafe { mlx_sys::mlx_seed(0x51_0002) };
+        let compact = compact_quantized_merged_draft();
+        assert!(
+            compact.context_kv.is_some(),
+            "compact cross-layer k|v merge"
+        );
+        let compact_n = 1100i64;
+        let compact_taps = (0..2)
+            .map(|_| {
+                MxArray::random_normal(&[1, compact_n, 512], 0.0, 0.5, Some(DType::BFloat16))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let compact_tap_rows = |from: i64, to: i64| {
+            compact_taps
+                .iter()
+                .map(|tap| tap.slice_axis(1, from, to).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let compact_fused = compact.fuse_context(&compact_taps).unwrap();
+        let (_, compact_row) = context_rows(
+            &compact
+                .project_context(&compact_fused.slice_axis(1, 0, 1).unwrap(), base)
+                .unwrap(),
+        );
+
+        // Assert that M = 544 on the compact 512-wide `fc` actually dispatches
+        // the unsplit Tiled64 GEMM (`qmm_t_t64` on non-NAX, `qmm_t_nax_t64` on
+        // NAX: `ceil(544/32) * (512/32) = 17 * 16 = 272 >= 257`) with no split-K.
+        {
+            let unsplit_name = if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+                "qmm_t_nax_t64"
+            } else {
+                "qmm_t_t64"
+            };
+            let unsplit_fam = std::ffi::CString::new(unsplit_name).unwrap();
+            let splitk_fam = std::ffi::CString::new("qmm_t_splitk_t64").unwrap();
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let fused544 = compact.fuse_context(&compact_tap_rows(0, 544)).unwrap();
+            fused544.eval();
+            let unsplit_count =
+                unsafe { mlx_sys::mlx_test_kquant_family_count(unsplit_fam.as_ptr()) };
+            let splitk_count =
+                unsafe { mlx_sys::mlx_test_kquant_family_count(splitk_fam.as_ptr()) };
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            assert_eq!(
+                (unsplit_count, splitk_count),
+                (1, 0),
+                "compact M=544 fc must take unsplit {unsplit_name} without split-K (got {unsplit_count}, splitk {splitk_count})"
+            );
+        }
+
+        // (iii) Slot: one row at slot p of an M-row block, its absolute
+        // position held fixed (base - p), other rows unchanged. Includes
+        // M = 544 so non-NAX Metal exercises unsplit `qmm_t_t64` invariance.
+        let slot_widths = [8i64, 16, 32, 64, 256, 544];
+        let mut slot_table = Vec::new();
+        for &width in &slot_widths {
+            let others_start = 544i64;
+            let others_fused = compact_fused
+                .slice_axis(1, others_start, others_start + width)
+                .unwrap();
+            let others_taps = compact_tap_rows(others_start, others_start + width);
+            let x_fused = compact_fused.slice_axis(1, 5, 6).unwrap();
+            let x_taps = compact_tap_rows(5, 6);
+            let place = |others: &MxArray, x: &MxArray, slot: i64| {
+                let mut parts = Vec::new();
+                if slot > 0 {
+                    parts.push(others.slice_axis(1, 0, slot).unwrap());
+                }
+                parts.push(x.clone());
+                if slot + 1 < width {
+                    parts.push(others.slice_axis(1, slot + 1, width).unwrap());
+                }
+                MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
+            };
+            let mut projected = Vec::new();
+            let mut fused_end_to_end = Vec::new();
+            for slot in [0, 1, width / 2, width - 1] {
+                let at = base - slot as i32;
+                let pick = |rows: Vec<u16>| {
+                    rows[slot as usize * compact_row..(slot as usize + 1) * compact_row].to_vec()
+                };
+                projected.push(pick(
+                    context_rows(
+                        &compact
+                            .project_context(&place(&others_fused, &x_fused, slot), at)
+                            .unwrap(),
+                    )
+                    .0,
+                ));
+                let block_taps = others_taps
+                    .iter()
+                    .zip(&x_taps)
+                    .map(|(others, x)| place(others, x, slot))
+                    .collect::<Vec<_>>();
+                fused_end_to_end.push(pick(
+                    context_rows(
+                        &compact
+                            .project_context(&compact.fuse_context(&block_taps).unwrap(), at)
+                            .unwrap(),
+                    )
+                    .0,
+                ));
+            }
+            slot_table.push((
+                width,
+                projected.windows(2).all(|pair| pair[0] == pair[1]),
+                fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
+            ));
+        }
+        eprintln!(
+            "probe (iii) M: projection slot-invariant, end-to-end slot-invariant: {slot_table:?}"
+        );
+
+        // (iv) Padding: retained rows [0, k) of an M-row block, the rest
+        // the real rows, zeros, or large random rows.
+        let mut padding_table = Vec::new();
+        for &width in &slot_widths {
+            for keep in [1, width / 2, width - 1] {
+                let variants = [0u8, 1, 2];
+                let pad = |source: &MxArray, variant: u8| -> MxArray {
+                    let rows = width - keep;
+                    let shape = [1, rows, source.shape_at(2).unwrap()];
+                    let padding = match variant {
+                        0 => source.slice_axis(1, keep, width).unwrap(),
+                        1 => MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap(),
+                        _ => {
+                            MxArray::random_normal(&shape, 0.0, 8.0, Some(DType::BFloat16)).unwrap()
+                        }
+                    };
+                    MxArray::concatenate(&source.slice_axis(1, 0, keep).unwrap(), &padding, 1)
+                        .unwrap()
+                };
+                let retained = keep as usize * compact_row;
+                let mut projected = Vec::new();
+                let mut fused_end_to_end = Vec::new();
+                for variant in variants {
+                    projected.push(
+                        context_rows(
+                            &compact
+                                .project_context(
+                                    &pad(&compact_fused.slice_axis(1, 0, width).unwrap(), variant),
+                                    base,
+                                )
+                                .unwrap(),
+                        )
+                        .0[..retained]
+                            .to_vec(),
+                    );
+                    let padded_taps = compact_tap_rows(0, width)
+                        .iter()
+                        .map(|tap| pad(tap, variant))
+                        .collect::<Vec<_>>();
+                    fused_end_to_end.push(
+                        context_rows(
+                            &compact
+                                .project_context(&compact.fuse_context(&padded_taps).unwrap(), base)
+                                .unwrap(),
+                        )
+                        .0[..retained]
+                            .to_vec(),
+                    );
+                }
+                padding_table.push((
+                    width,
+                    keep,
+                    projected.windows(2).all(|pair| pair[0] == pair[1]),
+                    fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
+                ));
+            }
+        }
+        eprintln!(
+            "probe (iv) M, keep: projection padding-invariant, end-to-end padding-invariant: {padding_table:?}"
+        );
+
+        assert!(
+            slot_table
+                .iter()
+                .all(|&(_, projected, fused)| projected && fused),
+            "a row's draft K/V must not depend on its slot: {slot_table:?}"
+        );
+        assert!(
+            padding_table
+                .iter()
+                .all(|&(_, _, projected, fused)| projected && fused),
+            "a row's draft K/V must not depend on the other rows: {padding_table:?}"
+        );
+    }
+
+    // Production-dimension NAX tensor-op tier check (8-, 16-, and 32-row
+    // affine tiers): on any NAX GPU, verify slot and padding invariance at the
+    // published Qwen3.8 projection dimensions (`fc [5120, 25600]`, merged
+    // `context_kv [10240, 5120]`) and assert that each width dispatches its
+    // tensor-op tier kernel. Probes (i) & (ii) also run on the calibrated
+    // gen-17 40-core NAX GPU reusing the same draft model.
+    let has_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
+    let calibrated = unsafe {
+        has_nax && mlx_sys::mlx_gpu_architecture_gen() == 17 && mlx_sys::mlx_gpu_core_count() == 40
+    };
+    if !has_nax {
+        return;
+    }
+
     unsafe { mlx_sys::mlx_seed(0x51_0001) };
     let model = qwen38_geometry_draft();
     assert!(model.context_kv.is_some(), "cross-layer k|v merge");
     assert_eq!(model.merged_rows(), 8);
-    let n = 2048i64;
+    let n = if calibrated { 2048i64 } else { 320i64 };
     let taps = (0..5)
         .map(|_| MxArray::random_normal(&[1, n, 5120], 0.0, 0.5, Some(DType::BFloat16)).unwrap())
         .collect::<Vec<_>>();
@@ -1954,8 +2274,158 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
             .map(|tap| tap.slice_axis(1, from, to).unwrap())
             .collect::<Vec<_>>()
     };
-    let base = 40_000i32;
     let fused_all = model.fuse_context(&taps).unwrap();
+    let (_, prod_row) = context_rows(
+        &model
+            .project_context(&fused_all.slice_axis(1, 0, 1).unwrap(), base)
+            .unwrap(),
+    );
+    let custom_metallib = std::env::var_os("MLX_PAGED_ATTN_METALLIB").is_some();
+    for (width, tier_name, min_dispatches) in [
+        (8i64, "qmm_m8_nax_t64", 2u64),
+        (16i64, "qmm_m16_nax_t64", 1u64),
+        (32i64, "qmm_m32_nax_t64", 1u64),
+        (64i64, "qmm_t_nax_t64", 1u64),
+        (256i64, "qmm_t_nax_t64", 1u64),
+    ] {
+        let tier_family = std::ffi::CString::new(tier_name).unwrap();
+        let p128_family = std::ffi::CString::new("qmm_t_nax_t64_p128").unwrap();
+        let splitk_family = std::ffi::CString::new("qmm_t_splitk_t64").unwrap();
+        // Verify that the production-width `fc` (and merged `context_kv` at
+        // M = 8) actually dispatch the corresponding NAX tensor-op tier.
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        let prod_fused = model.fuse_context(&tap_rows(0, width)).unwrap();
+        prod_fused.eval();
+        let fc_tier_count = unsafe { mlx_sys::mlx_test_kquant_family_count(tier_family.as_ptr()) };
+        let fc_p128_count = unsafe { mlx_sys::mlx_test_kquant_family_count(p128_family.as_ptr()) };
+        let fc_splitk_count =
+            unsafe { mlx_sys::mlx_test_kquant_family_count(splitk_family.as_ptr()) };
+        let _ = context_rows(&model.project_context(&prod_fused, base).unwrap());
+        let tier_count = unsafe { mlx_sys::mlx_test_kquant_family_count(tier_family.as_ptr()) };
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        assert!(
+            tier_count >= min_dispatches,
+            "Qwen3.8 M={width} must dispatch {tier_name} >= {min_dispatches}x (got {tier_count})"
+        );
+        if width == 64 {
+            assert!(
+                fc_tier_count >= 1 && fc_p128_count == 0 && fc_splitk_count == 0,
+                "Qwen3.8 M=64 fc must dispatch standard unsplit NAX (qmm_t_nax_t64={fc_tier_count}, p128={fc_p128_count}, splitk={fc_splitk_count})"
+            );
+        } else if width == 256 {
+            assert!(
+                fc_tier_count >= 1 && fc_splitk_count == 0,
+                "Qwen3.8 M=256 fc must stay unsplit NAX (qmm_t_nax_t64={fc_tier_count}, splitk={fc_splitk_count})"
+            );
+            if !custom_metallib {
+                assert!(
+                    fc_p128_count >= 1,
+                    "Qwen3.8 M=256 fc must dispatch qmm_t_nax_t64_p128 on built-in metallib (got {fc_p128_count})"
+                );
+            }
+        }
+
+        let others_fused = fused_all.slice_axis(1, 32, 32 + width).unwrap();
+        let others_taps = tap_rows(32, 32 + width);
+        let x_fused = fused_all.slice_axis(1, 0, 1).unwrap();
+        let x_taps = tap_rows(0, 1);
+        let place = |others: &MxArray, x: &MxArray, slot: i64| {
+            let mut parts = Vec::new();
+            if slot > 0 {
+                parts.push(others.slice_axis(1, 0, slot).unwrap());
+            }
+            parts.push(x.clone());
+            if slot + 1 < width {
+                parts.push(others.slice_axis(1, slot + 1, width).unwrap());
+            }
+            MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
+        };
+        let mut slot_proj = Vec::new();
+        let mut slot_e2e = Vec::new();
+        for slot in [0i64, 1, width / 2, width - 1] {
+            let at = base - slot as i32;
+            let pick = |rows: Vec<u16>| {
+                rows[slot as usize * prod_row..(slot as usize + 1) * prod_row].to_vec()
+            };
+            slot_proj.push(pick(
+                context_rows(
+                    &model
+                        .project_context(&place(&others_fused, &x_fused, slot), at)
+                        .unwrap(),
+                )
+                .0,
+            ));
+            let block_taps = others_taps
+                .iter()
+                .zip(&x_taps)
+                .map(|(others, x)| place(others, x, slot))
+                .collect::<Vec<_>>();
+            slot_e2e.push(pick(
+                context_rows(
+                    &model
+                        .project_context(&model.fuse_context(&block_taps).unwrap(), at)
+                        .unwrap(),
+                )
+                .0,
+            ));
+        }
+        assert!(
+            slot_proj.windows(2).all(|pair| pair[0] == pair[1])
+                && slot_e2e.windows(2).all(|pair| pair[0] == pair[1]),
+            "Qwen3.8 M={width} ({tier_name}) must be slot-invariant"
+        );
+
+        for keep in [1i64, width / 2, width - 1] {
+            let retained = keep as usize * prod_row;
+            let pad = |source: &MxArray, variant: u8| -> MxArray {
+                let rows = width - keep;
+                let shape = [1, rows, source.shape_at(2).unwrap()];
+                let padding = match variant {
+                    0 => source.slice_axis(1, keep, width).unwrap(),
+                    1 => MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap(),
+                    _ => MxArray::random_normal(&shape, 0.0, 8.0, Some(DType::BFloat16)).unwrap(),
+                };
+                MxArray::concatenate(&source.slice_axis(1, 0, keep).unwrap(), &padding, 1).unwrap()
+            };
+            let mut pad_proj = Vec::new();
+            let mut pad_e2e = Vec::new();
+            for variant in [0u8, 1, 2] {
+                pad_proj.push(
+                    context_rows(
+                        &model
+                            .project_context(
+                                &pad(&fused_all.slice_axis(1, 0, width).unwrap(), variant),
+                                base,
+                            )
+                            .unwrap(),
+                    )
+                    .0[..retained]
+                        .to_vec(),
+                );
+                let padded_taps = tap_rows(0, width)
+                    .iter()
+                    .map(|tap| pad(tap, variant))
+                    .collect::<Vec<_>>();
+                pad_e2e.push(
+                    context_rows(
+                        &model
+                            .project_context(&model.fuse_context(&padded_taps).unwrap(), base)
+                            .unwrap(),
+                    )
+                    .0[..retained]
+                        .to_vec(),
+                );
+            }
+            assert!(
+                pad_proj.windows(2).all(|pair| pair[0] == pair[1])
+                    && pad_e2e.windows(2).all(|pair| pair[0] == pair[1]),
+                "Qwen3.8 M={width} ({tier_name}) must be padding-invariant (keep={keep})"
+            );
+        }
+    }
+    if !calibrated {
+        return;
+    }
     let widths = [
         1i64, 2, 3, 7, 8, 9, 15, 16, 17, 32, 33, 64, 65, 128, 129, 224, 225, 255, 256, 257, 288,
         548, 1024, 1500, 2047, 2048,
@@ -2046,134 +2516,6 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
         "probe (ii) keep: merged==full_width, merged==per_layer, per_layer==per_layer@9, per_layer==per_layer@2048: {route_table:?}"
     );
 
-    // (iii) Slot: one row at slot p of an M-row block, its absolute
-    // position held fixed (base - p), other rows unchanged.
-    let slot_widths = [8i64, 16, 32, 64, 256];
-    let mut slot_table = Vec::new();
-    for &width in &slot_widths {
-        let others_fused = fused_all.slice_axis(1, 100, 100 + width).unwrap();
-        let others_taps = tap_rows(100, 100 + width);
-        let x_fused = fused_all.slice_axis(1, 5, 6).unwrap();
-        let x_taps = tap_rows(5, 6);
-        let place = |others: &MxArray, x: &MxArray, slot: i64| {
-            let mut parts = Vec::new();
-            if slot > 0 {
-                parts.push(others.slice_axis(1, 0, slot).unwrap());
-            }
-            parts.push(x.clone());
-            if slot + 1 < width {
-                parts.push(others.slice_axis(1, slot + 1, width).unwrap());
-            }
-            MxArray::concatenate_many(parts.iter().collect(), Some(1)).unwrap()
-        };
-        let mut projected = Vec::new();
-        let mut fused_end_to_end = Vec::new();
-        for slot in [0, 1, width / 2, width - 1] {
-            let at = base - slot as i32;
-            let pick =
-                |rows: Vec<u16>| rows[slot as usize * row..(slot as usize + 1) * row].to_vec();
-            projected.push(pick(
-                context_rows(
-                    &model
-                        .project_context(&place(&others_fused, &x_fused, slot), at)
-                        .unwrap(),
-                )
-                .0,
-            ));
-            let block_taps = others_taps
-                .iter()
-                .zip(&x_taps)
-                .map(|(others, x)| place(others, x, slot))
-                .collect::<Vec<_>>();
-            fused_end_to_end.push(pick(
-                context_rows(
-                    &model
-                        .project_context(&model.fuse_context(&block_taps).unwrap(), at)
-                        .unwrap(),
-                )
-                .0,
-            ));
-        }
-        slot_table.push((
-            width,
-            projected.windows(2).all(|pair| pair[0] == pair[1]),
-            fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
-        ));
-    }
-    eprintln!(
-        "probe (iii) M: projection slot-invariant, end-to-end slot-invariant: {slot_table:?}"
-    );
-
-    // (iv) Padding: retained rows [0, k) of an M-row block, the rest
-    // the real rows, zeros, or large random rows.
-    let mut padding_table = Vec::new();
-    for &width in &slot_widths {
-        for keep in [1, width / 2, width - 1] {
-            let variants = [0u8, 1, 2];
-            let pad = |source: &MxArray, variant: u8| -> MxArray {
-                let rows = width - keep;
-                let shape = [1, rows, source.shape_at(2).unwrap()];
-                let padding = match variant {
-                    0 => source.slice_axis(1, keep, width).unwrap(),
-                    1 => MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap(),
-                    _ => MxArray::random_normal(&shape, 0.0, 8.0, Some(DType::BFloat16)).unwrap(),
-                };
-                MxArray::concatenate(&source.slice_axis(1, 0, keep).unwrap(), &padding, 1).unwrap()
-            };
-            let retained = keep as usize * row;
-            let mut projected = Vec::new();
-            let mut fused_end_to_end = Vec::new();
-            for variant in variants {
-                projected.push(
-                    context_rows(
-                        &model
-                            .project_context(
-                                &pad(&fused_all.slice_axis(1, 0, width).unwrap(), variant),
-                                base,
-                            )
-                            .unwrap(),
-                    )
-                    .0[..retained]
-                        .to_vec(),
-                );
-                let padded_taps = tap_rows(0, width)
-                    .iter()
-                    .map(|tap| pad(tap, variant))
-                    .collect::<Vec<_>>();
-                fused_end_to_end.push(
-                    context_rows(
-                        &model
-                            .project_context(&model.fuse_context(&padded_taps).unwrap(), base)
-                            .unwrap(),
-                    )
-                    .0[..retained]
-                        .to_vec(),
-                );
-            }
-            padding_table.push((
-                width,
-                keep,
-                projected.windows(2).all(|pair| pair[0] == pair[1]),
-                fused_end_to_end.windows(2).all(|pair| pair[0] == pair[1]),
-            ));
-        }
-    }
-    eprintln!(
-        "probe (iv) M, keep: projection padding-invariant, end-to-end padding-invariant: {padding_table:?}"
-    );
-
-    assert!(
-        slot_table
-            .iter()
-            .all(|&(_, projected, fused)| projected && fused),
-        "a row's draft K/V must not depend on its slot: {slot_table:?}"
-    );
-    assert!(
-        padding_table
-            .iter()
-            .all(|&(_, _, projected, fused)| projected && fused),
-        "a row's draft K/V must not depend on the other rows: {padding_table:?}"
-    );
     let class_of = |classes: &[Vec<i64>], width: i64| {
         classes
             .iter()
@@ -2195,15 +2537,6 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
         "probe decision: (1) a changed append width changes draft K/V bits: {}; (2) the segment map needs {segment_key}",
         if width_changes_bits { "yes" } else { "no" }
     );
-
-    let calibrated = unsafe {
-        mlx_sys::mlx_gpu_architecture_gen() == 17
-            && mlx_sys::mlx_metal_is_nax_available()
-            && mlx_sys::mlx_gpu_core_count() == 40
-    };
-    if !calibrated {
-        return;
-    }
     assert!(
         width_changes_bits && per_layer_classes.len() > 1,
         "the tiled kernels' reduction follows M: a width-independent draft projection \

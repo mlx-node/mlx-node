@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import { getMemorySnapshot } from '@mlx-node/core';
+import * as core from '@mlx-node/core';
 import { validateSystemOneClairicEnvelope } from '@mlx-node/lm/clairic-types';
 import { validateClefRequest } from '@mlx-node/lm/clef-types';
 
@@ -16,7 +16,8 @@ import { recordExternalTurn } from '../turn-trace.js';
 
 function safeMemorySnapshot(): { activeBytes: number; peakBytes: number } | undefined {
   try {
-    const snap = getMemorySnapshot();
+    if (typeof core.getMemorySnapshot !== 'function') return undefined;
+    const snap = core.getMemorySnapshot();
     return { activeBytes: snap.activeBytes, peakBytes: snap.peakBytes };
   } catch {
     return undefined;

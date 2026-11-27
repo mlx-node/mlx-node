@@ -248,18 +248,36 @@ pub(crate) fn accept_dspark_proposal(
             // prefix. Construct deterministic target distributions together
             // without drawing acceptance coins or residual samples early.
             let mut targets = Vec::with_capacity(draft_len);
-            for (i, &draft_id) in proposal.draft_ids.iter().enumerate().take(draft_len) {
-                let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                targets.push(
-                    sampling::sampling_distribution(&penalized, p.sampling_config)?
-                        .astype(DType::Float32)?,
-                );
-                hist_extended.push(draft_id as u32);
-            }
+            let bonus_target = if penalties_no_op && draft_len > 0 {
+                // Without penalties every verify row shares identical sampling
+                // config, so run the compiled filter chain once on `[1+L, V]`.
+                let rows_2d = logits.squeeze(Some(&[0]))?;
+                let batched = sampling::sampling_distribution(&rows_2d, p.sampling_config)?
+                    .astype(DType::Float32)?;
+                for i in 0..draft_len as i64 {
+                    targets.push(batched.slice_axis(0, i, i + 1)?.reshape(&[vocab])?);
+                }
+                Some(
+                    batched
+                        .slice_axis(0, draft_len as i64, draft_len as i64 + 1)?
+                        .reshape(&[vocab])?,
+                )
+            } else {
+                for (i, &draft_id) in proposal.draft_ids.iter().enumerate().take(draft_len) {
+                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                    targets.push(
+                        sampling::sampling_distribution(&penalized, p.sampling_config)?
+                            .astype(DType::Float32)?,
+                    );
+                    hist_extended.push(draft_id as u32);
+                }
+                None
+            };
             let roots = targets
                 .iter()
+                .chain(bonus_target.iter())
                 .chain(proposal.draft_dists.iter())
                 .collect::<Vec<_>>();
             MxArray::eval_arrays_with_context(&roots, "speculative_sampled_accept")?;
@@ -296,13 +314,18 @@ pub(crate) fn accept_dspark_proposal(
                 Some(b) => b,
                 None => {
                     // All L drafts accepted: bonus sample from row L.
-                    let i = draft_len;
-                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                    let distribution =
-                        sampling::sampling_distribution(&penalized, p.sampling_config)?
-                            .astype(DType::Float32)?;
+                    let distribution = match bonus_target {
+                        Some(dist) => dist,
+                        None => {
+                            let i = draft_len;
+                            let v_slice =
+                                logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                            let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                            let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                            sampling::sampling_distribution(&penalized, p.sampling_config)?
+                                .astype(DType::Float32)?
+                        }
+                    };
                     sampling::sample_dense_distribution(&distribution, rng)? as u32
                 }
             };
@@ -358,18 +381,12 @@ pub(crate) fn accept_device_sampled(
     TEST_SAMPLED_ACCEPTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
     let vocab = logits.shape_at(2)?;
     let len = draft_len as i64;
-    let mut targets = Vec::with_capacity(draft_len + 1);
-    for i in 0..=len {
-        let row = logits
-            .slice(&[0, i, 0], &[1, i + 1, vocab])?
-            .squeeze(Some(&[0, 1]))?;
-        targets.push(
-            sampling::sampling_distribution(&row, p.sampling_config)?.astype(DType::Float32)?,
-        );
-    }
+    let rows_2d = logits.squeeze(Some(&[0]))?;
+    let all_targets =
+        sampling::sampling_distribution(&rows_2d, p.sampling_config)?.astype(DType::Float32)?;
     let coins: Vec<f32> = (0..draft_len).map(|_| rng.random::<f32>()).collect();
     let coins = MxArray::from_float32(&coins, &[len])?;
-    let drafted = MxArray::stack(targets[..draft_len].iter().collect(), Some(0))?;
+    let drafted = all_targets.slice_axis(0, 0, len)?;
     let column = ids.reshape(&[len, 1])?;
     let p_draft = drafted.take_along_axis(&column, 1)?.reshape(&[len])?;
     let q_draft = rows
@@ -394,10 +411,12 @@ pub(crate) fn accept_device_sampled(
         .clip(Some(0.0), None)?;
     let mut draws = Vec::with_capacity(draft_len + 1);
     for i in 0..len {
+        let target_row = all_targets.slice_axis(0, i, i + 1)?.reshape(&[vocab])?;
         let row = residual.slice_axis(0, i, i + 1)?.reshape(&[vocab])?;
-        draws.push(sampling::residual_draw_array(&targets[i as usize], &row, rng)?.reshape(&[1])?);
+        draws.push(sampling::residual_draw_array(&target_row, &row, rng)?.reshape(&[1])?);
     }
-    draws.push(sampling::sample_dense_distribution_array(&targets[draft_len], rng)?.reshape(&[1])?);
+    let bonus_target = all_targets.slice_axis(0, len, len + 1)?.reshape(&[vocab])?;
+    draws.push(sampling::sample_dense_distribution_array(&bonus_target, rng)?.reshape(&[1])?);
     let boundary =
         MxArray::concatenate_many(draws.iter().collect(), Some(0))?.take(&accepted, 0)?;
     MxArray::eval_arrays_with_context(

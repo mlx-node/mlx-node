@@ -20,7 +20,7 @@
 //! Run every captured route after an MLX pin change:
 //!
 //! ```text
-//! cargo test -p mlx-core --release --test affine_mixed_golden_gate -- --ignored --nocapture
+//! cargo test -p mlx-core --release --features e2e-tests --test affine_mixed_golden_gate -- --ignored --nocapture
 //! MLX_METAL_GPU_ARCH=applegpu_g17d cargo test ...   # 'd' class qmv batch limits
 //! MLX_METAL_GPU_ARCH=applegpu_g17g cargo test ...   # base class
 //! MLX_METAL_GPU_ARCH=applegpu_g17p cargo test ...   # gen 17 without NAX

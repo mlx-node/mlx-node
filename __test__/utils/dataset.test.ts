@@ -1,7 +1,9 @@
 import { resolve } from 'node:path';
 
-import { loadLocalGsm8kDataset, LocalGsm8kDatasetLoader, type ChatMessage } from '@mlx-node/trl';
+import type { ChatMessage } from '@mlx-node/core';
 import { describe, expect, it } from 'vite-plus/test';
+
+import { loadLocalGsm8kDataset, LocalGsm8kDatasetLoader } from '../../packages/trl/src/data/dataset.js';
 
 describe('Local GSM8K dataset loader', () => {
   it('loads a limited number of training examples and extracts answers', async () => {

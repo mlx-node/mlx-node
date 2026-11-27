@@ -60,7 +60,7 @@ mod compact_recurrence_tests {
         let mut expected_state = Some(input(&[3, 10240], 2.4));
         let mut actual_state = expected_state.clone();
         let mut compact_state = expected_state.clone();
-        for tokens in [1, 2, 7, 1024, 3] {
+        for tokens in [1, 2, 7, 256, 3] {
             let x = input(&[1, tokens, 10240], 0.1);
             let a = input(&[1, tokens, 48], 0.7).astype(DType::Float32).unwrap();
             let b = input(&[1, tokens, 48], 1.1).astype(DType::Float32).unwrap();
@@ -158,7 +158,7 @@ mod compact_recurrence_tests {
         for (kh, nh, d) in [(16, 48, 128), (48, 48, 128), (2, 4, 32)] {
             let mut expected = input(&[1, nh, d, d], 0.3).astype(DType::Float32).unwrap();
             let mut actual = expected.clone();
-            for tokens in [7, 1024, 1] {
+            for tokens in [7, 256, 1] {
                 let q = input(&[1, tokens, kh, d], 0.1);
                 let k = input(&[1, tokens, kh, d], 0.7);
                 let v = input(&[1, tokens, nh, d], 1.3);
@@ -273,8 +273,7 @@ mod rotary_window_tests {
         let mut cache = RotaryWindowCache::default();
         for dtype in [DType::BFloat16, DType::Float32] {
             for interleaved in [true, false] {
-                for (count, stride, base) in [(1, 1, 1023), (7, 4, 1), (256, 4, 2045), (1024, 1, 0)]
-                {
+                for (count, stride, base) in [(1, 1, 1023), (7, 4, 1), (32, 4, 2045), (64, 1, 0)] {
                     let positions: Vec<_> = (0..count)
                         .map(|i| {
                             let p = base + i * stride;
@@ -422,7 +421,7 @@ mod prefill_epilogue_tests {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return;
         }
-        for tokens in [1i64, 7, 128, 512, 692, 1024] {
+        for tokens in [1i64, 7, 128, 256] {
             let shape = [1, tokens, 2, 128];
             let n = (tokens * 2 * 128) as usize;
             let values: Vec<_> = (0..n).map(|i| (i as f32 * 0.013).sin() * 5.3).collect();

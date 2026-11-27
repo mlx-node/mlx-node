@@ -106,7 +106,7 @@ describe('runFirstRunWizard', () => {
     const { io, selectCalls } = makeIO();
     const { download } = makeDownload();
 
-    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC, platform: 'darwin' });
 
     const question = selectCalls[0]!;
     expect(question.message).toBe('Model to download');
@@ -273,7 +273,13 @@ describe('runFirstRunWizard', () => {
     const { io, selectCalls } = makeIO({ answers: ['Hy4-flash'] });
     const { download, calls } = makeDownload();
 
-    const folder = await runFirstRunWizard({ io, download, modelsDir: '/other/models', totalMemBytes: LARGE_MAC });
+    const folder = await runFirstRunWizard({
+      io,
+      download,
+      modelsDir: '/other/models',
+      totalMemBytes: LARGE_MAC,
+      platform: 'darwin',
+    });
 
     expect(selectCalls.map((call) => call.message)).toEqual(['Model to download']);
     expect(folder).toBe('hy4-flash-gguf');
@@ -312,11 +318,11 @@ describe('runFirstRunWizard', () => {
 
     // The hint must list every offered repo so headless users can copy a command.
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC, platform: 'darwin' });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      for (const entry of visibleCatalog(LARGE_MAC)) {
+      for (const entry of visibleCatalog(LARGE_MAC, 'darwin')) {
         expect(message).toContain(repoOf(entry));
       }
     }
@@ -330,11 +336,11 @@ describe('runFirstRunWizard', () => {
     const { download, calls } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC, platform: 'darwin' });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      for (const entry of visibleCatalog(LARGE_MAC)) {
+      for (const entry of visibleCatalog(LARGE_MAC, 'darwin')) {
         const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
         expect(line).toBeDefined();
         const commands = line.trim().split(' && ');
@@ -361,13 +367,13 @@ describe('runFirstRunWizard', () => {
 
     let message = '';
     try {
-      await runFirstRunWizard({ io, download, modelsDir, totalMemBytes: LARGE_MAC });
+      await runFirstRunWizard({ io, download, modelsDir, totalMemBytes: LARGE_MAC, platform: 'darwin' });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       message = (error as Error).message;
     }
 
-    for (const entry of visibleCatalog(LARGE_MAC)) {
+    for (const entry of visibleCatalog(LARGE_MAC, 'darwin')) {
       const slug = catalogBuildSlug(entry.builds[0]);
       const line = message.split('\n').find((l) => l.includes(repoOf(entry)));
       expect(line).toBeDefined();
@@ -396,11 +402,11 @@ describe('runFirstRunWizard', () => {
     const { download } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC, platform: 'darwin' });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      const entry = visibleCatalog(LARGE_MAC)[0]!;
+      const entry = visibleCatalog(LARGE_MAC, 'darwin')[0]!;
       const slug = catalogBuildSlug(entry.builds[0]);
       // Safe paths stay readable: the -o value renders unquoted...
       expect(message).toContain(`-o /custom/models/${slug}`);

@@ -50,7 +50,7 @@
 //!
 //! Run:
 //!   KQ_PARITY_ROOT=... cargo test -p mlx-core --release \
-//!     --test kquant_realdata_llamacpp_parity -- --ignored --nocapture
+//!     --features e2e-tests --test kquant_realdata_llamacpp_parity -- --ignored --nocapture
 
 use std::ffi::CString;
 use std::fs::File;

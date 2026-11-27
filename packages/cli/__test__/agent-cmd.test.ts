@@ -10,13 +10,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
-import {
-  WHOLE_PROMPT_CAPTURE_BLOCKS,
-  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
-} from '@mlx-node/server/host/persist-cache';
+import { WHOLE_PROMPT_CAPTURE_BLOCKS, WHOLE_PROMPT_CAPTURE_BUDGET_MS } from '@mlx-node/server/host/persist-cache';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { agentPreambleText, scanAgentArgs } from '../src/commands/agent/index.js';
+import { agentPreambleText, scanAgentArgs } from '../src/commands/agent/args.js';
 
 describe('scanAgentArgs --no-persist-cache', () => {
   // Mutation TPA1: the agent's default is `byDefault: false` → red.

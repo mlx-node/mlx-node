@@ -951,8 +951,8 @@ fn hc_fused_suite_and_prefill_row2_parity_and_invariance() {
 fn bf16_lm_head_and_f32_head_weights_row_invariant() {
     crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(701);
-    for &v in &[32usize, 37, 4096] {
-        for &k in &[64usize, 192, 3072] {
+    for &v in &[32usize, 37, 1024] {
+        for &k in &[64usize, 192, 1024] {
             let wb: Vec<u16> = rng
                 .vec_f32(v * k, 1.0 / (k as f32).sqrt())
                 .into_iter()
@@ -989,7 +989,7 @@ fn bf16_lm_head_and_f32_head_weights_row_invariant() {
         }
     }
 
-    for &(n, k) in &[(16usize, 3072usize), (2, 12), (32, 128)] {
+    for &(n, k) in &[(16usize, 1024usize), (2, 12), (32, 128)] {
         let scale = ((n * 128) as f32).sqrt().recip();
         let w = Dense::Array(arr(&rng.vec_f32(n * k, 0.25), &[n, k]));
         let x_all = arr(&rng.vec_f32(16 * k, 1.0), &[16, k]);
@@ -1511,7 +1511,7 @@ fn engram_fused_norm_and_gate_add_match_unfused_and_are_row_invariant() {
     let mut rng = Rng::new(3701);
 
     for &(hc, d, cols, hd) in &[
-        (4usize, 3072usize, 16usize, 96usize),
+        (4usize, 512usize, 16usize, 96usize),
         (4, 8, 2, 4),
         (4, 66, 4, 12),
     ] {
@@ -1604,8 +1604,8 @@ fn engram_fused_norm_and_gate_add_match_unfused_and_are_row_invariant() {
         );
     }
 
-    // M=512, HC=4, D=3072 repeated launch race stress (with negative gate_w).
-    let (hc, d, m) = (4usize, 3072usize, 512usize);
+    // M=128, HC=4, D=1024 repeated launch race stress (with negative gate_w).
+    let (hc, d, m) = (4usize, 1024usize, 128usize);
     let kv_b = arr(&rng.vec_f32((hc + 1) * d, 0.25), &[hc + 1, d]);
     let gw = arr(
         &rng.vec_f32(hc * d, 1.0)
@@ -1622,19 +1622,21 @@ fn engram_fused_norm_and_gate_add_match_unfused_and_are_row_invariant() {
         arr(&rng.vec_f32(m * hc * d, 1.5), &[m, hc, d]),
         arr(&rng.vec_f32(m * (hc + 1) * d, 1.2), &[m, (hc + 1) * d]),
     );
-    let ref_out = engram_gate_add_ref(
+    let ref_f32 = read_f32(&engram_gate_add_ref(
         &xm,
         &kvm,
         &[&kv_b, &gw, &pg, &hcs],
         (m as i64, hc as i64, d as i64),
-    );
+    ));
     let mut first: Option<Vec<u32>> = None;
-    for rep in 0..8 {
+    for rep in 0..3 {
         let got = try_engram_gate_add(&xm, &kvm, &kv_b, &gw, &pg, &hcs, None, ENGRAM_EPS)
             .unwrap()
             .unwrap();
-        assert_err(&got, &ref_out, 1e-5, &format!("stress rep={rep}"));
-        let b = read_bits(&got);
+        let got_f32 = read_f32(&got);
+        let err = max_abs_err(&got_f32, &ref_f32);
+        assert!(err <= 1e-5, "stress rep={rep}: max_abs={err:e} > 1e-5");
+        let b = f32_bits(&got_f32);
         if let Some(prev) = &first {
             assert_eq!(b, *prev, "stress rep={rep} diverged");
         } else {

@@ -55,6 +55,40 @@ pub(crate) struct DraftKvWindow {
 }
 
 #[cfg(test)]
+impl Clone for DraftKvWindow {
+    fn clone(&self) -> Self {
+        // Deep-copy and eagerly materialize ring buffers: `deep_copy` is lazy,
+        // and in-place `store_rows` mutates the source window's GPU storage.
+        let keys = self
+            .keys
+            .as_ref()
+            .map(|k| k.deep_copy().expect("clone DraftKvWindow keys"));
+        let values = self
+            .values
+            .as_ref()
+            .map(|v| v.deep_copy().expect("clone DraftKvWindow values"));
+        let mut to_eval = Vec::with_capacity(2);
+        if let Some(ref k) = keys {
+            to_eval.push(k);
+        }
+        if let Some(ref v) = values {
+            to_eval.push(v);
+        }
+        if !to_eval.is_empty() {
+            MxArray::eval_arrays(&to_eval).expect("eval cloned DraftKvWindow buffers");
+        }
+        Self {
+            keys,
+            values,
+            start: self.start,
+            end: self.end,
+            slots: self.slots,
+            reserve: self.reserve,
+        }
+    }
+}
+
+#[cfg(test)]
 thread_local! {
     /// Draft ring buffers allocated on this thread.
     pub(crate) static RING_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -391,6 +425,22 @@ pub(crate) struct DFlash2ContextCache {
     /// `with_block`. Restoring them drops any lazy `KvStoreRows` handles whose
     /// inputs depend on a failed shared batched forward graph before solo retry.
     pub(super) pre_propose_handles: Option<Vec<(Option<MxArray>, Option<MxArray>)>>,
+}
+
+#[cfg(test)]
+impl Clone for DFlash2ContextCache {
+    fn clone(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            mask_memo: self.mask_memo.clone(),
+            logical_len: self.logical_len,
+            kv_end: self.kv_end,
+            token_history: self.token_history.clone(),
+            vocab_size: self.vocab_size,
+            wide_vocab: self.wide_vocab,
+            pre_propose_handles: None,
+        }
+    }
 }
 
 impl DFlash2ContextCache {

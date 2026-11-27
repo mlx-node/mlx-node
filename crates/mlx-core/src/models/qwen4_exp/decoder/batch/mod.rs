@@ -412,9 +412,7 @@ impl Decoder {
                 slot_of[e as usize] = slot;
             }
             #[cfg(test)]
-            let watched = self
-                .fill_bank_checks
-                .is_some()
+            let watched = (self.fill_bank_checks.is_some() && sub_groups.get(g + 1).is_some())
                 .then(|| self.weights.slot_rows_bits(i, &slots));
             ahead = match sub_groups.get(g + 1) {
                 Some(next) => self.weights.begin_expert_fill(i, experts, top, next)?,

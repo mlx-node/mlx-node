@@ -3,7 +3,7 @@
 //! ```shell
 //! MLX_TEST_QWEN38_TARGET_PATH=/path/to/qwen3.8-27b-mlx \
 //! MLX_TEST_QWEN38_DFLASH2_PATH=/path/to/qwen3.8-27b-dflash2 \
-//! cargo test -p mlx-core --test qwen3_8_dflash2 -- --ignored --nocapture
+//! cargo test -p mlx-core --features e2e-tests --test qwen3_8_dflash2 -- --ignored --nocapture
 //! ```
 
 use mlx_core::engine::types::ChatConfig;

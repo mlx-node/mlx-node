@@ -21,7 +21,7 @@
 //! image inputs, so they are not a usable vision golden. Run:
 //!   MLX_TEST_GEMMA4_VL_MODEL_PATH=.cache/models/gemma-4-e2b-it-mlx \
 //!   MLX_TEST_VLM_IMAGE_PATH=examples/ocr.png \
-//!     cargo test -p mlx-core --test gemma4_vl_image_chat -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test gemma4_vl_image_chat -- --ignored --nocapture
 
 use std::path::{Path, PathBuf};
 

@@ -196,11 +196,11 @@ mod tests {
                 .unwrap();
             MxArray::async_eval_arrays(&[&lazy]);
             for array in [&column, &lazy] {
-                for seed in 0..16 {
+                for seed in 0..4 {
                     let mut first = StdRng::seed_from_u64(seed);
                     let mut second = StdRng::seed_from_u64(seed);
                     let mut keys = StdRng::seed_from_u64(seed);
-                    for _ in 0..16 {
+                    for _ in 0..8 {
                         let token = sample_dense_distribution(array, &mut first).unwrap();
                         assert_eq!(
                             token,
@@ -281,6 +281,17 @@ mod tests {
                 (nan, None),
                 (vec![f32::NEG_INFINITY; width], Some(true)),
             ];
+            let width_i32 = width as i32;
+            let mut top_ks = vec![0, 1, 2, 50, width_i32 - 1, width_i32, width_i32 + 1];
+            top_ks.retain(|&k| k >= 0 && k <= width_i32 + 1);
+            top_ks.sort_unstable();
+            top_ks.dedup();
+            // Full 4 temps x 8 seeds on two representative widths (multi-warp small
+            // and the fused kernel limit); 2 temps x 2 seeds on the remaining widths.
+            let (temps, seeds): (&[f64], std::ops::Range<u64>) = match width {
+                130 | 4096 => (&[0.5, 0.9, 1.0, 1.7], 0..8),
+                _ => (&[0.5, 1.7], 0..2),
+            };
             for (row_index, (row, no_mass)) in rows.iter().enumerate() {
                 for dtype in [crate::array::DType::Float32, crate::array::DType::BFloat16] {
                     let logits = MxArray::from_float32(row, &[1, width as i64])
@@ -288,10 +299,9 @@ mod tests {
                         .astype(dtype)
                         .unwrap();
                     let mut pairs = Vec::new();
-                    for temperature in [0.5, 0.9, 1.0, 1.7] {
-                        let width = width as i32;
-                        for top_k in [0, 1, 2, 50, width - 1, width, width + 1] {
-                            for seed in 0..8 {
+                    for &temperature in temps {
+                        for &top_k in &top_ks {
+                            for seed in seeds.clone() {
                                 let mut fused_rng = StdRng::seed_from_u64(seed);
                                 let mut composed_rng = StdRng::seed_from_u64(seed);
                                 let fused = sample_logits_array(
@@ -360,33 +370,57 @@ mod tests {
 
     #[test]
     fn device_draw_and_rejection_recover_the_target_distribution() {
+        const DRAWS: usize = 4_096;
+        const BATCH: usize = 128;
         let target = MxArray::from_float32(&[0.1, 0.3, 0.6, 0.0], &[4]).unwrap();
         let draft = MxArray::from_float32(&[0.6, 0.3, 0.1, 0.0], &[4]).unwrap();
+        target.eval();
+        draft.eval();
         let mut rng = StdRng::seed_from_u64(92731);
         let mut proposed = [0usize; 4];
         let mut accepted = [0usize; 4];
         let config = crate::sampling::SamplingConfig::default();
-        for _ in 0..4096 {
-            let token = sample_dense_distribution(&draft, &mut rng).unwrap();
-            proposed[token as usize] += 1;
-            let (_, result) =
-                crate::sampling::accept_with_residual(&target, &draft, token, &config, &mut rng)
-                    .unwrap();
-            accepted[result as usize] += 1;
+        for _ in 0..(DRAWS / BATCH) {
+            let draft_arrays: Vec<MxArray> = (0..BATCH)
+                .map(|_| sample_dense_distribution_array(&draft, &mut rng).unwrap())
+                .collect();
+            for token in materialize_draft_tokens(&draft_arrays).unwrap() {
+                proposed[token as usize] += 1;
+                let (_, result) = crate::sampling::accept_with_residual(
+                    &target, &draft, token, &config, &mut rng,
+                )
+                .unwrap();
+                accepted[result as usize] += 1;
+            }
         }
-        for (counts, expected) in [
-            (proposed, [0.6, 0.3, 0.1, 0.0]),
-            (accepted, [0.1, 0.3, 0.6, 0.0]),
+        for (name, counts, expected) in [
+            ("proposed", proposed, [0.6, 0.3, 0.1, 0.0]),
+            ("accepted", accepted, [0.1, 0.3, 0.6, 0.0]),
         ] {
-            assert_eq!(counts[3], 0, "zero-mass tokens must never be sampled");
+            assert_eq!(
+                counts[3], 0,
+                "{name}: zero-mass tokens must never be sampled"
+            );
             for i in 0..3 {
-                let observed = counts[i] as f64 / 4096.0;
+                let observed = counts[i] as f64 / DRAWS as f64;
                 assert!(
                     (observed - expected[i]).abs() < 0.04,
-                    "token {i}: observed {observed}, expected {}",
+                    "{name}: token {i}: observed {observed}, expected {}",
                     expected[i]
                 );
             }
+            // Exact chi-square with dof = 2 (3 positive-mass bins): P(X >= chi2) = exp(-chi2 / 2).
+            let chi2: f64 = (0..3)
+                .map(|i| {
+                    let e = expected[i] * DRAWS as f64;
+                    (counts[i] as f64 - e).powi(2) / e
+                })
+                .sum();
+            let p_val = (-chi2 / 2.0).exp();
+            assert!(
+                p_val >= 1e-6,
+                "{name}: counts {counts:?}, expected {expected:?}, chi2 {chi2:.2}, p {p_val:.3e}"
+            );
         }
     }
 

@@ -12,7 +12,7 @@
 //!
 //! ```shell
 //! MLX_TEST_LFM2_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx-bf16 \
-//!     cargo test -p mlx-core --test lfm2_session -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test lfm2_session -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_LFM2_MODEL_PATH` the test early-returns and passes

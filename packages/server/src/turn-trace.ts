@@ -33,26 +33,23 @@
 
 import { randomUUID } from 'node:crypto';
 
-import {
-  coldCacheStats,
-  coldSidecarStats,
-  getMemorySnapshot,
-  memoryGovernorStatus,
-  type ChatConfig,
-  type ChatMessage,
-  type ChatResult,
-  type ChatStreamProgress,
-  type ColdCacheStats,
-  type ColdSidecarStats,
-  type PerformanceMetrics,
+import * as core from '@mlx-node/core';
+import type {
+  ChatConfig,
+  ChatMessage,
+  ChatResult,
+  ChatStreamProgress,
+  ColdCacheStats,
+  ColdSidecarStats,
+  PerformanceMetrics,
 } from '@mlx-node/core';
 import {
   isMediaHeldRestartError,
   mtpAutoDefaultAllowed,
-  type ChatStreamEvent,
   type ChatStreamControl,
+  type ChatStreamEvent,
   type SessionCapableModel,
-} from '@mlx-node/lm';
+} from '@mlx-node/lm/chat-session';
 import { canonicalCacheRoot, COLD_TIER_STATE_FAMILIES } from '@mlx-node/lm/cold-tier';
 
 import {
@@ -75,7 +72,7 @@ import type { MeasuredPrefill } from './timing.js';
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
 function safeColdStats(): ColdCacheStats | undefined {
   try {
-    return coldCacheStats();
+    return typeof core.coldCacheStats === 'function' ? core.coldCacheStats() : undefined;
   } catch {
     return undefined;
   }
@@ -90,7 +87,7 @@ function safeColdStats(): ColdCacheStats | undefined {
  */
 function safeSidecarStats(): ColdSidecarStats | undefined {
   try {
-    return coldSidecarStats();
+    return typeof core.coldSidecarStats === 'function' ? core.coldSidecarStats() : undefined;
   } catch {
     return undefined;
   }
@@ -102,7 +99,9 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
  */
 function safeStateTierMode(): string | undefined {
   try {
-    return memoryGovernorStatus()?.dflash2States.disk.mode;
+    return typeof core.memoryGovernorStatus === 'function'
+      ? core.memoryGovernorStatus()?.dflash2States.disk.mode
+      : undefined;
   } catch {
     return undefined;
   }
@@ -111,7 +110,8 @@ function safeStateTierMode(): string | undefined {
 /** Process-wide memory reader; the native addon may be absent (unit tests). */
 function safeMemory(): { activeBytes: number; peakBytes: number } | undefined {
   try {
-    const snapshot = getMemorySnapshot();
+    if (typeof core.getMemorySnapshot !== 'function') return undefined;
+    const snapshot = core.getMemorySnapshot();
     return { activeBytes: snapshot.activeBytes, peakBytes: snapshot.peakBytes };
   } catch {
     return undefined;

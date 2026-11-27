@@ -3,6 +3,8 @@ import type { AddressInfo } from 'node:net';
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { runGuardedModelLoad, type GuardedLoadDeps } from '../../packages/server/src/load-model.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry, type ServableModel } from '../../packages/server/src/registry.js';

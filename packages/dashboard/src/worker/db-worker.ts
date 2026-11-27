@@ -14,19 +14,9 @@
 
 import { parentPort, receiveMessageOnPort, workerData, type MessagePort } from 'node:worker_threads';
 
-import { AgentSessionsReader } from '../agent-sessions/reader.js';
-import type { IngestPassResult, IngestSummary, WorkerApiContext } from '../api/context.js';
-import { dispatchWorker } from '../api/dispatch.js';
-import { failure, toFailure, type ApiResponse } from '../api/errors.js';
-import { readWorkIndexSync } from '../chat/index-file.js';
-import { openDashboardDb } from '../db/open.js';
-import { ingestRuntime } from '../ingest/runtime.js';
-import { ingestTraces } from '../ingest/traces.js';
-import { closePrefixCacheWalks } from '../prefix-cache.js';
+import { failure } from '../api/errors.js';
+import { createDbWorkerEngine } from './engine.js';
 import type { DbWorkerBoot, MainToWorker, WorkerToMain } from './protocol.js';
-
-/** Trace-file retention passed to the periodic + boot ingest. */
-const RETENTION_DAYS = 30;
 
 function requireParentPort(): MessagePort {
   if (parentPort === null) throw new Error('db-worker.ts must be started as a worker thread');
@@ -34,18 +24,8 @@ function requireParentPort(): MessagePort {
 }
 const port = requireParentPort();
 
-const {
-  dbPath,
-  modelsDir,
-  tracesDir,
-  runtimeDir,
-  cacheRoot,
-  prefixCacheRoot,
-  agentHome,
-  chatAgentHome,
-  chatIndexPath,
-  withdrawPort,
-} = workerData as DbWorkerBoot;
+const boot = workerData as DbWorkerBoot;
+const { withdrawPort } = boot;
 
 /**
  * Requests the transport thread stopped waiting for before this thread reached
@@ -85,68 +65,7 @@ function isWithdrawn(id: number): boolean {
   return withdrawn.delete(id);
 }
 
-const dash = openDashboardDb(dbPath);
-
-// Serialize ingests so overlapping timer/boot/manual runs never interleave
-// SQLite transactions. `doIngest` never throws, so a failed run cannot poison
-// the chain for later callers (a rejected promise would skip every queued
-// `.then`).
-const doIngest = async (): Promise<IngestSummary> => {
-  let traces: IngestPassResult;
-  let runtime: IngestPassResult;
-  try {
-    traces = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
-  } catch (err) {
-    traces = { files: 0, records: 0, pruned: 0, warnings: [String(err)] };
-  }
-  try {
-    runtime = await ingestRuntime(dash, runtimeDir);
-  } catch (err) {
-    runtime = { files: 0, records: 0, pruned: 0, warnings: [String(err)] };
-  }
-  return { traces, runtime };
-};
-let ingestChain: Promise<IngestSummary> = Promise.resolve({
-  traces: { files: 0, records: 0, pruned: 0, warnings: [] },
-  runtime: { files: 0, records: 0, pruned: 0, warnings: [] },
-});
-const runIngest = (): Promise<IngestSummary> => {
-  ingestChain = ingestChain.then(doIngest);
-  return ingestChain;
-};
-
-/**
- * Await the ingest chain to its FIXPOINT, re-reading after each await: a caller
- * can queue another rescan while we wait, and closing the database under an
- * in-flight one only ever looked harmless because `doIngest`'s catch swallowed
- * the resulting "database is not open".
- *
- * `ingestTraces` and `ingestRuntime` have fully synchronous bodies today, so the
- * chain advances on microtasks and no `close` message can be DELIVERED while it
- * runs — which makes this await invisible in a test right now. It is what keeps
- * the invariant true the day one of them awaits real I/O.
- */
-const drainIngest = async (): Promise<void> => {
-  let awaited: Promise<IngestSummary> | null = null;
-  while (awaited !== ingestChain) {
-    awaited = ingestChain;
-    await awaited;
-  }
-};
-
-const ctx: WorkerApiContext = {
-  dash,
-  modelsDir,
-  tracesDir,
-  runtimeDir,
-  cacheRoot,
-  prefixCacheRoot,
-  agentHome,
-  runIngest,
-  agentSessions: new AgentSessionsReader({ agentHome }),
-  chatSessions: new AgentSessionsReader({ agentHome: chatAgentHome, origin: 'chat' }),
-  chatIndex: () => readWorkIndexSync(chatIndexPath),
-};
+const engine = createDbWorkerEngine(boot);
 
 /**
  * Post a reply, or — when the payload defeats the structured clone algorithm (a
@@ -167,27 +86,6 @@ function post(message: WorkerToMain): void {
   }
 }
 
-async function answerCall(message: Extract<MainToWorker, { kind: 'call' }>): Promise<ApiResponse> {
-  try {
-    // A constant, trusted base: only the path + query of `message.path` are used.
-    // Rebuilding the params HERE is why the wire carries a string — a
-    // `URLSearchParams` is not structured-clonable.
-    const url = new URL(message.path, 'http://localhost');
-    return await dispatchWorker(ctx, {
-      method: message.method,
-      pathname: url.pathname,
-      query: url.searchParams,
-      body: message.body,
-      ...(message.bodyError !== undefined ? { bodyError: message.bodyError } : {}),
-    });
-  } catch (err) {
-    // `dispatchWorker` converts handler throws itself; this catches a fault in
-    // matching (e.g. `decodeURIComponent` on a malformed `%` escape) so every
-    // request gets exactly one reply.
-    return toFailure(err);
-  }
-}
-
 async function handle(message: MainToWorker): Promise<void> {
   switch (message.kind) {
     case 'call':
@@ -200,22 +98,17 @@ async function handle(message: MainToWorker): Promise<void> {
         post({ kind: 'withdrawn', id: message.id });
         return;
       }
-      post({ kind: 'response', id: message.id, response: await answerCall(message) });
+      post({ kind: 'response', id: message.id, response: await engine.call(message) });
       return;
     case 'ingest':
-      post({ kind: 'ingested', id: message.id, summary: await runIngest() });
+      post({ kind: 'ingested', id: message.id, summary: await engine.ingest() });
       return;
     case 'drain':
-      await drainIngest();
+      await engine.drain();
       post({ kind: 'drained', id: message.id });
       return;
     case 'close':
-      // Drain again rather than trusting the earlier `drain`: a call answered in
-      // between can queue a rescan of its own (the rename/delete handlers do), and
-      // that must finish against an OPEN database.
-      await drainIngest();
-      dash.close();
-      closePrefixCacheWalks();
+      await engine.close();
       post({ kind: 'closed', id: message.id });
       // Ending the message loop is what lets the thread exit on its own; the
       // runtime still terminates it if this never happens.
@@ -230,4 +123,4 @@ port.on('message', (message: MainToWorker) => {
 });
 
 // Boot ingest, owned here so the transport thread never waits on it.
-void runIngest();
+void engine.ingest();

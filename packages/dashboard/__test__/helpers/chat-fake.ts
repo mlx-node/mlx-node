@@ -339,6 +339,7 @@ export interface FakeServiceOptions {
   /** Read at each service start (a Control Panel restart reads MAIN's ledger again). */
   appEnds?: () => ChatServiceOptions['appEnds'];
   onBusyChange?: ChatServiceOptions['onBusyChange'];
+  maxPicturesBase64?: ChatServiceOptions['maxPicturesBase64'];
 }
 
 export interface FakeService {
@@ -437,6 +438,7 @@ export function fakeService(name: string, options: FakeServiceOptions = {}): Fak
       createBudgetMs: options.createBudgetMs,
       appEnds: options.appEnds?.(),
       onBusyChange: options.onBusyChange,
+      maxPicturesBase64: options.maxPicturesBase64,
     });
   const records = (): Json[] => {
     try {

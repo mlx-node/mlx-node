@@ -376,7 +376,12 @@ mod tests {
             0
         );
 
-        let err = assets_in(&source, &store, &config, &cache).unwrap_err();
+        let err = crate::utils::gguf::with_test_sidecar_retry_budget(
+            3,
+            std::time::Duration::from_millis(5),
+            || assets_in(&source, &store, &config, &cache),
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("sidecar lock"),
             "expected a contention error, got: {}",
@@ -479,7 +484,12 @@ mod tests {
         // every platform, so the keyed lease fails closed.
         fs::create_dir_all(cache.join(format!("{dir_name}.lease"))).unwrap();
 
-        let err = assets_in(&source, &store, &config, &cache).unwrap_err();
+        let err = crate::utils::gguf::with_test_sidecar_retry_budget(
+            3,
+            std::time::Duration::from_millis(5),
+            || assets_in(&source, &store, &config, &cache),
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("lease"),
             "the load must fail rather than return an unleasable sidecar, got: {}",

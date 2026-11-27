@@ -4,15 +4,17 @@
  */
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
+import type { SessionCapableModel } from '@mlx-node/lm/chat-session';
 import {
   GEMMA4_SAMPLING_DEFAULTS,
   LFM2_SAMPLING_DEFAULTS,
   QWEN_SAMPLING_DEFAULTS,
   launchPresetFor,
-  type SessionCapableModel,
-} from '@mlx-node/lm';
+} from '@mlx-node/lm/family-data';
 import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 // Mock model: captures the merged ChatConfig ChatSession passes to
 // chatSessionStart.

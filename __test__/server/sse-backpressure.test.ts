@@ -8,6 +8,8 @@ import type { ChatStreamControl, SessionCapableModel } from '@mlx-node/lm';
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 import * as streaming from '../../packages/server/src/streaming.js';

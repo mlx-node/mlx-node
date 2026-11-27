@@ -2,7 +2,9 @@ import type { IncomingMessage } from 'node:http';
 import { connect as netConnect, type AddressInfo } from 'node:net';
 
 import { createServer, type ServerInstance } from '@mlx-node/server';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
+
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
 
 import { extractPresentedToken, isAuthorized, tokensMatch } from '../../packages/server/src/auth.js';
 import { resolveAuthToken } from '../../packages/server/src/server.js';

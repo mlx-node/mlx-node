@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import { ApiError } from '../src/api/errors.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import { attachmentView, type AttachmentInput, CHAT_PICTURES_MAX_BASE64 } from '../src/chat/attachment-rule.js';
+import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
 import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
@@ -1012,7 +1012,8 @@ describe('Chat service — attachments', () => {
 
   // Mutation: drop the count of the pictures a chat holds → the last picture goes out.
   it('a picture past the stored pictures a chat can keep is refused; text and files still go', async () => {
-    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES] });
+    const cap = 1024;
+    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES], maxPicturesBase64: cap });
     try {
       const svc = fake.service;
       const { conversation } = await svc.create({ mode: 'chat', text: 'hello' });
@@ -1021,7 +1022,7 @@ describe('Chat service — attachments', () => {
       const big: AttachmentInput = {
         kind: 'image',
         mediaType: 'image/png',
-        data: `iVBO${'A'.repeat(CHAT_PICTURES_MAX_BASE64 - 8)}`,
+        data: `iVBO${'A'.repeat(cap - 8)}`,
       };
       await svc.prompt(conversation.id, 'a big one', [big]);
       await until(() => page.ends().length === 2, 10_000);
@@ -1331,8 +1332,8 @@ describe('Chat service — Work', () => {
         [fake.root, 'home'],
         [dirname(fake.root), 'home'],
       ];
-      const firmlinked = `/System/Volumes/Data${realpathSync(join(fake.root, 'home'))}`;
-      if (existsSync(firmlinked)) cases.push([firmlinked, 'home'], [`${firmlinked}/../agent-home`, 'app-data']);
+      // macOS `/System/Volumes/Data` firmlink refusal cases live in
+      // `chat-work-landing.test.ts` (`darwin-ts` lane) so macOS CI always asserts them.
       mkdirSync(fake.paths.root, { recursive: true });
       mkdirSync(join(fake.root, 'agent-home'), { recursive: true });
       try {

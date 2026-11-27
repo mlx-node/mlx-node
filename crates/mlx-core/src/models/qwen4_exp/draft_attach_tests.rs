@@ -3,8 +3,9 @@
 //! draft reports none. Through the scheduler, a sampled drafted turn keeps
 //! the target's distribution with the engine's accept rule, a proposal
 //! error fails the turn, and a drafted turn reports its cycles.
-use super::draft_cycle::moe_draft;
+use super::draft_cycle::{chi_square_p, moe_draft, tilted_row};
 use super::draft_switch::{ROWS, chat_model, forced, full_length};
+use super::draft_view::tiny_draft;
 use super::lanes::direct_inner;
 use super::*;
 use crate::engine::backend::ChatBackend;
@@ -335,26 +336,31 @@ fn drafted_config(max_new: i32, temperature: f64) -> ChatConfig {
     }
 }
 
-/// The target's sampling distribution after `prompt` then `tokens`, from a
-/// cold prefill of the prompt on `inner`'s sequence 1.
-fn target_after(
-    inner: &mut Inner,
-    prompt: &[u32],
-    tokens: &[u32],
-    config: &ChatConfig,
-) -> Vec<f64> {
-    let params = extract_chat_params(config);
-    inner.decoder.reset();
-    if let Some(adapter) = inner.decoder.paged.as_mut()
-        && adapter.block_table_for(1).is_some()
-    {
-        adapter.release_request_for(1).unwrap();
+/// A tiny direct-ready chat model (`hidden = 32`, 4 experts, `plan.direct == true`)
+/// opened from a GGUF written by [`write_direct_gguf_fixture`].
+fn tiny_direct_chat_at(path: &Path, config: &config::Config) -> Inner {
+    let store = weights::Store::open_fixture(path, None).unwrap();
+    let vision = media::Vision::metadata(&serde_json::Value::Null, &store, config).unwrap();
+    let mut decoder = decoder::Decoder::new(config.clone(), store).unwrap();
+    decoder.paged = Some(paged::create_fixture(config).unwrap());
+    go_live(&mut decoder, 0);
+    assert!(
+        decoder.weights.plan.direct,
+        "the fixture host admits every bank"
+    );
+    let probe = MxArray::from_uint32(&[0], &[1]).unwrap();
+    for layer in 0..decoder.config.num_hidden_layers {
+        decoder
+            .weights
+            .device_expert_slots(layer, &probe)
+            .unwrap()
+            .expect("a filled direct layer");
     }
-    inner.activate_paged_seq(1).unwrap();
-    let mut logits = inner.decoder.prefill_prompt(prompt).unwrap();
-    for &token in tokens {
-        logits = inner.decoder.step(token).unwrap();
-    }
+    chat_model(inner_over(decoder, vision, false))
+}
+
+/// The target's sampling distribution from a single logit row.
+fn target_dist(logits: &MxArray, params: &crate::engine::params::ChatParams) -> Vec<f64> {
     let row = logits.reshape(&[-1]).unwrap();
     f32s(&crate::sampling::sampling_distribution(&row, params.sampling_config).unwrap())
         .iter()
@@ -362,19 +368,32 @@ fn target_after(
         .collect()
 }
 
-fn tv(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / 2.0
+/// The target's sampling distribution after `tokens` stepped from a prefilled
+/// snapshot `base`, rolling back `inner` to `base` afterward.
+fn target_after_base(
+    inner: &mut Inner,
+    base: &decoder::DecoderState,
+    tokens: &[u32],
+    params: &crate::engine::params::ChatParams,
+) -> Vec<f64> {
+    let mut logits = None;
+    for &token in tokens {
+        logits = Some(inner.decoder.step(token).unwrap());
+    }
+    let dist = target_dist(&logits.unwrap(), params);
+    inner
+        .decoder
+        .paged
+        .as_mut()
+        .unwrap()
+        .rollback_last_tokens(tokens.len() as u32)
+        .unwrap();
+    inner.decoder.restore_state(base.clone());
+    dist
 }
 
-/// Twice the total variation `n` exact draws of `p` show on average, plus
-/// 0.02.
-fn tv_bound(p: &[f64], n: usize) -> f64 {
-    let expected: f64 = p
-        .iter()
-        .map(|&q| (2.0 * q * (1.0 - q) / (std::f64::consts::PI * n.max(1) as f64)).sqrt())
-        .sum::<f64>()
-        / 2.0;
-    2.0 * expected + 0.02
+fn tv(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / 2.0
 }
 
 fn ranked(p: &[f64]) -> Vec<usize> {
@@ -383,12 +402,13 @@ fn ranked(p: &[f64]) -> Vec<usize> {
     ranked
 }
 
-/// 1,500 sampled turns (temperature 1, top 6) through the scheduler on the
-/// whole store, each drafted at 4 rows with proposals the test draws
-/// from rows of its own over the target's likely tokens, and accepted by the
-/// engine's rule: the turn's first two tokens follow the target's joint
-/// distribution, and so do its second and third (a stop counts as a token),
-/// while the second proposal is accepted in some cycles.
+/// 400 sampled turns (temperature 1, top 4, draft width 2) through the
+/// scheduler on a tiny direct store (`hidden = 32`, `plan.direct == true`),
+/// each drafted with proposals the test draws from tilted rows over the
+/// target's likely tokens, and accepted by the engine's rule: the turn's first
+/// two tokens match the target's joint distribution by exact Pearson
+/// chi-square (`p >= 1e-6`), and so do its second and third (a stop counts as
+/// a token), while the second proposal is accepted in some cycles.
 /// MUTATION: a refused proposal's token is drawn from the target, not from
 /// the residual → red (a token pair follows the target).
 /// MUTATION: a proposal is kept with no accept draw → red (a token pair
@@ -396,10 +416,16 @@ fn ranked(p: &[f64]) -> Vec<usize> {
 #[test]
 fn a_sampled_drafted_turn_keeps_the_target_distribution() {
     let _host = memory::scoped_fixture_host();
-    const TRIALS: usize = 1500;
-    let prompt = super::prefix_reuse::prompt(21, 3);
-    let config = drafted_config(4, 1.0);
-    let mut plain = direct_chat();
+    const TRIALS: usize = 400;
+    let temp = Temp::new();
+    let gguf_path = temp.0.join("direct.gguf");
+    let gguf_config = write_direct_gguf_fixture(&gguf_path);
+    let prompt = super::prefix_reuse::prompt(8, 3);
+    let mut config = drafted_config(4, 1.0);
+    config.top_k = Some(4);
+    config.mtp_depth = Some(2);
+    let params = extract_chat_params(&config);
+    let mut plain = tiny_direct_chat_at(&gguf_path, &gguf_config);
     let vocab = plain.decoder.config.vocab_size;
     let stop = vocab;
     let eos: Vec<usize> = {
@@ -407,9 +433,14 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
         ids.push(plain.session_eos_id(&plain.tokenizer().unwrap()).unwrap());
         ids.into_iter().map(|id| id as usize).collect()
     };
-    let first = target_after(&mut plain, &prompt, &[], &config);
+    plain.activate_paged_seq(1).unwrap();
+    let first_logits = plain.decoder.prefill_prompt(&prompt).unwrap();
+    let base = plain.decoder.snapshot();
+    let first = target_dist(&first_logits, &params);
     let second: Vec<Option<Vec<f64>>> = (0..vocab)
-        .map(|x| (first[x] > 0.0).then(|| target_after(&mut plain, &prompt, &[x as u32], &config)))
+        .map(|x| {
+            (first[x] > 0.0).then(|| target_after_base(&mut plain, &base, &[x as u32], &params))
+        })
         .collect();
     let mut third = std::collections::HashMap::new();
     for (x, row) in second.iter().enumerate() {
@@ -421,7 +452,7 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
             if py > 0.0 && !eos.contains(&y) {
                 third.insert(
                     (x, y),
-                    target_after(&mut plain, &prompt, &[x as u32, y as u32], &config),
+                    target_after_base(&mut plain, &base, &[x as u32, y as u32], &params),
                 );
             }
         }
@@ -481,7 +512,7 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
             )
         };
         vec![
-            row(&by_first[..4], &p),
+            tilted_row(&by_first, &p),
             row(&by_second[..4], &marginal),
             (
                 by_second[8..12].iter().map(|&t| t as i32).collect(),
@@ -489,9 +520,303 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
             ),
         ]
     };
-    let mut driver = Driver::new(direct_chat());
-    let draft = direct_draft(&driver.state.inner);
+    let mut driver = Driver::new(tiny_direct_chat_at(&gguf_path, &gguf_config));
+    let draft = Arc::new(tiny_draft());
     driver.state.inner.set_draft(Some(draft)).unwrap();
+    // Exercise both (1) a real non-injected sampled turn (`drawn = None`) and
+    // (2) a full-width accept-2 + reject-3rd + post-commit continuation turn on
+    // the Flash Next MoE shape (`direct_chat`, `hidden = 2560`, `mtp_depth = 3`).
+    {
+        let mut moe_driver = Driver::new(direct_chat());
+        let moe_draft = direct_draft(&moe_driver.state.inner);
+        let moe_cfg = &moe_driver.state.inner.decoder.config;
+        let moe_vocab = moe_cfg.vocab_size;
+        assert_eq!(moe_cfg.hidden_size, 2560);
+        assert_eq!(moe_cfg.moe_intermediate_size, 640);
+        assert_eq!(moe_cfg.num_experts_per_tok, 10);
+        assert!(moe_driver.state.inner.decoder.weights.plan.direct);
+        moe_driver
+            .state
+            .inner
+            .set_draft(Some(Arc::clone(&moe_draft)))
+            .unwrap();
+        let moe_config = drafted_config(8, 1.0); // top_k = 6, mtp_depth = ROWS - 1 (= 3)
+        let moe_params = extract_chat_params(&moe_config);
+        let mut moe_oracle = direct_chat();
+        let mut moe_eos = moe_oracle.extra_eos_ids();
+        moe_eos.push(
+            moe_oracle
+                .session_eos_id(&moe_oracle.tokenizer().unwrap())
+                .unwrap(),
+        );
+        moe_oracle.activate_paged_seq(1).unwrap();
+        let moe_first_logits = moe_oracle.decoder.prefill_prompt(&prompt).unwrap();
+        let moe_base = moe_oracle.decoder.snapshot();
+        let moe_first = target_dist(&moe_first_logits, &moe_params);
+        unsafe { mlx_sys::mlx_seed(0x5EED_F4E2) };
+
+        // (1) Real non-injected `draft.propose_with` at depth 3 (4-row verify).
+        let mut verified_moe_real = false;
+        for attempt in 0..8 {
+            let before_offered = moe_driver.state.inner.draft_slot().unwrap().offered.len();
+            let result = moe_driver
+                .turn(&format!("moe-real-{attempt}"), &prompt, moe_config.clone())
+                .unwrap();
+            let real_offered: Vec<usize> = moe_driver.state.inner.draft_slot().unwrap().offered
+                [before_offered..]
+                .iter()
+                .map(|&(_, _, n)| n)
+                .collect();
+            if real_offered.contains(&(ROWS - 1)) {
+                let committed = ids_of(&result.text);
+                assert!(!committed.is_empty());
+                assert!(moe_first[committed[0] as usize] > 0.0);
+                for i in 1..committed.len() {
+                    let dist =
+                        target_after_base(&mut moe_oracle, &moe_base, &committed[..i], &moe_params);
+                    assert!(
+                        dist[committed[i] as usize] > 0.0,
+                        "Flash Next MoE real sampled token {} at step {i} outside top-k support",
+                        committed[i]
+                    );
+                }
+                verified_moe_real = true;
+                break;
+            }
+        }
+        assert!(
+            verified_moe_real,
+            "Flash Next MoE real sampled turn must verify {} proposals",
+            ROWS - 1
+        );
+
+        // (2) One-shot accept-2 + reject-3rd + residual-only boundary draw +
+        // recovery + real second proposal at hidden = 2560, depth = 3:
+        // cycle 0 runs the real `propose_with` then injects proposals 0 & 1
+        // with p/q = 2.0 (always accepted) and proposal 2 with q2 covering all
+        // top-k tokens of p3 except `only_survivor` (so p3[d2] = 0 guarantees
+        // rejection while `(p3 - q2)+` concentrates 100% of its mass on
+        // `only_survivor`, distinguishing residual sampling from raw target
+        // sampling); cycle 1 runs the REAL `draft.propose_with` on the
+        // recovered draft context, whose history and live KV rows are checked
+        // against a sequential oracle before cycle 1's proposal.
+        let oracle_cell = Rc::new(RefCell::new(moe_oracle));
+        let recorded = Rc::new(RefCell::new(None::<(u32, u32, u32, u32, u32)>));
+        let mut verified_residual_trials = 0usize;
+        let mut verified_moe_recovery = false;
+        let accept_config = drafted_config(8, 1.0);
+        for attempt in 0..12 {
+            *recorded.borrow_mut() = None;
+            let oracle_ref = Rc::clone(&oracle_cell);
+            let rec_ref = Rc::clone(&recorded);
+            let base_clone = moe_base.clone();
+            let eos_clone = moe_eos.clone();
+            let params_clone = moe_params.clone();
+            {
+                let slot = moe_driver.state.inner.draft_slot().unwrap();
+                slot.capture_context = !verified_moe_recovery;
+                slot.captured_contexts.clear();
+                slot.drawn_once = Some(Box::new(move |anchor| {
+                    let mut oracle = oracle_ref.borrow_mut();
+                    let pick_in = |p: &[f64]| {
+                        ranked(p)
+                            .into_iter()
+                            .find(|&t| p[t] > 0.0 && !eos_clone.contains(&(t as u32)))
+                            .unwrap() as u32
+                    };
+                    let pick_out = |p: &[f64]| {
+                        (0..moe_vocab)
+                            .find(|&t| p[t] == 0.0 && !eos_clone.contains(&(t as u32)))
+                            .unwrap() as u32
+                    };
+                    let always_accept = |tok: u32, p: &[f64]| {
+                        let other = pick_out(p);
+                        let w = (p[tok as usize] * 0.5).max(1e-6);
+                        SparseDistribution::from_parts(
+                            vec![tok as i32, other as i32],
+                            vec![w, 1.0 - w],
+                            moe_vocab,
+                        )
+                        .unwrap()
+                    };
+                    let p1 = target_after_base(&mut oracle, &base_clone, &[anchor], &params_clone);
+                    let d0 = pick_in(&p1);
+                    let p2 =
+                        target_after_base(&mut oracle, &base_clone, &[anchor, d0], &params_clone);
+                    let d1 = pick_in(&p2);
+                    let p3 = target_after_base(
+                        &mut oracle,
+                        &base_clone,
+                        &[anchor, d0, d1],
+                        &params_clone,
+                    );
+                    let d2 = pick_out(&p3);
+                    // Suppress every positive token in `p3` except the
+                    // lowest-probability non-EOS token `only_survivor`, so
+                    // `(p3 - q2)+` has support `{only_survivor}` while `p3`
+                    // puts most of its mass on the suppressed tokens.
+                    let pos_p3: Vec<usize> =
+                        ranked(&p3).into_iter().filter(|&t| p3[t] > 0.0).collect();
+                    let only_survivor = *pos_p3
+                        .iter()
+                        .rev()
+                        .find(|&&t| !eos_clone.contains(&(t as u32)))
+                        .unwrap();
+                    let suppressed: Vec<usize> =
+                        pos_p3.into_iter().filter(|&t| t != only_survivor).collect();
+                    assert!(
+                        !suppressed.is_empty(),
+                        "top_k = 6 target distribution must have > 1 positive token"
+                    );
+                    let margin = p3[only_survivor];
+                    let extra = (0.5 * margin) / suppressed.len() as f64;
+                    let mut q2_ids: Vec<i32> = suppressed.iter().map(|&t| t as i32).collect();
+                    let mut q2_probs: Vec<f64> =
+                        suppressed.iter().map(|&t| p3[t] + extra).collect();
+                    q2_ids.push(d2 as i32);
+                    q2_probs.push(0.5 * margin);
+                    let q0 = always_accept(d0, &p1);
+                    let q1 = always_accept(d1, &p2);
+                    let q2 = SparseDistribution::from_parts(q2_ids, q2_probs, moe_vocab).unwrap();
+                    *rec_ref.borrow_mut() = Some((anchor, d0, d1, d2, only_survivor as u32));
+                    (vec![d0, d1, d2], vec![q0, q1, q2])
+                }));
+            }
+            let before_offered = moe_driver.state.inner.draft_slot().unwrap().offered.len();
+            let result = moe_driver
+                .turn(
+                    &format!("moe-accept-{attempt}"),
+                    &prompt,
+                    accept_config.clone(),
+                )
+                .unwrap();
+            let Some((anchor, d0, d1, d2, only_survivor)) = recorded.borrow_mut().take() else {
+                // Only valid skip: anchor itself was EOS before cycle 0 drafted.
+                assert_eq!(result.finish_reason, "stop");
+                continue;
+            };
+            let (offered, captured) = {
+                let slot = moe_driver.state.inner.draft_slot().unwrap();
+                slot.capture_context = false;
+                (
+                    slot.offered[before_offered..]
+                        .iter()
+                        .map(|&(_, _, n)| n)
+                        .collect::<Vec<_>>(),
+                    std::mem::take(&mut slot.captured_contexts),
+                )
+            };
+            let committed = ids_of(&result.text);
+            // Assert immediately on every injected cycle (never skip early
+            // stops, which could hide an EOS draw from the raw target).
+            assert_eq!(offered[0], ROWS - 1, "cycle 0 must verify 3 proposals");
+            assert!(
+                committed.len() >= 4,
+                "injected cycle with non-EOS d0, d1, and only_survivor must commit >= 4 tokens, got {committed:?}"
+            );
+            assert_eq!(committed[0], anchor);
+            assert_eq!(committed[1], d0, "first proposal must be accepted");
+            assert_eq!(committed[2], d1, "second proposal must be accepted");
+            assert_ne!(committed[3], d2, "third proposal must be rejected");
+            assert_eq!(
+                committed[3], only_survivor,
+                "Flash Next MoE boundary token must come from residual (p3 - q2)+, not target p3"
+            );
+            assert!(
+                offered.len() >= 2 && offered[1] == ROWS - 1,
+                "cycle 1 must run a real 3-proposal draft after rejection, got offered={offered:?}"
+            );
+            verified_residual_trials += 1;
+
+            if !verified_moe_recovery && committed.len() >= 5 {
+                // Compare the recovered draft context right before cycle 1's real
+                // proposal against a fresh sequential oracle stepped on `prompt` +
+                // `[anchor, d0, d1]`.
+                let mut seq_oracle = direct_chat();
+                seq_oracle.activate_paged_seq(1).unwrap();
+                seq_oracle.decoder.draft_taps_on(&moe_draft).unwrap();
+                seq_oracle.decoder.prefill_prompt(&prompt).unwrap();
+                let mut want_ctx =
+                    crate::models::qwen3_5::dflash2::DFlash2ContextCache::new(&moe_draft.config);
+                seq_oracle
+                    .decoder
+                    .draft_follow(&moe_draft, &mut want_ctx)
+                    .unwrap();
+                for &tok in &committed[..3] {
+                    seq_oracle.decoder.step(tok).unwrap();
+                    seq_oracle
+                        .decoder
+                        .draft_follow(&moe_draft, &mut want_ctx)
+                        .unwrap();
+                }
+                let got_ctx = &captured[1];
+                assert_eq!(
+                    got_ctx.logical_len(),
+                    want_ctx.logical_len(),
+                    "recovered Flash Next draft context length before cycle 1"
+                );
+                assert_eq!(
+                    got_ctx.token_history(),
+                    want_ctx.token_history(),
+                    "recovered Flash Next draft context token history before cycle 1"
+                );
+                let got_views = got_ctx.window_views();
+                let want_views = want_ctx.window_views();
+                assert_eq!(got_views.len(), want_views.len());
+                assert!(!got_views.is_empty());
+                for (layer, (g, w)) in got_views.iter().zip(&want_views).enumerate() {
+                    let (gk, gv) = g.as_ref().expect("recovered draft KV layer populated");
+                    let (wk, wv) = w.as_ref().expect("oracle draft KV layer populated");
+                    for (name, ga, wa) in [("K", gk, wk), ("V", gv, wv)] {
+                        let g_vals = f32s(ga);
+                        let w_vals = f32s(wa);
+                        assert_eq!(g_vals.len(), w_vals.len(), "draft layer {layer} {name} len");
+                        let mut max_diff = 0.0f32;
+                        for (elem_idx, (&a, &b)) in g_vals.iter().zip(&w_vals).enumerate() {
+                            assert!(
+                                a.is_finite() && b.is_finite(),
+                                "non-finite recovered Flash Next draft layer {layer} {name}[{elem_idx}]: got={a}, want={b}"
+                            );
+                            max_diff = max_diff.max((a - b).abs());
+                        }
+                        assert!(
+                            max_diff <= 1e-2,
+                            "recovered Flash Next draft layer {layer} {name} drifted from sequential oracle: max_diff={max_diff}"
+                        );
+                    }
+                }
+                for i in 4..committed.len() {
+                    let dist = target_after_base(
+                        &mut oracle_cell.borrow_mut(),
+                        &moe_base,
+                        &committed[..i],
+                        &moe_params,
+                    );
+                    assert!(
+                        dist[committed[i] as usize] > 0.0,
+                        "post-rejection token {} at step {i} outside sequential target support",
+                        committed[i]
+                    );
+                }
+                let perf = result.performance.as_ref().unwrap();
+                let cycles = perf.mtp_cycles.unwrap_or(0) as usize;
+                let accepted =
+                    (perf.mtp_mean_accepted_tokens.unwrap_or(0.0) * cycles as f64).round() as usize;
+                assert!(
+                    accepted >= 2,
+                    "Flash Next MoE turn must record >= 2 accepted proposals, got {accepted}"
+                );
+                verified_moe_recovery = true;
+            }
+            if verified_residual_trials >= 4 && verified_moe_recovery {
+                break;
+            }
+        }
+        assert!(
+            verified_residual_trials >= 4 && verified_moe_recovery,
+            "Flash Next MoE residual+recovery check did not complete (trials={verified_residual_trials}, recovery={verified_moe_recovery})"
+        );
+    }
     let draws = Rc::new(RefCell::new(StdRng::seed_from_u64(0x5EED_D0E5)));
     {
         let draws = Rc::clone(&draws);
@@ -516,8 +841,8 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
             (ids, dists)
         }));
     }
-    let mut pairs_a = vec![0usize; cells];
-    let mut pairs_b = vec![0usize; cells];
+    let mut pairs_a = vec![0u64; cells];
+    let mut pairs_b = vec![0u64; cells];
     let mut n_b = 0usize;
     let mut one_cycle = 0usize;
     for trial in 0..TRIALS {
@@ -526,6 +851,16 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
             .turn(&format!("s{trial}"), &prompt, config.clone())
             .unwrap();
         let cycles = driver.state.inner.draft_slot().unwrap().offered.len() - before;
+        let perf_cycles = result
+            .performance
+            .as_ref()
+            .and_then(|p| p.mtp_cycles)
+            .unwrap_or(0) as usize;
+        let perf_accepted = result
+            .performance
+            .as_ref()
+            .and_then(|p| p.mtp_mean_accepted_tokens)
+            .map_or(0, |mean| (mean * perf_cycles as f64).round() as usize);
         let mut seq: Vec<usize> = Vec::new();
         for id in ids_of(&result.text) {
             let t = as_token(id as usize);
@@ -554,18 +889,21 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
         };
         pairs_b[b] += 1;
         n_b += 1;
-        one_cycle += usize::from(cycles == 1 && seq.len() >= 4 && seq[3] != stop);
+        one_cycle +=
+            usize::from(cycles == 1 && perf_accepted >= 2 && seq.len() >= 4 && seq[3] != stop);
     }
-    let freq = |pairs: &[usize], n: usize| -> Vec<f64> {
+    let freq = |pairs: &[u64], n: usize| -> Vec<f64> {
         pairs.iter().map(|&c| c as f64 / n.max(1) as f64).collect()
     };
     let (tv_a, tv_b) = (
         tv(&freq(&pairs_a, TRIALS), &joint_a),
         tv(&freq(&pairs_b, n_b), &joint_b),
     );
+    let (stat_a, dof_a, p_a) = chi_square_p(&pairs_a, &joint_a);
+    let (stat_b, dof_b, p_b) = chi_square_p(&pairs_b, &joint_b);
     let second_accepted = one_cycle as f64 / TRIALS as f64;
     eprintln!(
-        "sampled drafted turns: {TRIALS}; tv(first two) {tv_a:.4} over {} cells, tv(second and third) {tv_b:.4} over {} cells ({n_b} turns), second proposal accepted {second_accepted:.4}",
+        "sampled drafted turns: {TRIALS}; first two chi2 {stat_a:.2} dof {dof_a} p {p_a:.3e} tv {tv_a:.4} over {} cells; second and third chi2 {stat_b:.2} dof {dof_b} p {p_b:.3e} tv {tv_b:.4} over {} cells ({n_b} turns); second proposal accepted {second_accepted:.4}",
         joint_a.iter().filter(|&&p| p > 0.0).count(),
         joint_b.iter().filter(|&&p| p > 0.0).count(),
     );
@@ -573,15 +911,13 @@ fn a_sampled_drafted_turn_keeps_the_target_distribution() {
         second_accepted > 0.05,
         "the second proposal was accepted in some turns: {second_accepted}"
     );
-    let (bound_a, bound_b) = (tv_bound(&joint_a, TRIALS), tv_bound(&joint_b, n_b));
-    eprintln!("tv bounds: first two {bound_a:.4}, second and third {bound_b:.4}");
     assert!(
-        tv_a < bound_a,
-        "the first two tokens follow the target: tv {tv_a}"
+        !p_a.is_nan() && p_a >= 1e-6,
+        "the first two tokens follow the target: chi2 {stat_a:.2} dof {dof_a} p {p_a:.3e}"
     );
     assert!(
-        tv_b < bound_b,
-        "the second and third follow the target: tv {tv_b}"
+        !p_b.is_nan() && p_b >= 1e-6,
+        "the second and third follow the target: chi2 {stat_b:.2} dof {dof_b} p {p_b:.3e}"
     );
 }
 

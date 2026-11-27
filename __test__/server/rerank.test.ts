@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import type { RerankerModel } from '../../packages/rerank/src/types.js';
 import { withCapabilityModels, type CapabilityAdapter } from '../../packages/server/src/host/capability-models.js';
 import { RerankRegistry } from '../../packages/server/src/rerank-registry.js';

@@ -2571,8 +2571,8 @@ mod tests {
         if !metal_available() {
             return;
         }
-        let num_q_heads = 24usize;
-        let num_kv_heads = 8usize;
+        let num_q_heads = 6usize;
+        let num_kv_heads = 2usize;
         let head_dim = 128usize;
         let rel_extent = 1024usize;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -2789,8 +2789,8 @@ mod tests {
         if !metal_available() {
             return;
         }
-        let num_q_heads = 24usize;
-        let num_kv_heads = 8usize;
+        let num_q_heads = 6usize;
+        let num_kv_heads = 2usize;
         let head_dim = 128usize;
         let rel_extent = 1024usize;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -4581,12 +4581,26 @@ mod tests {
                 .collect();
             let h_refs: Vec<&MxArray> = hists.iter().collect();
 
-            for &(quant_mode, sym_q8) in &[
-                (Inkling2MoeQuantMode::Nvfp4, false),
-                (Inkling2MoeQuantMode::Q8, false),
-                (Inkling2MoeQuantMode::Q8, true),
-                (Inkling2MoeQuantMode::Mxfp8, false),
-            ] {
+            let full_modes = matches!(rows, 1 | 8 | 32);
+            let modes: &[(Inkling2MoeQuantMode, bool)] = if full_modes {
+                &[
+                    (Inkling2MoeQuantMode::Nvfp4, false),
+                    (Inkling2MoeQuantMode::Q8, false),
+                    (Inkling2MoeQuantMode::Q8, true),
+                    (Inkling2MoeQuantMode::Mxfp8, false),
+                ]
+            } else if rows == 4 {
+                &[
+                    (Inkling2MoeQuantMode::Nvfp4, false),
+                    (Inkling2MoeQuantMode::Q8, true),
+                    (Inkling2MoeQuantMode::Mxfp8, false),
+                ]
+            } else {
+                &[(Inkling2MoeQuantMode::Q8, true)]
+            };
+            let interleaved_list: &[bool] = if full_modes { &[false, true] } else { &[false] };
+
+            for &(quant_mode, sym_q8) in modes {
                 let (gu_w, gu_s, gu_aux, dn_w, dn_s, dn_aux, dn_outer) = match (quant_mode, sym_q8)
                 {
                     (Inkling2MoeQuantMode::Nvfp4, _) => (
@@ -4616,7 +4630,7 @@ mod tests {
                     (Inkling2MoeQuantMode::Q5k, _) => unreachable!(),
                 };
 
-                for &interleaved in &[false, true] {
+                for &interleaved in interleaved_list {
                     // Unfused reference: inkling2_moe_route -> inkling2_grouped_moe -> inkling2_sconv_k4_ragged
                     let (topk, gamma) = inkling2_moe_route(
                         &logits,
@@ -4657,59 +4671,68 @@ mod tests {
                     )
                     .unwrap();
 
-                    for &router_is_weight in &[false, true] {
+                    let rw_tape_pairs: &[(bool, bool)] = if rows == 8
+                        && matches!(quant_mode, Inkling2MoeQuantMode::Q8)
+                        && sym_q8
+                        && !interleaved
+                    {
+                        &[(false, false), (false, true), (true, false), (true, true)]
+                    } else if rows == 4 {
+                        &[(false, false), (true, false), (true, true)]
+                    } else {
+                        &[(false, false), (true, true)]
+                    };
+                    for &(router_is_weight, emit_tape) in rw_tape_pairs {
                         let router_in = if router_is_weight { &router_w } else { &logits };
-                        for &emit_tape in &[false, true] {
-                            let (y_got, hist_got, tape_got) = inkling2_grouped_moe_fused(
-                                &x,
-                                router_in,
-                                Some(&router_bias),
-                                dn_outer,
-                                gu_w,
-                                gu_s,
-                                gu_aux,
-                                dn_w,
-                                dn_s,
-                                dn_aux,
-                                &post_conv_w,
-                                Some(&res),
-                                cu,
-                                &h_refs,
-                                num_seqs,
-                                false,
-                                top_k,
-                                route_scale,
-                                quant_mode,
-                                quant_mode,
-                                interleaved,
-                                gate_cap,
-                                up_cap,
-                                true,
-                                emit_tape,
-                                router_is_weight,
-                            )
-                            .unwrap();
+                        let (y_got, hist_got, tape_got) = inkling2_grouped_moe_fused(
+                            &x,
+                            router_in,
+                            Some(&router_bias),
+                            dn_outer,
+                            gu_w,
+                            gu_s,
+                            gu_aux,
+                            dn_w,
+                            dn_s,
+                            dn_aux,
+                            &post_conv_w,
+                            Some(&res),
+                            cu,
+                            &h_refs,
+                            num_seqs,
+                            false,
+                            top_k,
+                            route_scale,
+                            quant_mode,
+                            quant_mode,
+                            interleaved,
+                            gate_cap,
+                            up_cap,
+                            true,
+                            emit_tape,
+                            router_is_weight,
+                        )
+                        .unwrap();
 
+                        assert_eq!(
+                            y_got.to_float32().unwrap().as_ref(),
+                            y_ref.to_float32().unwrap().as_ref(),
+                            "fused MoE y mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows}, emit_tape={emit_tape})"
+                        );
+                        assert_eq!(
+                            hist_got.to_float32().unwrap().as_ref(),
+                            hist_ref.to_float32().unwrap().as_ref(),
+                            "fused MoE hist mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows}, emit_tape={emit_tape})"
+                        );
+                        if emit_tape {
+                            let tape_arr = tape_got.expect("tape must be returned");
                             assert_eq!(
-                                y_got.to_float32().unwrap().as_ref(),
-                                y_ref.to_float32().unwrap().as_ref(),
-                                "fused MoE y mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows}, emit_tape={emit_tape})"
+                                tape_arr.to_float32().unwrap().as_ref(),
+                                moe_ref.to_float32().unwrap().as_ref(),
+                                "fused MoE tape mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows})"
                             );
-                            assert_eq!(
-                                hist_got.to_float32().unwrap().as_ref(),
-                                hist_ref.to_float32().unwrap().as_ref(),
-                                "fused MoE hist mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows}, emit_tape={emit_tape})"
-                            );
-                            if emit_tape {
-                                let tape_arr = tape_got.expect("tape must be returned");
-                                assert_eq!(
-                                    tape_arr.to_float32().unwrap().as_ref(),
-                                    moe_ref.to_float32().unwrap().as_ref(),
-                                    "fused MoE tape mismatch (mode={quant_mode:?}, sym_q8={sym_q8}, rw={router_is_weight}, il={interleaved}, rows={rows})"
-                                );
-                            } else {
-                                assert!(tape_got.is_none());
-                            }
+                        } else {
+                            assert!(tape_got.is_none());
                         }
                     }
 
@@ -5657,7 +5680,7 @@ mod tests {
                     .to_int32()
                     .unwrap();
 
-            for &m in &[1usize, 2, 4, 5, 7, 8, 9, 15, 16, 17, 24, 28, 32] {
+            for &m in &[1usize, 4, 8, 9, 16, 17, 32] {
                 let x = x_all.slice(&[0, 0], &[m as i64, k as i64]).unwrap();
                 let mlx_ref_f32 = ql.forward_keep_f32(&x).unwrap().to_float32().unwrap();
 

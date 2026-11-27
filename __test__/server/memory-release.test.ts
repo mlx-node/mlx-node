@@ -5,6 +5,8 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 import { createHandler, createServer, ModelRegistry, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 /**
  * `POST /v1/memory/release` over HTTP, the cases of Splash
  * `test_memory_release.py`: a request takes no fields, a 409 says why the

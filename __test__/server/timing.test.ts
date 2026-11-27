@@ -1,7 +1,6 @@
-import { resolveServerTuningForUsage } from '@mlx-node/server';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { mergeTimingUsageExtensions } from '../../packages/server/src/timing.js';
+import { mergeTimingUsageExtensions, resolveServerTuningForUsage } from '../../packages/server/src/timing.js';
 
 describe('server timing tuning metadata', () => {
   it('mirrors native env parser defaults', () => {

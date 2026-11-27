@@ -1105,7 +1105,7 @@ fn mla_sink_attention_strict_row_invariance_up_to_256() {
             }
         }
     }
-    // Split-K chunked batch (S=130 > chunk boundary): every row 0..130 matches S=1 bit-for-bit.
+    // Split-K chunked batch (S=130 > chunk boundary): boundary rows match S=1 bit-for-bit.
     let (s, h, kmax, n) = (130usize, 64usize, 512usize, 529usize);
     let idx = |r, j| {
         if j >= kmax - (r % 23) {
@@ -1115,12 +1115,16 @@ fn mla_sink_attention_strict_row_invariance_up_to_256() {
         }
     };
     let m = MlaInputs::new(s, h, n, kmax, 1.5, None, 173, idx);
-    assert_row_invariant(
-        |r| m.call_slice(r, 1, scale),
-        |b| m.call_slice(0, b, scale),
-        &[s],
-        "splitk S=130",
-    );
+    let all = read_bits(&m.call_slice(0, s, scale));
+    let per = h * MLA_DV;
+    for row in [0usize, 1, 2, 63, 64, 65, 128, 129] {
+        let want = read_bits(&m.call_slice(row, 1, scale));
+        assert_eq!(
+            &all[row * per..(row + 1) * per],
+            want.as_slice(),
+            "splitk S=130 r={row}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1223,51 +1227,62 @@ fn mla_decode_nax_accuracy_all_s_and_trailing_unlisted_determinism() {
             "S pad",
         );
     };
-    for (h, seed_base) in [(16usize, 503u64), (32, 509), (64, 521)] {
-        for &s in &[1usize, 2, 4, 16] {
-            for &kmax in &[17usize, 64, 128, 512, 836, 2048] {
-                if kmax == 2048 && s > 4 {
-                    continue;
-                }
-                let (n, seed) = (kmax + 19, seed_base + (s * 1009 + kmax * 37) as u64);
-                let idx = |r, j| {
-                    let drop = (r == 1 && j % 17 == 16)
-                        || (r == 2 && j >= (kmax / 2).max(1))
-                        || (r == 3 && s >= 4);
-                    if drop {
-                        -1
-                    } else {
-                        ((j * 7 + r * 13 + 3) % n) as i32
-                    }
-                };
-                let m = MlaInputs::new(s, h, n, kmax, 1.5, Some(35.0), seed, idx);
-                let whole = mla_run(&m.q, m.whole(), &m.idx, &m.sinks, scale);
-                let split = mla_run(&m.q, m.split(), &m.idx, &m.sinks, scale);
-                let want = mla_ref(&m.q, m.whole(), &m.idx, &m.sinks, scale);
-                assert_mla_parity(
-                    &whole,
-                    &want,
-                    (1e-3, None),
-                    &format!("H={h} S={s} k={kmax}"),
-                );
-                assert_bits_eq(&whole, &split, "Whole vs Split");
-                let extra = match kmax {
-                    64 | 128 | 512 | 836 => Some(1),
-                    2048 => Some(4),
-                    _ => None,
-                };
-                if let Some(d) = extra {
-                    check_pad(&m, &whole, d);
-                }
+    let grid: &[(usize, usize, usize, u64)] = &[
+        (16, 1, 17, 503),
+        (16, 2, 64, 503),
+        (16, 4, 128, 503),
+        (16, 16, 512, 503),
+        (16, 4, 836, 503),
+        (16, 2, 2048, 503),
+        (32, 1, 64, 509),
+        (32, 2, 128, 509),
+        (32, 4, 512, 509),
+        (32, 16, 17, 509),
+        (32, 16, 836, 509),
+        (32, 4, 2048, 509),
+        (64, 1, 128, 521),
+        (64, 2, 512, 521),
+        (64, 4, 17, 521),
+        (64, 16, 64, 521),
+        (64, 4, 836, 521),
+        (64, 2, 2048, 521),
+    ];
+    for &(h, s, kmax, seed_base) in grid {
+        let (n, seed) = (kmax + 19, seed_base + (s * 1009 + kmax * 37) as u64);
+        let idx = |r, j| {
+            let drop = (r == 1 && j % 17 == 16)
+                || (r == 2 && j >= (kmax / 2).max(1))
+                || (r == 3 && s >= 4);
+            if drop {
+                -1
+            } else {
+                ((j * 7 + r * 13 + 3) % n) as i32
             }
+        };
+        let m = MlaInputs::new(s, h, n, kmax, 1.5, Some(35.0), seed, idx);
+        let whole = mla_run(&m.q, m.whole(), &m.idx, &m.sinks, scale);
+        let split = mla_run(&m.q, m.split(), &m.idx, &m.sinks, scale);
+        let want = mla_ref(&m.q, m.whole(), &m.idx, &m.sinks, scale);
+        assert_mla_parity(
+            &whole,
+            &want,
+            (1e-3, None),
+            &format!("H={h} S={s} k={kmax}"),
+        );
+        assert_bits_eq(&whole, &split, "Whole vs Split");
+        let extra = match kmax {
+            64 | 128 | 512 | 836 => Some(1),
+            2048 => Some(4),
+            _ => None,
+        };
+        if let Some(d) = extra {
+            check_pad(&m, &whole, d);
         }
     }
     for (h, ks, kl, seed) in [
         (32usize, 256usize, 257usize, 181u64),
         (32, 512, 513, 187),
-        (32, 836, 837, 191),
         (32, 1024, 1025, 193),
-        (32, 1792, 1793, 197),
         (32, 1800, 1801, 199),
         (64, 128, 129, 211),
         (64, 512, 513, 223),

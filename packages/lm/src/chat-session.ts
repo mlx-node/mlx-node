@@ -93,6 +93,9 @@ import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, Too
 
 import type { ChatStreamControl, ChatStreamEvent } from './stream.js';
 
+export { getLoadedModelPath } from './model-path.js';
+export type { ChatStreamControl, ChatStreamEvent };
+
 /**
  * Typed prefix native media guards use when a history cannot be continued
  * from the held image/audio state. The session layer recognizes this exact

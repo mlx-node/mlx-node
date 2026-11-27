@@ -21,7 +21,7 @@
 //! ```shell
 //! MLX_TEST_MODEL_PATH=/Volumes/P4510/models/qwen3.6-35b-a3b-mxfp8-mtp \
 //!     PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
-//!     cargo test -p mlx-core --test qwen3_5_moe_reset_purge -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_5_moe_reset_purge -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_MODEL_PATH` the test early-returns and passes

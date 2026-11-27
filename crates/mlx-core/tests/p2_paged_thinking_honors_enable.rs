@@ -28,7 +28,7 @@
 //! ```shell
 //! MLX_TEST_MODEL_PATH=/Volumes/P4510/models/qwen3.5-0.8b-mlx-bf16 \
 //!     PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
-//!     cargo test -p mlx-core --test p2_paged_thinking_honors_enable -- --ignored --nocapture
+//!     cargo test -p mlx-core --features e2e-tests --test p2_paged_thinking_honors_enable -- --ignored --nocapture
 //! ```
 //!
 //! Without `MLX_TEST_MODEL_PATH` it early-returns and passes trivially so it

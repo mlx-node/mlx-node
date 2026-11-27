@@ -49,8 +49,15 @@ import {
   resolveReleaseTag,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { run } from '../../packages/cli/src/commands/agent/index.js';
-import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
+import { parseServeArgs } from '../../packages/cli/src/commands/serve-args.js';
 import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
+
+// No test invokes the first-run download wizard.
+vi.mock('../../packages/cli/src/commands/download-model.js', () => ({
+  run: async () => {
+    throw new Error('unexpected production wizard download in agent-update test');
+  },
+}));
 
 const MANAGED = { source: 'managed', path: '/m/mlx-agent' } satisfies Partial<AgentInstallProbe>;
 
@@ -815,7 +822,7 @@ describe('downloadAgentBinary', () => {
       try {
         // A live listener owns the name — a second acquirer can never unlink
         // or bind over it, so it waits out its deadline and refuses.
-        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+        await expect(acquireInstallLock(lock, { deadlineMs: 150 })).rejects.toThrow('install lock');
       } finally {
         releaseInstallLock(lock);
       }
@@ -888,7 +895,7 @@ describe('downloadAgentBinary', () => {
         // contender in while it held. Under bakery it maps to ticket 0 —
         // it advertised before any `b-` member — so we MUST queue.
         await advertise(`m-${process.pid}-999`);
-        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+        await expect(acquireInstallLock(lock, { deadlineMs: 150 })).rejects.toThrow('install lock');
 
         // Same for a low bakery ticket under our pid: ticket 2 < whatever we
         // choose next, so the earlier advertiser wins regardless of seq.
@@ -897,7 +904,7 @@ describe('downloadAgentBinary', () => {
         }
         rmSync(join(dir, `m-${process.pid}-999`), { force: true });
         await advertise(`b-2-${process.pid}-999`);
-        await expect(acquireInstallLock(lock, { deadlineMs: 400 })).rejects.toThrow('install lock');
+        await expect(acquireInstallLock(lock, { deadlineMs: 150 })).rejects.toThrow('install lock');
       } finally {
         for (const server of servers) {
           server.close();
@@ -987,7 +994,7 @@ describe('downloadAgentBinary', () => {
           }
         }, 5);
         try {
-          await expect(acquireInstallLock(lock, { deadlineMs: 1_500 })).rejects.toThrow('install lock');
+          await expect(acquireInstallLock(lock, { deadlineMs: 300 })).rejects.toThrow('install lock');
           expect(swapped).toBe(true);
         } finally {
           clearInterval(watcher);
@@ -1025,7 +1032,7 @@ describe('downloadAgentBinary', () => {
       } catch {
         // aging is best-effort — some filesystems refuse socket utimes
       }
-      await expect(acquireInstallLock(lock, { deadlineMs: 1_000 })).rejects.toThrow('install lock');
+      await expect(acquireInstallLock(lock, { deadlineMs: 200 })).rejects.toThrow('install lock');
       expect(existsSync(marker)).toBe(true);
     } finally {
       server?.close();
@@ -1167,7 +1174,9 @@ describe('downloadAgentBinary', () => {
       await acquireInstallLock(lock);
       try {
         mockMirrors(makeTarball(home, 'fake-agent-binary'));
-        await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.4')).rejects.toThrow('install lock');
+        await expect(downloadAgentBinary(dest, 'mlx-agent-v0.3.4', process.env, undefined, 150)).rejects.toThrow(
+          'install lock',
+        );
         // A refused install must not have touched the managed cache.
         expect(existsSync(`${dest}.tag`)).toBe(false);
       } finally {

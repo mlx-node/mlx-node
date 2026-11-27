@@ -407,6 +407,17 @@ impl Closer {
         self.once(deadline, false)
     }
 
+    /// Whether a close has already claimed ownership (`outcome` transitioned
+    /// from `None` to `Some(...)`), so overlapping-close tests can synchronize
+    /// deterministically instead of sleeping for a fixed wall-clock guess.
+    #[cfg(test)]
+    pub fn is_close_started(&self) -> bool {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+    }
+
     fn once(&self, deadline: Instant, ask_model: bool) -> bool {
         {
             let mut outcome = self
@@ -1653,7 +1664,7 @@ impl<C: PrefixCodec> PrefixDisk<C> {
         store: &mut HybridStateStore<C::StoreState>,
         source: &mut dyn Blocks,
     ) {
-        let by = Instant::now() + SLOT_WAIT;
+        let by = Instant::now() + self.parker.lock().slot_wait();
         self.flush_points(store, source, by);
         self.closing_by = Some(by);
     }
@@ -1868,10 +1879,9 @@ impl<C: PrefixCodec> PrefixDisk<C> {
 
 impl<C: PrefixCodec> Drop for PrefixDisk<C> {
     fn drop(&mut self) {
-        self.closer.finish(
-            self.closing_by
-                .unwrap_or_else(|| Instant::now() + SLOT_WAIT),
-        );
+        let wait = self.parker.lock().slot_wait();
+        self.closer
+            .finish(self.closing_by.unwrap_or_else(|| Instant::now() + wait));
         {
             let mut slot = self.parker.lock();
             slot.stop = true;

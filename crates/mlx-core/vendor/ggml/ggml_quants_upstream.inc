@@ -3,7 +3,7 @@
 // without a network fetch or a llama.cpp checkout.
 //
 // Nothing here is compiled. It is data for the provenance guard in
-// crates/mlx-core/tests/kquant_ggml_parity.rs
+// crates/mlx-core/tests/kquant_suite/kquant_ggml_parity.rs
 // (`vendored_ggml_reference_is_verbatim`), which is the in-tree port of the
 // scratchpad's check_verbatim.py.
 //
@@ -13,7 +13,7 @@
 //
 // To re-anchor against a real checkout, point the guard at it:
 //   GGML_QUANTS_C=/path/to/llama.cpp/ggml/src/ggml-quants.c \
-//     cargo test -p mlx-core --release --test kquant_ggml_parity
+//     cargo test -p mlx-core --release --test kquant_suite kquant_ggml_parity::
 // The guard then reads the spans below straight out of that file instead, so
 // this excerpt is itself re-verifiable rather than merely asserted.
 //

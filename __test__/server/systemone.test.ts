@@ -11,6 +11,8 @@ import type { AddressInfo } from 'node:net';
 import type { ClairicResult, DecisionModel, ExtractionModel } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 import { formatClefResult, validateClefRequest } from '../../packages/lm/src/clef-types.js';
 import { DecisionQueueFullError } from '../../packages/server/src/decision-registry.js';
 import { handleSystemOne } from '../../packages/server/src/endpoints/systemone.js';

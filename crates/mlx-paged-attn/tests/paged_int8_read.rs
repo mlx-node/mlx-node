@@ -163,10 +163,13 @@ fn as_f64_head_major(rows: &[u16], tokens: usize, d: usize) -> Vec<f64> {
 }
 
 /// f64 causal attention of `q` `[rows][HQ][D]` over `[H][C][D]` keys and
-/// values: row r sees the first `C - rows + r + 1` tokens. Out `[rows][HQ][D]`.
-fn reference(
+/// values for the selected query row indices: row r sees the first
+/// `C - rows + r + 1` tokens. Out `[row_indices.len()][HQ][D]`.
+#[allow(clippy::too_many_arguments)]
+fn reference_rows(
     q: &[f32],
     rows: usize,
+    row_indices: &[usize],
     keys: &[f64],
     values: &[f64],
     c: usize,
@@ -174,9 +177,9 @@ fn reference(
     scale: f64,
 ) -> Vec<f32> {
     let gqa = q_heads() / kv_heads();
-    let mut out = vec![0f32; rows * q_heads() * d];
+    let mut out = vec![0f32; row_indices.len() * q_heads() * d];
     let mut scores = vec![0f64; c];
-    for r in 0..rows {
+    for (out_r, &r) in row_indices.iter().enumerate() {
         let visible = c - rows + r + 1;
         for qh in 0..q_heads() {
             let h = qh / gqa;
@@ -196,7 +199,7 @@ fn reference(
                 *score = (*score - max).exp();
                 sum += *score;
             }
-            let o = &mut out[(r * q_heads() + qh) * d..(r * q_heads() + qh + 1) * d];
+            let o = &mut out[(out_r * q_heads() + qh) * d..(out_r * q_heads() + qh + 1) * d];
             let mut acc = vec![0f64; d];
             for (i, &p) in scores[..visible].iter().enumerate() {
                 let v = &values[(h * c + i) * d..(h * c + i + 1) * d];
@@ -210,6 +213,21 @@ fn reference(
         }
     }
     out
+}
+
+/// f64 causal attention of `q` `[rows][HQ][D]` over `[H][C][D]` keys and
+/// values: row r sees the first `C - rows + r + 1` tokens. Out `[rows][HQ][D]`.
+fn reference(
+    q: &[f32],
+    rows: usize,
+    keys: &[f64],
+    values: &[f64],
+    c: usize,
+    d: usize,
+    scale: f64,
+) -> Vec<f32> {
+    let all: Vec<usize> = (0..rows).collect();
+    reference_rows(q, rows, &all, keys, values, c, d, scale)
 }
 
 fn bf16_ulp(x: f32) -> f32 {
@@ -484,8 +502,17 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
     };
     let keys_q = dequantized(&f.keys, c, d);
     let values_q = dequantized(&f.values, c, d);
-    let keys_bf16 = as_f64_head_major(&f.keys, c, d);
-    let values_bf16 = as_f64_head_major(&f.values, c, d);
+    let needs_bf16_ref = d == 256 && case.rows.iter().any(|&r| flat_serves(r));
+    let keys_bf16 = if needs_bf16_ref {
+        as_f64_head_major(&f.keys, c, d)
+    } else {
+        Vec::new()
+    };
+    let values_bf16 = if needs_bf16_ref {
+        as_f64_head_major(&f.values, c, d)
+    } else {
+        Vec::new()
+    };
     let mut rng = Rng(seed ^ 0x9);
     for (&rows, &grouped) in case.rows.iter().zip(case.grouped) {
         let q: Vec<u16> = (0..rows * q_heads() * d)
@@ -495,8 +522,57 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
         unsafe { mlx_sys::mlx_paged_grouped_qwen35_test_probe_reset() };
         let got = paged(&f, &q, rows, c, d, bs, scale);
         let launches = unsafe { mlx_sys::mlx_paged_grouped_qwen35_test_probe_count() };
-        let expected = reference(&q_f32, rows, &keys_q, &values_q, c, d, f64::from(scale));
-        let (max, mean) = error_ulps(&got, &expected);
+        // For wide 64-row long-context varlen blocks (`rows = 64` at
+        // C >= 17_000), check boundary/tail rows against the exact f64 oracle
+        // AND verify every single output row against independent 1-row decode
+        // GPU dispatches over the identical causal prefixes. All <= 8-row cases
+        // run the full dequantized f64 reference across every row.
+        let sampled_rows: Option<&[usize]> = if rows == 64 && c >= 17_000 {
+            Some(&[0, 1, 59, 60, 61, 62, 63])
+        } else {
+            None
+        };
+        let (expected, (max, mean)) = if let Some(sample_idx) = sampled_rows {
+            if !got.iter().all(|v| v.is_finite()) {
+                failures.push(format!(
+                    "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: non-finite GPU output"
+                ));
+            }
+            let stride = q_heads() * d;
+            let mut per_row_gpu = Vec::with_capacity(got.len());
+            for r in 0..rows {
+                let row_q = &q[r * stride..(r + 1) * stride];
+                let row_out = paged(&f, row_q, 1, c - rows + r + 1, d, bs, scale);
+                per_row_gpu.extend_from_slice(&row_out);
+            }
+            let (gpu_max, gpu_mean) = error_ulps(&got, &per_row_gpu);
+            if !(gpu_max <= 3.0 && gpu_mean <= 0.35) {
+                failures.push(format!(
+                    "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: varlen vs independent 1-row GPU \
+                     max {gpu_max} / mean {gpu_mean:.4} bf16 ulps"
+                ));
+            }
+            let mut sampled = Vec::with_capacity(sample_idx.len() * stride);
+            for &r in sample_idx {
+                sampled.extend_from_slice(&got[r * stride..(r + 1) * stride]);
+            }
+            let expected = reference_rows(
+                &q_f32,
+                rows,
+                sample_idx,
+                &keys_q,
+                &values_q,
+                c,
+                d,
+                f64::from(scale),
+            );
+            let errs = error_ulps(&sampled, &expected);
+            (expected, errs)
+        } else {
+            let expected = reference(&q_f32, rows, &keys_q, &values_q, c, d, f64::from(scale));
+            let errs = error_ulps(&got, &expected);
+            (expected, errs)
+        };
         eprintln!(
             "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: grouped launches {launches}; paged vs f64 \
              dequantized reference max {max} / mean {mean:.4} bf16 ulps"
@@ -522,18 +598,41 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
         } else if d == 256 {
             let flat_out = flat(&f, &q, rows, c, scale)
                 .unwrap_or_else(|| panic!("flat int8 kernel refused rows {rows} c {c}"));
-            let ref_bf16 = reference(
-                &q_f32,
-                rows,
-                &keys_bf16,
-                &values_bf16,
-                c,
-                d,
-                f64::from(scale),
-            );
+            let stride = q_heads() * d;
+            let (got_cmp, flat_cmp, ref_bf16) = if let Some(sample_idx) = sampled_rows {
+                let slice_rows = |buf: &[f32]| -> Vec<f32> {
+                    let mut out = Vec::with_capacity(sample_idx.len() * stride);
+                    for &r in sample_idx {
+                        out.extend_from_slice(&buf[r * stride..(r + 1) * stride]);
+                    }
+                    out
+                };
+                let ref_bf16 = reference_rows(
+                    &q_f32,
+                    rows,
+                    sample_idx,
+                    &keys_bf16,
+                    &values_bf16,
+                    c,
+                    d,
+                    f64::from(scale),
+                );
+                (slice_rows(&got), slice_rows(&flat_out), ref_bf16)
+            } else {
+                let ref_bf16 = reference(
+                    &q_f32,
+                    rows,
+                    &keys_bf16,
+                    &values_bf16,
+                    c,
+                    d,
+                    f64::from(scale),
+                );
+                (got.clone(), flat_out.clone(), ref_bf16)
+            };
             let noise = rel(&expected, &ref_bf16, &ref_bf16);
-            let paged_vs_flat = rel(&got, &flat_out, &ref_bf16);
-            let flat_err = error_ulps(&flat_out, &expected);
+            let paged_vs_flat = rel(&got_cmp, &flat_cmp, &ref_bf16);
+            let flat_err = error_ulps(&flat_cmp, &expected);
             let magnitude = ref_bf16.iter().fold(0f32, |m, e| m.max(e.abs()));
             let ulp = bf16_ulp(magnitude) / magnitude;
             eprintln!(
@@ -546,6 +645,18 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
                     "{h}/{hq} D{d} C{c} rows {rows}: paged vs flat {paged_vs_flat:?} exceeds the \
                      quantization noise {noise:?} + kernel tolerance"
                 ));
+            }
+            if sampled_rows.is_some() {
+                // Also verify every single row of `got` against `flat_out`.
+                let full_vs_flat = rel(&got, &flat_out, &flat_out);
+                if !(full_vs_flat.0 <= noise.0 * 1.5 + 4.0 * ulp
+                    && full_vs_flat.1 <= noise.1 * 1.5 + ulp)
+                {
+                    failures.push(format!(
+                        "{h}/{hq} D{d} C{c} rows {rows}: full paged vs flat {full_vs_flat:?} \
+                         exceeds quantization noise {noise:?}"
+                    ));
+                }
             }
         }
     }

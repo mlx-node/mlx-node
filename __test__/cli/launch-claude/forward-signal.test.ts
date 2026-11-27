@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { computeExitCode, makeChildKillEscalation } from '../../../packages/cli/src/commands/launch-claude/index.js';
+import { computeExitCode, makeChildKillEscalation } from '../../../packages/cli/src/commands/launch-claude/helpers.js';
 
 describe('makeChildKillEscalation', () => {
   beforeEach(() => {

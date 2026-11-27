@@ -6,6 +6,8 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 import { activeSSEStreamCount, createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 /**
  * Bounded, idempotent shutdown.
  *

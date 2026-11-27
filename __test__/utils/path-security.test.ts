@@ -1,7 +1,14 @@
 import { resolve } from 'node:path';
 
-import { validatePathContainment, resolveAndValidatePath, getAllowedRoot, PathTraversalError } from '@mlx-node/trl';
 import { describe, expect, it, afterEach } from 'vite-plus/test';
+
+import { loadLocalGsm8kDataset } from '../../packages/trl/src/data/dataset.js';
+import {
+  validatePathContainment,
+  resolveAndValidatePath,
+  getAllowedRoot,
+  PathTraversalError,
+} from '../../packages/trl/src/utils/path-security.js';
 
 describe('Path Security', () => {
   describe('validatePathContainment', () => {
@@ -145,21 +152,16 @@ describe('Path Security', () => {
 
 describe('Dataset path traversal protection', () => {
   it('loadLocalGsm8kDataset rejects path traversal attempts', async () => {
-    const { loadLocalGsm8kDataset } = await import('@mlx-node/trl');
-
     // Attempt to escape to parent directories
     await expect(loadLocalGsm8kDataset('train', { basePath: '../../../etc' })).rejects.toThrow(PathTraversalError);
   });
 
   it('loadLocalGsm8kDataset rejects absolute paths outside cwd', async () => {
-    const { loadLocalGsm8kDataset } = await import('@mlx-node/trl');
-
     // Attempt to use absolute path outside cwd
     await expect(loadLocalGsm8kDataset('train', { basePath: '/etc' })).rejects.toThrow(PathTraversalError);
   });
 
   it('loadLocalGsm8kDataset accepts valid paths within cwd', async () => {
-    const { loadLocalGsm8kDataset } = await import('@mlx-node/trl');
     const validBasePath = resolve(process.cwd(), 'data/gsm8k');
 
     // This should not throw a PathTraversalError (may fail for other reasons like file not found)
@@ -172,7 +174,6 @@ describe('Dataset path traversal protection', () => {
   });
 
   it('loadLocalGsm8kDataset allows custom allowedRoot', async () => {
-    const { loadLocalGsm8kDataset } = await import('@mlx-node/trl');
     const customRoot = '/custom/root';
 
     // With a custom allowedRoot, paths relative to that root should work

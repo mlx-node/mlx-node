@@ -7541,6 +7541,40 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
     true
 }
 
+const ASSETS_LOCK_RETRIES: u32 = 40;
+const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SIDECAR_RETRY_BUDGET: std::cell::Cell<Option<(u32, std::time::Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_sidecar_retry_budget<T>(
+    retries: u32,
+    sleep: std::time::Duration,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Guard(Option<(u32, std::time::Duration)>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_SIDECAR_RETRY_BUDGET.with(|slot| slot.set(self.0));
+        }
+    }
+    let prev = TEST_SIDECAR_RETRY_BUDGET.with(|slot| slot.replace(Some((retries, sleep))));
+    let _guard = Guard(prev);
+    f()
+}
+
+fn sidecar_retry_budget() -> (u32, std::time::Duration) {
+    #[cfg(test)]
+    if let Some(budget) = TEST_SIDECAR_RETRY_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    (ASSETS_LOCK_RETRIES, ASSETS_LOCK_RETRY_SLEEP)
+}
+
 /// Bounded retry around a keyed lease: a transient sentinel failure — fd
 /// pressure, or a deleter's brief EX try-flock between `still_deletable`
 /// and the unlink — clears in milliseconds, so spin ~2s (the budget the
@@ -7548,11 +7582,12 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
 /// here must NEVER downgrade to an unprotected return: callers fail the
 /// load instead of handing a model a directory an eviction can remove.
 pub(crate) fn native_gguf_lease_in_use_retry(root: &Path, dir: &Path, key: &str) -> bool {
-    for _ in 0..40 {
+    let (retries, sleep) = sidecar_retry_budget();
+    for _ in 0..retries {
         if native_gguf_lease_in_use(root, dir, Some(key)) {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(sleep);
     }
     false
 }
@@ -7904,19 +7939,18 @@ where
         std::process::id()
     );
     let live_dir = root.join(&live_dir_name);
-    const ASSETS_LOCK_RETRIES: u32 = 40;
-    const ASSETS_LOCK_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    let (assets_lock_retries, assets_lock_retry_sleep) = sidecar_retry_budget();
 
     // Hit path: shared-lease `dir` before checking `complete` so a foreign
     // sweep's LOCK_EX cannot delete it out from under the caller.
     if dir.join("complete").exists() {
         let mut leased = false;
-        for _ in 0..ASSETS_LOCK_RETRIES {
+        for _ in 0..assets_lock_retries {
             if native_gguf_lease_in_use(root, &dir, Some(&dir_name)) {
                 leased = true;
                 break;
             }
-            std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+            std::thread::sleep(assets_lock_retry_sleep);
         }
         if leased {
             if dir.join("complete").exists() {
@@ -7947,11 +7981,11 @@ where
     }
 
     let mut guard = assets_sidecar_lock(root, &dir_name);
-    for _ in 0..ASSETS_LOCK_RETRIES {
+    for _ in 0..assets_lock_retries {
         if guard.is_some() {
             break;
         }
-        std::thread::sleep(ASSETS_LOCK_RETRY_SLEEP);
+        std::thread::sleep(assets_lock_retry_sleep);
         guard = assets_sidecar_lock(root, &dir_name);
     }
     let Some(_guard) = guard else {

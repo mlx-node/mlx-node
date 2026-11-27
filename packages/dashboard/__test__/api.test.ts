@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
@@ -113,6 +113,7 @@ beforeEach(() => {
   writeFileSync(join(cacheRoot, hexBlock(2)), Buffer.alloc(200));
 
   runtime = createDashboardRuntime({
+    inProcessWorker: true,
     chat: { tempRoots: [] },
     dbPath: ':memory:',
     tracesDir,
@@ -1482,6 +1483,7 @@ describe('dashboard api — cache trend scoping', () => {
     const linkRoot = join(base, 'cache-link');
     symlinkSync(cacheRoot, linkRoot);
     const linked = createDashboardRuntime({
+      inProcessWorker: true,
       chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
@@ -1712,6 +1714,7 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
     );
 
     defaulted = createDashboardRuntime({
+      inProcessWorker: true,
       chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
@@ -2086,14 +2089,41 @@ describe('dashboard api — health and unknown paths', () => {
 // only in the renderer. Everything else stays in-process because it is API
 // behaviour, not transport behaviour.
 describe('dashboard api — the RPC transport carries the error model over a port', () => {
+  let rpcBase: string;
+  let rpcModelsDir: string;
+  let rpcRuntime: DashboardRuntime;
   let rpc: TestClient;
   let teardown: () => void;
 
-  beforeEach(() => {
+  // One dedicated real worker-thread runtime (inProcessWorker: false) covers the
+  // full MessagePort + Worker thread boundary across all 6 read/error checks.
+  beforeAll(() => {
+    rpcBase = mkdtempSync(join(tmpdir(), 'dash-api-rpc-'));
+    const rpcTracesDir = join(rpcBase, 'traces');
+    cpSync(FIXTURE_TRACES, rpcTracesDir, { recursive: true });
+    rpcModelsDir = join(rpcBase, 'models');
+    mkdirSync(join(rpcModelsDir, 'model-a'), { recursive: true });
+    writeFileSync(join(rpcModelsDir, 'model-a', 'config.json'), MODEL_CONFIG);
+    writeFileSync(join(rpcModelsDir, 'model-a', 'model.safetensors'), Buffer.alloc(2048));
+    const rpcCacheRoot = join(rpcBase, 'cache');
+    mkdirSync(rpcCacheRoot, { recursive: true });
+    writeFileSync(join(rpcCacheRoot, hexBlock(1)), Buffer.alloc(100));
+    writeFileSync(join(rpcCacheRoot, hexBlock(2)), Buffer.alloc(200));
+
+    rpcRuntime = createDashboardRuntime({
+      chat: { tempRoots: [] },
+      dbPath: ':memory:',
+      tracesDir: rpcTracesDir,
+      modelsDir: rpcModelsDir,
+      cacheRoot: rpcCacheRoot,
+      moveToTrash: async () => {
+        throw new Error('an API test reached the Trash');
+      },
+    });
     const { port1, port2 } = new MessageChannel();
     port1.unref();
     port2.unref();
-    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    const dispose = serveRuntimeOverPort(rpcRuntime, bindEventTargetPort(port2));
     const client = createRpcClient(bindEventTargetPort(port1));
     rpc = createTestClient(client);
     teardown = () => {
@@ -2102,14 +2132,16 @@ describe('dashboard api — the RPC transport carries the error model over a por
     };
   });
 
-  afterEach(() => {
+  afterAll(async () => {
     teardown();
+    await rpcRuntime.close();
+    rmSync(rpcBase, { recursive: true, force: true });
   });
 
   it('answers a plain read over the port', async () => {
     const res = await rpc.fetch('/api/models');
     expect(res.status).toBe(200);
-    expect((await res.json()) as { dir: string }).toMatchObject({ dir: modelsDir });
+    expect((await res.json()) as { dir: string }).toMatchObject({ dir: rpcModelsDir });
   });
 
   it('carries a handler 404 across with its message', async () => {
@@ -2129,7 +2161,7 @@ describe('dashboard api — the RPC transport carries the error model over a por
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe('Invalid JSON in request body');
     // Nothing was cleared by the rejected call.
-    const after = (await (await api.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
+    const after = (await (await rpc.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
     expect(after.disk.entryCount).toBe(2);
   });
 

@@ -35,7 +35,7 @@
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
 //!     MLX_PAGED_PREFILL_CHUNK_SIZE=512 \
-//!     cargo test -p mlx-core --test qwen3_prefill_cancel \
+//!     cargo test -p mlx-core --features e2e-tests --test qwen3_prefill_cancel \
 //!     -- --ignored --nocapture
 //! ```
 

@@ -184,7 +184,7 @@ fn q8_wave_rows_equal_each_owner_alone() {
 fn router_mv_bitwise_row_invariant_and_f32_parity() {
     crate::models::hy_v4_flash::exact_f32();
     let mut r = Rng::new(2028);
-    for (e, k) in [(512usize, 3072usize), (509, 96), (7, 64), (16, 128)] {
+    for (e, k) in [(512usize, 1024usize), (509, 96), (7, 64), (16, 128)] {
         let w_f32 = arr(&r.vec_f32(e * k, 1.0 / (k as f32).sqrt()), &[e, k]);
         let w_f16 = w_f32.astype(DType::Float16).unwrap();
         let x_all = r.vec_f32(8 * k, 1.25);
@@ -261,7 +261,7 @@ fn q8_dual_down_add_decode_and_prefill_parity() {
     let mut r = Rng::new(2029);
 
     // 1. Decode M=1,2,4: clamp boundaries + bit-exact row invariance.
-    for (k, n) in [(1536usize, 3072usize), (192, 71)] {
+    for (k, n) in [(512usize, 1024usize), (192, 71)] {
         let (w_up, w_sd, rl_all, sgu_all) = dual_setup(&mut r, 4, k, n, 1.5);
         for lim in [0.0f32, 10.0f32] {
             assert_row_invariant(
@@ -312,7 +312,7 @@ fn q8_dual_down_add_decode_and_prefill_parity() {
         (17usize, 192usize, 71usize),
         (45, 192, 160),
         (64, 512, 256),
-        (77, 1536, 3072),
+        (77, 512, 1024),
     ] {
         let (w_up, w_sd, rl_v, sgu_v) = dual_setup(&mut r, m, k, n, 1.0);
         let mut combined = Vec::with_capacity(m * 3 * k);

@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! MLX_KQUANT_TILED_BENCH=1 cargo test -p mlx-core --release \
-//!   --test kquant_tiled_bench -- --ignored --nocapture
+//!   --features e2e-tests --test kquant_tiled_bench -- --ignored --nocapture
 //! ```
 
 mod kquant_support;

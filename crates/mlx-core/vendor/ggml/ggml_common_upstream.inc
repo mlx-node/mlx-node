@@ -3,7 +3,7 @@
 // fetch or a llama.cpp checkout.
 //
 // Nothing here is compiled. It is data for the provenance guard in
-// crates/mlx-core/tests/kquant_ggml_parity.rs (`vendored_ggml_reference_is_verbatim`).
+// crates/mlx-core/tests/kquant_suite/kquant_ggml_parity.rs (`vendored_ggml_reference_is_verbatim`).
 //
 // Source file : ggml/src/ggml-common.h  (llama.cpp / ggml, MIT)
 // sha256      : af255601767325f087313fa84b9435cb77aeec37df6b61b98d9ecc65f29fb4a0
@@ -11,7 +11,7 @@
 //
 // To re-anchor against a real checkout, point the guard at it:
 //   GGML_COMMON_H=/path/to/llama.cpp/ggml/src/ggml-common.h \
-//     cargo test -p mlx-core --release --test kquant_ggml_parity
+//     cargo test -p mlx-core --release --test kquant_suite kquant_ggml_parity::
 //
 // Each span is introduced by a `// @@ <symbol> ggml-common.h:<first>-<last>`
 // marker; the lines after it up to the next marker are byte-for-byte upstream.

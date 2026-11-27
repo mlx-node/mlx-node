@@ -10,7 +10,7 @@ import {
   findClaudeOnPath,
   resolveClaudeLaunch,
   resolveWindowsClaudeShim,
-} from '../src/commands/launch-claude/index.js';
+} from '../src/commands/launch-claude/helpers.js';
 
 let root: string;
 

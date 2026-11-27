@@ -13,7 +13,7 @@ import {
   isLocalCopyComplete,
   isModelAlreadyDownloaded,
   pickAssetSidecars,
-} from '../../packages/cli/src/commands/download-model.js';
+} from '../../packages/cli/src/commands/download-model-helpers.js';
 
 describe('pickAssetSidecars', () => {
   const file = (path: string): ListFileEntry => ({ type: 'file', path, size: 1 });

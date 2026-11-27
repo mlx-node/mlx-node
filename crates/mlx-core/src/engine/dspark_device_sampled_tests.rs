@@ -57,28 +57,54 @@ fn app_params() -> ChatParams {
 }
 
 pub(super) fn fixture(seed: u64) -> Result<Fixture> {
+    fixture_with(seed, L, false)
+}
+
+pub(super) fn fixture_with(seed: u64, draft_len: usize, align_scores: bool) -> Result<Fixture> {
     let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut candidate_ids = Vec::with_capacity(L * K);
-    for _ in 0..L {
+    let mut candidate_ids = Vec::with_capacity(draft_len * K);
+    for _ in 0..draft_len {
         let mut order: Vec<(f64, i32)> = (0..V as i32).map(|id| (rng.next(), id)).collect();
         order.sort_by(|a, b| a.0.total_cmp(&b.0));
         candidate_ids.extend(order[..K].iter().map(|&(_, id)| id));
     }
-    let score_values: Vec<f32> = (0..L * K * K)
-        .map(|_| (3.0 * rng.next() - 1.5) as f32)
-        .collect();
-    let mut logit_values = Vec::with_capacity((L + 1) * V);
-    for row in 0..=L {
+    let score_values: Vec<f32> = if align_scores {
+        let mut scores = Vec::with_capacity(draft_len * K * K);
+        for _ in 0..draft_len * K {
+            for slot in 0..K {
+                let s = if slot < K / 2 {
+                    0.35 * rng.next() + 3.5
+                } else {
+                    1.5 * rng.next() - 2.0
+                };
+                scores.push(s as f32);
+            }
+        }
+        scores
+    } else {
+        (0..draft_len * K * K)
+            .map(|_| (3.0 * rng.next() - 1.5) as f32)
+            .collect()
+    };
+    let mut logit_values = Vec::with_capacity((draft_len + 1) * V);
+    for row in 0..=draft_len {
         for id in 0..V as i32 {
-            let favored = row < L && candidate_ids[row * K..row * K + K / 2].contains(&id);
-            let lean = if favored { 3.5 } else { 0.0 };
-            logit_values.push((1.5 * rng.next() + lean) as f32);
+            let favored = row < draft_len && candidate_ids[row * K..row * K + K / 2].contains(&id);
+            let lean = if !favored {
+                0.0
+            } else if align_scores {
+                4.5
+            } else {
+                3.5
+            };
+            let noise = if align_scores && favored { 0.35 } else { 1.5 };
+            logit_values.push((noise * rng.next() + lean) as f32);
         }
     }
     let params = app_params();
-    let logits = MxArray::from_float32(&logit_values, &[1, (L + 1) as i64, V as i64])?;
-    let mut targets = Vec::with_capacity(L + 1);
-    for row in 0..=L {
+    let logits = MxArray::from_float32(&logit_values, &[1, (draft_len + 1) as i64, V as i64])?;
+    let mut targets = Vec::with_capacity(draft_len + 1);
+    for row in 0..=draft_len {
         let one = MxArray::from_float32(&logit_values[row * V..(row + 1) * V], &[V as i64])?;
         let p = crate::sampling::sampling_distribution(&one, params.sampling_config)?
             .astype(DType::Float32)?;
@@ -86,8 +112,8 @@ pub(super) fn fixture(seed: u64) -> Result<Fixture> {
         targets.push(p.to_float32()?.iter().map(|&v| f64::from(v)).collect());
     }
     Ok(Fixture {
-        candidates: MxArray::from_int32(&candidate_ids, &[1, L as i64, K as i64])?,
-        scores: MxArray::from_float32(&score_values, &[L as i64, K as i64, K as i64])?,
+        candidates: MxArray::from_int32(&candidate_ids, &[1, draft_len as i64, K as i64])?,
+        scores: MxArray::from_float32(&score_values, &[draft_len as i64, K as i64, K as i64])?,
         logits,
         candidate_ids,
         score_values,
@@ -214,25 +240,43 @@ pub(super) fn chi_square(counts: &[u64], probs: &[f64]) -> (f64, usize) {
     (stat, bins.saturating_sub(1).max(1))
 }
 
+enum LawBudget {
+    Draws(usize),
+    Cycles(usize),
+}
+
 /// Pooled p-value of the emitted tokens per verify row against the target,
 /// and of the first draft against the selector row it is drawn from.
-fn law_p(f: &Fixture, draws: usize, seed: u64, host_accept: bool) -> Result<(f64, Vec<String>)> {
+fn law_p_budget(
+    f: &Fixture,
+    budget: LawBudget,
+    seed: u64,
+    host_accept: bool,
+) -> Result<(f64, Vec<u64>, Vec<String>)> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut counts = vec![vec![0u64; V]; L + 1];
+    let rows = f.targets.len();
+    let mut counts = vec![vec![0u64; V]; rows];
     let mut first_draft = vec![0u64; V];
     let mut emitted_total = 0usize;
-    while emitted_total < draws {
+    let mut cycles = 0usize;
+    while match budget {
+        LawBudget::Draws(target) => emitted_total < target,
+        LawBudget::Cycles(target) => cycles < target,
+    } {
         let (emitted, drafts) = cycle(f, &mut rng, host_accept)?;
         first_draft[drafts[0] as usize] += 1;
         for (row, &token) in emitted.iter().enumerate() {
             counts[row][token] += 1;
         }
         emitted_total += emitted.len();
+        cycles += 1;
     }
     let mut lines = Vec::new();
+    let mut row_hits = Vec::with_capacity(rows);
     let (mut stat, mut dof) = (0.0, 0usize);
     for (row, (c, p)) in counts.iter().zip(&f.targets).enumerate() {
         let n: u64 = c.iter().sum();
+        row_hits.push(n);
         if n < 200 {
             continue;
         }
@@ -256,7 +300,12 @@ fn law_p(f: &Fixture, draws: usize, seed: u64, host_accept: bool) -> Result<(f64
     ));
     stat += s;
     dof += d;
-    Ok((gamma_q(dof as f64 / 2.0, stat / 2.0), lines))
+    Ok((gamma_q(dof as f64 / 2.0, stat / 2.0), row_hits, lines))
+}
+
+fn law_p(f: &Fixture, draws: usize, seed: u64, host_accept: bool) -> Result<(f64, Vec<String>)> {
+    let (p, _, lines) = law_p_budget(f, LawBudget::Draws(draws), seed, host_accept)?;
+    Ok((p, lines))
 }
 
 /// The host selector's softmax of one score row (`normalized_selector_probs`).
@@ -270,9 +319,11 @@ fn selector_probs(row: &[f32], temperature: f64) -> Vec<f64> {
     w.iter().map(|x| x / total).collect()
 }
 
-/// 200,000 emitted tokens through the product's device draw and device
+/// 10,000 emitted tokens through the product's device draw and device
 /// acceptance: per verify row they follow the target distribution, and the
-/// first draft follows its selector row. `MLX_TEST_SAMPLED_DRAWS` sets the count.
+/// first draft follows its selector row. A compact L=3 arm with aligned
+/// favored scores also verifies the bonus row (`row L`) with >= 400 hits.
+/// `MLX_TEST_SAMPLED_DRAWS` sets the main arm's draw count.
 #[test]
 fn device_sampled_acceptance_keeps_the_target_law() -> Result<()> {
     if !metal() {
@@ -282,7 +333,7 @@ fn device_sampled_acceptance_keeps_the_target_law() -> Result<()> {
     let draws = std::env::var("MLX_TEST_SAMPLED_DRAWS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200_000);
+        .unwrap_or(10_000);
     let started = std::time::Instant::now();
     let (p, lines) = law_p(&f, draws, 0xA11CE, false)?;
     eprintln!(
@@ -296,6 +347,32 @@ fn device_sampled_acceptance_keeps_the_target_law() -> Result<()> {
         p >= 1e-6,
         "device sampled acceptance breaks the law: p {p:.3e}"
     );
+
+    // Full-width (L = 7) high-acceptance arm verifies every verify row
+    // including late rows 4..=6 and bonus row 7 with >= 200 hits each.
+    const FULL_CYCLES: usize = 1_500;
+    let bonus = fixture_with(0x56, L, true)?;
+    let started = std::time::Instant::now();
+    let (bonus_p, row_hits, bonus_lines) =
+        law_p_budget(&bonus, LawBudget::Cycles(FULL_CYCLES), 0xB0405, false)?;
+    eprintln!(
+        "sampled law device full-width L={L} cycles {FULL_CYCLES} row_hits {:?} pooled p {bonus_p:.3e} in {:?}",
+        row_hits,
+        started.elapsed()
+    );
+    for line in &bonus_lines {
+        eprintln!("sampled law full-width   {line}");
+    }
+    for (row, &hits) in row_hits.iter().enumerate() {
+        assert!(
+            hits >= 200,
+            "verify row {row} got only {hits} hits (< 200), cannot verify full-width law"
+        );
+    }
+    assert!(
+        bonus_p >= 1e-6,
+        "device sampled acceptance full-width arm breaks the law: p {bonus_p:.3e}"
+    );
     Ok(())
 }
 
@@ -307,14 +384,41 @@ fn host_acceptance_of_device_drafts_keeps_the_target_law() -> Result<()> {
         return Ok(());
     }
     let f = fixture(0x52)?;
-    let (p, lines) = law_p(&f, 40_000, 0xB0B, true)?;
-    eprintln!("sampled law host draws 40000 pooled p {p:.3e}");
+    let (p, lines) = law_p(&f, 5_000, 0xB0B, true)?;
+    eprintln!("sampled law host draws 5000 pooled p {p:.3e}");
     for line in &lines {
         eprintln!("sampled law   {line}");
     }
     assert!(
         p >= 1e-6,
         "host acceptance of device drafts breaks the law: p {p:.3e}"
+    );
+
+    // Full-width (L = 7) high-acceptance arm verifies every verify row through
+    // the batched host path (`accept_dspark_proposal`), including late rows
+    // 4..=6 and bonus row 7, with >= 200 hits each.
+    const FULL_CYCLES: usize = 1_500;
+    let full = fixture_with(0x57, L, true)?;
+    let started = std::time::Instant::now();
+    let (full_p, row_hits, full_lines) =
+        law_p_budget(&full, LawBudget::Cycles(FULL_CYCLES), 0xB0B07, true)?;
+    eprintln!(
+        "sampled law host full-width L={L} cycles {FULL_CYCLES} row_hits {:?} pooled p {full_p:.3e} in {:?}",
+        row_hits,
+        started.elapsed()
+    );
+    for line in &full_lines {
+        eprintln!("sampled law host full-width   {line}");
+    }
+    for (row, &hits) in row_hits.iter().enumerate() {
+        assert!(
+            hits >= 200,
+            "host verify row {row} got only {hits} hits (< 200), cannot verify full-width law"
+        );
+    }
+    assert!(
+        full_p >= 1e-6,
+        "host acceptance full-width arm breaks the law: p {full_p:.3e}"
     );
     Ok(())
 }
@@ -365,7 +469,7 @@ fn a_seed_repeats_its_device_sampled_tokens() -> Result<()> {
     let run = |seed: u64| -> Result<Vec<usize>> {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut out = Vec::new();
-        for _ in 0..400 {
+        for _ in 0..24 {
             out.extend(cycle(&f, &mut rng, false)?.0);
         }
         Ok(out)

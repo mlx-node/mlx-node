@@ -1183,6 +1183,9 @@ void qmm_nax(const Operands &o, int M, int N, int K) {
   std::string kname = prefill_128
       ? kernels::qmm_t_nax_t64_p128_bf16(o.mode)
       : kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1, o.tiled);
+  if (bridge_testing::counting && prefill_128) {
+    bridge_testing::record("qmm_t_nax_t64_p128");
+  }
   std::string family = family_of("qmm_t_nax", o.tiled);
   auto kernel = get_kernel(o.d, family, kname, M, N, K);
   array w = prefill_128 ? ensure_aligned16_matrix(o.w, o.s) : o.w;

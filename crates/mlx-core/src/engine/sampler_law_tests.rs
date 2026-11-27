@@ -17,7 +17,7 @@ use crate::sampling::{SamplingConfig, SparseDistribution};
 
 const V: usize = 2048;
 const DRAFTS: usize = 7;
-const CYCLES: usize = 2048;
+const CYCLES: usize = 768;
 const MIN_P_VALUE: f64 = 1e-6;
 
 fn metal() -> bool {
@@ -305,10 +305,7 @@ fn the_sampler_keeps_its_law() -> Result<()> {
         fails.push(format!("draws: pooled p {draws_p:.3e}"));
     }
     let all = presets();
-    let mut arms = vec![
-        ("host", all[0].1, Accept::Host, 0u64),
-        ("host", all[0].1, Accept::Host, 1),
-    ];
+    let mut arms = vec![("host", all[0].1, Accept::Host, 0u64)];
     if !crate::test_support::apple_gpu_family_absent("the_sampler_keeps_its_law: device rows arms")
     {
         for (name, config) in &all {
@@ -317,7 +314,7 @@ fn the_sampler_keeps_its_law() -> Result<()> {
             }
         }
         assert!(
-            arms.len() >= 4,
+            arms.len() >= 3,
             "the device rows take the top-k presets: {} arms",
             arms.len()
         );

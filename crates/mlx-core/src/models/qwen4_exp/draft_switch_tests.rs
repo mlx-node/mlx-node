@@ -24,6 +24,13 @@ pub(super) const ROWS: usize = 4;
 /// A tokenizer whose chat template writes each message's content and a
 /// space, and whose words `t0`..`t{vocab-1}` are the ids.
 fn word_tokenizer(vocab: usize) -> Arc<Qwen3Tokenizer> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, Arc<Qwen3Tokenizer>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(tok) = cache.lock().unwrap().get(&vocab) {
+        return Arc::clone(tok);
+    }
     let dir = Temp::new();
     std::fs::write(
         dir.0.join("tokenizer_config.json"),
@@ -41,7 +48,9 @@ fn word_tokenizer(vocab: usize) -> Arc<Qwen3Tokenizer> {
     });
     let path = dir.0.join("tokenizer.json");
     std::fs::write(&path, tokenizer.to_string()).unwrap();
-    Arc::new(Qwen3Tokenizer::load_from_file_sync(path.to_str().unwrap()).unwrap())
+    let tok = Arc::new(Qwen3Tokenizer::load_from_file_sync(path.to_str().unwrap()).unwrap());
+    let mut map = cache.lock().unwrap();
+    Arc::clone(map.entry(vocab).or_insert(tok))
 }
 
 fn words(ids: &[u32]) -> String {
@@ -168,12 +177,39 @@ pub(super) fn full_length(
     max_new: i32,
     seed: u32,
 ) -> (Vec<u32>, Turn) {
+    let mut state = HybridSchedulerState::new(model()).unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     for k in 0..16 {
         let tokens = prompt(len, seed + 17 * k);
-        let (_, turn) = alone(model(), "plain", &tokens, max_new, false);
+        let (command, rx) = start("plain", &tokens, max_new, false);
+        assert!(sender.send(command).is_ok());
+        let result = drive_all(&mut state, &mut receiver, &mut [rx])
+            .remove(0)
+            .unwrap();
+        let turn = turn_of(&state, "plain", result);
         if turn.finish == "length" {
             return (tokens, turn);
         }
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .send(ModelCommand::from_chat(ChatCmd::ReleaseCacheOwner {
+                    owner_id: "plain".to_string(),
+                    reply,
+                }))
+                .is_ok()
+        );
+        for _ in 0..64 {
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        }
+        state
+            .inner
+            .reset_caches(crate::engine::backend::ResetScope::Command)
+            .unwrap();
+        state.inner.prefix_states.reset(true);
     }
     panic!("no prompt ran {max_new} tokens");
 }
@@ -306,7 +342,7 @@ fn the_switch_drafts_only_a_lone_turn_on_a_whole_store() {
             "attached {attached}, direct {direct}, filled {filled}, {open} open"
         );
     }
-    let c = direct_inner().decoder.config.clone();
+    let c = super::route_step::moe_shape_config();
     let draft = || moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers);
     let layers = draft().config.target_layers.clone();
     let greedy = crate::engine::params::extract_chat_params(&ChatConfig {
@@ -427,7 +463,7 @@ fn a_peer_ends_the_drafted_cycles_at_a_cycle_boundary() {
     let _host = memory::scoped_fixture_host();
     const MAX_NEW: i32 = 24;
     let model = || chat_model(reuse_over(direct_inner()));
-    let c = model().decoder.config.clone();
+    let c = super::route_step::moe_shape_config();
     let draft = || moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers);
     let (a, plain_a) = full_length(model, 40, MAX_NEW, 1);
     let (b, plain_b) = full_length(model, 33, MAX_NEW, 5);
@@ -531,15 +567,20 @@ fn a_peer_ends_the_drafted_cycles_at_a_cycle_boundary() {
 /// MUTATION: the fill gate is ignored → red (turn 2 drafted).
 #[test]
 fn a_store_that_moves_up_drafts_the_turn_after_its_fill() {
-    const MAX_NEW: i32 = 12;
+    const MAX_NEW: i32 = 9;
     let bank = bank_bytes();
     let model = || chat_model(host_gate_model(bank));
-    let c = model().decoder.config.clone();
+    let c = super::route_step::deep_moe_shape_config();
     let draft = || moe_draft(c.hidden_size, c.vocab_size, c.num_hidden_layers);
     let quiet = 3u64 << 30;
-    let first = prompt(40, 2);
-    let second = prompt(36, 4);
-    let third = prompt(38, 6);
+    let first = prompt(16, 2);
+    let second = prompt(14, 4);
+    let (third, _) = full_length(
+        || chat_model(super::promote::model_direct()),
+        15,
+        MAX_NEW,
+        6,
+    );
     let run = |inner: Inner, ks: Option<Rc<RefCell<Vec<usize>>>>, full: Vec<u32>| {
         let _host = memory::scoped_test_host(host_with(quiet + own(&inner)));
         let mut state = HybridSchedulerState::new(inner).unwrap();

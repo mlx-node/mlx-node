@@ -64,10 +64,13 @@ import {
   retryableErrorCode,
   selectCommittedStreamText,
   validateRequestImagesAsync,
-} from '@mlx-node/lm';
-import type { ChatSession, ChatStreamControl, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
-import { ToolCallTagBuffer } from '@mlx-node/lm';
+  type ChatSession,
+  type ChatStreamControl,
+  type ChatStreamEvent,
+  type SessionCapableModel,
+} from '@mlx-node/lm/chat-session';
 import { defaultThinkingBudgetForEffort, type ChatFamilyId } from '@mlx-node/lm/family-data';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tool-call-buffer';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {

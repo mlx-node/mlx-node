@@ -56,7 +56,7 @@
 //! PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
 //! MLX_TEST_GEMMA4_MODEL_PATH=/abs/path/to/gemma-4-12b-it \
 //! MLX_TEST_GEMMA4_ASSISTANT_PATH=/abs/path/to/gemma-4-12B-it-assistant \
-//!     cargo test -p mlx-core --test gemma4_assistant --release -- \
+//!     cargo test -p mlx-core --features e2e-tests --test gemma4_assistant --release -- \
 //!     --ignored --nocapture --test-threads=1
 //! ```
 

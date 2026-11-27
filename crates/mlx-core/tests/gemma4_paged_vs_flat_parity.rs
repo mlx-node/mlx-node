@@ -26,7 +26,7 @@
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/gemma-3-1b-mlx \
-//!     cargo test -p mlx-core --test gemma4_paged_vs_flat_parity \
+//!     cargo test -p mlx-core --features e2e-tests --test gemma4_paged_vs_flat_parity \
 //!     -- --ignored --nocapture
 //! ```
 //!

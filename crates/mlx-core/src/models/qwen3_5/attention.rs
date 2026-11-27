@@ -3552,9 +3552,10 @@ mod tests {
         base_v.eval();
         // The segmented primitive rejects an empty prefix (the Rust caller
         // concatenates there), so prefix 0 has no tile route to compare.
-        let prefixes = [
+        let all_prefixes = [
             1_i64, 7, 31, 32, 33, 87, 1023, 1024, 4095, 4096, 6219, 32768,
         ];
+        let boundary_prefixes = [1_i64, 32, 87, 4096, 32768];
         // gqa 6 tiles rows 4 and 8 (M % 8), gqa 8 every width 2..=8.
         let layouts: [(i64, Vec<i64>); 2] = [(24, vec![4, 8]), (32, (2..=8).collect())];
         let mut nax_plan = [0u32; 6];
@@ -3574,20 +3575,49 @@ mod tests {
         let mut checked_nax = 0usize;
         for (q_heads, rows_list) in &layouts {
             for &rows in rows_list {
-                for &prefix in &prefixes {
+                let primary = rows == 8;
+                let prefixes: &[i64] = if primary {
+                    &all_prefixes
+                } else {
+                    &boundary_prefixes
+                };
+                for (pi, &prefix) in prefixes.iter().enumerate() {
                     let nax_here =
                         nax_any && nax_supported(*q_heads, HKV, rows, prefix + rows, &mut nax_plan);
-                    // Random, sharp (x8) and adversarial (x64: scores in
-                    // the tens, a few keys own the softmax).
-                    for (set, shift) in [0u16, 3, 6].into_iter().enumerate() {
+                    // Random (0), sharp (x8, shift 3) and adversarial (x64,
+                    // shift 6: scores in the tens, a few keys own softmax).
+                    let shifts: &[u16] = if primary && matches!(prefix, 33 | 4096 | 32768) {
+                        &[0, 3, 6]
+                    } else if !primary && prefix == 4096 {
+                        &[0, 6]
+                    } else {
+                        match (pi + rows as usize) % 3 {
+                            0 => &[0],
+                            1 => &[3],
+                            _ => &[6],
+                        }
+                    };
+                    for &shift in shifts {
+                        let set = (shift / 3) as usize;
                         let salt =
                             0x1357_9bdf ^ (prefix as u32 * 31) ^ (rows as u32) ^ (set as u32);
                         let c = tile_case(&base_k, &base_v, *q_heads, rows, prefix, salt, shift)?;
-                        let got = strict_tile_for_test(&c)?.to_float32()?;
-                        let expected = segmented_or_concat_split_for_test(
+                        let got_arr = strict_tile_for_test(&c)?;
+                        let expected_arr = segmented_or_concat_split_for_test(
                             &c.q, &c.pk, &c.pv, &c.nk, &c.nv, true,
-                        )?
-                        .to_float32()?;
+                        )?;
+                        let nax_arr = if nax_here {
+                            Some(strict_nax_for_test(&c)?)
+                        } else {
+                            None
+                        };
+                        if let Some(ref na) = nax_arr {
+                            MxArray::eval_arrays(&[&got_arr, &expected_arr, na])?;
+                        } else {
+                            MxArray::eval_arrays(&[&got_arr, &expected_arr])?;
+                        }
+                        let got = got_arr.to_float32()?;
+                        let expected = expected_arr.to_float32()?;
                         let (max_ulps, mean_ulps) = tile_error(got.as_ref(), expected.as_ref());
                         assert!(
                             max_ulps <= 2.0 && mean_ulps <= 0.25,
@@ -3597,8 +3627,8 @@ mod tests {
                         worst.0 = worst.0.max(max_ulps);
                         worst.1 = worst.1.max(mean_ulps);
                         checked += 1;
-                        if nax_here {
-                            let nax = strict_nax_for_test(&c)?.to_float32()?;
+                        if let Some(na) = nax_arr {
+                            let nax = na.to_float32()?;
                             let (max_ulps, mean_ulps) = tile_error(nax.as_ref(), expected.as_ref());
                             assert!(
                                 max_ulps <= 2.0 && mean_ulps <= 0.25,

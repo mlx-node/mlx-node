@@ -49,6 +49,8 @@
 import { __createIdleSweeper } from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+vi.mock('@mlx-node/core', () => ({ __internal__: { clearCache: () => {} } }));
+
 describe('IdleSweeper suspendDrains disposer (round-8/9 hot-load race)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
