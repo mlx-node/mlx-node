@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { DashboardApiError } from './api';
 import { fill } from './chat-strings';
+import { hostStartWords } from './pdf-run';
 import { prefillRate } from './prefill';
 import { toast } from './toast';
 import type { TranscriptEntry, TurnMetric } from './types';
@@ -350,14 +351,20 @@ export function retryTitleOf(text: string): string | null {
 }
 
 /**
- * A turn's title: the first line of its typed prompt (a workflow host's output-contract retry reads as one), what woke
- * the agent, or `(no prompt)`. An interjection is the title only when the turn has no other prompt.
+ * A turn's title: the first line of its typed prompt (a workflow host's output-contract retry reads as one; a Read it
+ * now command as "You started reading {file}", the file by `pdfNames`), what woke the agent, or `(no prompt)`. An
+ * interjection is the title only when the turn has no other prompt.
  */
-export function turnTitle(entries: readonly TranscriptEntry[]): string {
+export function turnTitle(
+  entries: readonly TranscriptEntry[],
+  pdfNames: ReadonlyMap<string, string> = new Map(),
+): string {
   const prompt = entries.find(isPrompt) ?? entries.find((entry) => entry.kind === 'user');
   if (prompt === undefined) return NO_PROMPT;
   if (prompt.kind === 'wake') return wakeTitle(prompt);
   if (prompt.kind !== 'user') return NO_PROMPT;
+  const started = hostStartWords(prompt.text, pdfNames);
+  if (started !== null) return started;
   const retry = retryTitleOf(prompt.text);
   if (retry !== null) return retry;
   const text = firstLine(prompt.text);

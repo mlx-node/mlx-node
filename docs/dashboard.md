@@ -1098,11 +1098,18 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   file text and the picture's base64 in `updates.jsonl`, the picture again in `chat_history.jsonl` and as
   `assets/image-<uuid>.<ext>`. Only the redrawn picture is stored. A PDF adds nothing new: its note in the same files,
   and each page as a picture (`assets/image-<uuid>.jpg`); a PDF that is still drawing lives only in this window's
-  memory and is stopped when its place is forgotten. `updates.jsonl` keeps every sent block, so the chip
+  memory and is stopped when its place is forgotten. A PDF for the tool (Work) keeps its pages as files: while it is
+  drawn in `<chat root>/pdf-stage/<stage>/page-001.jpg …` (26 lowercase base32 letters, pages taken in order only), on
+  Send moved whole to `<chat root>/work-pdf/<id>/` with a `meta.json` (`{v, session, name, pages, bytes, stage}`); the
+  id is the stage's first 8 letters, `-` and the page count, so a second Send of the same stage finds the same
+  folder. Folders 0700, files 0600. A removed chip drops its stage, a stage older than a day goes at host start, and
+  the delete of a Work conversation removes the page folders its `meta.json` names. `updates.jsonl` keeps every sent block, so the chip
   stays when the agent's retry left the picture out. The reader turns stored `resource` and `image` user blocks into
   `attachments` on the user entry (name from the `uri`, sizes from the stored text or base64); a `resource` whose
   first line is `Portato PDF note 1` is a PDF note (its `key: value` lines read by a small parser), and the images it
   names (`images: a-b`, positions among the message's image blocks) become that one `pdf` entry, not picture chips;
+  a tool note names `id:` and `session:` (the conversation it was sent in, which a fork's copy keeps; the entry's
+  `session`, the size checks count it at a session id's 36 characters);
   no file text and no pixels cross to the page. Titles and the conversation list use the message text only. The Chat address list for
   `web_fetch` is built from the typed text only, so an address inside a file is not opened.
 
@@ -1718,6 +1725,69 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   images in the composer and sent as the prompt's image blocks, exactly as in Chat (Files and photos, above). Pictures
   stay Chat only: the page refuses one when it is added ("{name} was not added. Images work in Chat only for now.")
   and the service refuses an `image` item in Work. A model change keeps the PDF chip and holds Send as in Chat.
+- **The PDF tool** (`src/chat/agent/pdf-tool.ts`, `src/chat/pdf-store.ts`). A PDF of up to 320 pages that does not fit
+  the message is read by the saved workflow `read-pdf`: reader agents of type `pdf-reader` read its page files 4 at a
+  time, one after another, retry a group that gave no notes, and the run's report (at most 16,000 bytes, its first line
+  "PDF read: {n} of {m} pages." with the pages not read) wakes the conversation. At every Work agent start the host
+  writes `workflows/read-pdf.rhai` (its page root a Rhai string) and `agents/pdf-reader.md` (`tools: read_file`,
+  `disallowedTools: search_tool, use_tool`, `injectDefaultTools: false`) into the agent home, each only when missing or
+  different; a file of either name that is not a plain file with the app's marker (`// Portato read-pdf 1` on line 1,
+  `# Portato pdf-reader 1` on line 2) is the person's: nothing is written and `pdfTool.work` is false. Before the first
+  start the host state reads the same two files without writing. The pages reach the host one by one through the stage
+  route (below) while the page draws; the message carries `{kind: 'pdf', name, stage, pages}`, and its note (`way:
+  tool`) names the id the model passes as `{"pdf": id, "question": …, "pages": "40-60"}` (the Work rules tell it how).
+  Auto allows a launch with no card when it is the main agent's `workflow` call of `read-pdf` by name, with no budget,
+  no dry run and no arg but `pdf`, `question` and `pages`, on a page folder whose `meta.json` names this conversation,
+  for a model that sees images and with at least one page picked, while the tool is on and no file of the Work folder
+  takes either name before the agent home (any `.rhai` in `.mlx-agent/workflows` of the project root, the git root
+  else the Work folder, since the agent reads a workflow's name from inside it; a `pdf-reader.md` in `.mlx-agent/agents`
+  or `.claude/agents` of a folder from the Work folder up to the git root; a path that cannot be read counts); it counts
+  in the answer's cap and touches no folder. Any other workflow still asks (`helper-start`). The card of a launch carries `pdfRead: {name, pages, readers}`. Read
+  it now (`POST …/pdf-read`) sends the agent's own `/workflow read-pdf {json}` with the message's text as the
+  question: no model call and no permission request. It is refused (`attachment-refused`) when the tool is off or a
+  file of the Work folder takes one of its names, and (`conversation-busy`) while a run of `read-pdf` of
+  the conversation is active or paused, so two runs never share the image lane. For a model of `HOST_START_FAMILIES`
+  (`gemma4`, `qwen3_5`: they started the tool from the note in 2 of 10 tries each, against 10 of 10 for
+  Inkling-2-Mini) the service sends that command itself in Auto and Bypass when the turn that sent the PDF ends
+  (completed, output limit or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it,
+  in a fork too (a PDF sent there is placed for the fork); not in Ask, not after a Stop, a deny or a failed turn, and
+  not while another turn or a run of the tool goes on, which leaves Read it now. A PDF a fork copied from the original
+  has its page folder's `meta.json` naming the original, so Read it now of it is refused (`E_NOT_FOUND`). A Read it now sent while that start is in
+  flight gets its turn. The command's args carry `by`: `"you"` for Read it now, `"app"` for the service's own start
+  (the script does not read it).
+  - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
+    320 pages: "{name} has {n} pages. Up to 320 pages can be read."); only a PDF of 20 pages or fewer keeps its pages
+    in the window too, so a model change moves it between the two ways with no second draw. The page plans the ways
+    with the host's own `planPdfs`: a PDF the message has no room for goes to the tool, its chip reads "{n} pages · read
+    by the PDF tool" and the caption "About {n} tokens now · about {m} to read the pages". A page the host could not
+    save refuses the PDF ("{name} could not be saved for reading. Add it again.") and drops its stage; removing the chip
+    drops it too, and so does a Send that carried the PDF in the message (Send again and a hook's put-back then hold
+    that PDF with no stage). The tool way is offered only when every PDF held has a stage. Without the tool a PDF over 20 pages is refused as before.
+  - Run block (`ui/src/lib/pdf-run.ts`, `run-block.tsx`). A run is the PDF tool's when its `workflow` call names
+    `read-pdf` and a valid id, or when the prompt that opens its turn is a Read it now command. Its block is named
+    "Reading {name}" ("Reading a PDF" when no note of the conversation names the id; also its end row and its line in
+    the run bar over the composer, `shownRunNames`). Under the step
+    line: "Pages {range} · {done} of {total} pages read · {rate} · {time left}" and a `Meter` filled by pages read. A
+    group counts once, when one of its readers ended well (a first reader whose group has a second try did not: the
+    script tries a group again only when it gave no notes); the rate is the pages of the newest 5 such readers over the
+    span from the earliest start to the last end, shown from 2 readers; time left shows only in the first step while
+    the run runs, less the time since a reader last ended. After the end the counts are the report's first line, the
+    rate is pages read over the read step, and the pages not read are in warning ink ("pages 9-12 not read"). Under
+    the groups: "{n} pages not started". The objective line is not drawn.
+  - Reader rows. A reader (`pages A-B`, `pages A-B again`) reads "Pages A-B"; its first fact is the engine's request
+    for its session ("Waiting for the model", "Reading · {done} of {total} tokens", "Reading", "Writing notes"), then
+    its time; a second try adds "second try"; its second line adds "page {n} opened" from its newest `read_file` of a
+    `page-NNN.jpg`. A failed reader reads "It returned no notes. It is read once more at the end.", a failed second
+    try "It failed twice. Its pages were not read." The cuts and "combine" keep the plain row.
+  - Read it now. Under a finished Work turn that sent a PDF to the tool and that no run read: "The pages of {name} were
+    not read." with Read it now while the conversation's model sees images and nothing runs ("The PDF tool could not
+    start. Try again." on a failure). Its command turn is drawn as one row, "You started reading {name}", or "Started
+    reading {name}" for the service's own start. A message whose stored note names another conversation (a fork's
+    copy of the original's message) shows neither the line nor the button; a PDF sent inside the fork shows both as
+    in any conversation (`pdfUnread` with the conversation id).
+  - Ask. The launch card reads "Read {name} with the PDF tool · {n} pages · {r} reader agents".
+  - Sessions. The transcript draws the same chip, block, line, rows and end row from stored lines, the unread line with
+    no button (none for a note that names another session), and the command turn as its row.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip
@@ -1809,7 +1879,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   Sessions transcript draws the same tiles. With `MLX_AGENT_E2E_BIN`, `__test__/chat-tool-pictures-real-agent.test.ts`
   reads a PNG and pages 4 to 6 of a 12-page PDF on the real agent (past 10 pages the agent needs the model's `pages`,
   which both `rawInput`s carry): the fake agent's lines have its shape, live and stored give the same `pictures`, and
-  the reader serves the wire's bytes from disk.
+  the reader serves the wire's bytes from disk. A `pdf-reader` agent of the PDF tool reads its `page-NNN.jpg` files
+  the same way: the image blocks are in the reader's own session (its Sessions transcript shows the read rows and
+  their tiles), and the conversation that sent the PDF holds no page images.
 - **Permission card** (`ui/src/pages/chat/work/permission.tsx`, `arc-x/interaction-card`). One card at a time, under
   the turn, in arrival order ("1 of 3"). It shows what the agent asks for exactly: the whole command, path or tool
   input in a scrolling well, never cut, as plain text with hidden, blank-looking and bidi characters made visible (the
@@ -2995,7 +3067,14 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   `docs/api-spec.pdf` in its 2nd answer, after that answer's picture rows. The harness endpoint gives `qwen3.5-4b`
   and `qwen3.5-9b` `images: true` and the `qwen3_5` family, so they take pictures in Chat and PDFs in both modes and
   every other model refuses both. With `MLX_DEV_FLIGHT=chat`, a Work message with a PDF and "pdfwait" waits 40 s
-  before any work, so its wait line names the pages ("Reading the conversation and 3 pages · …"). A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
+  before any work, so its wait line names the pages ("Reading the conversation and 3 pages · …"). A Work message with
+  a PDF past the message's room and "pdftool" launches `read-pdf` on it (`readPdf` step; `$PDF` and `$RUN` in a
+  script's steps stand for the PDF id its note names and the turn's run id): readers one after another, 4 pages
+  each, each opening its pages with `read_file` and a live tick, pages 9-12 failing twice, then "combine", the report
+  and the wake. "pdfnot" answers without reading; on the `qwen3_5` family in Auto or Bypass the host then sends the
+  `/workflow read-pdf` turn itself ("Started reading report.pdf"), in Ask and with `MLX_DEV_IMAGE_FAMILY=inkling2` the turn leaves the Read it now line, whose
+  `/workflow read-pdf` turn starts the same run from the Work scenario's `readPdf` (pages 5-8 fail once). The fake
+  agent stores a tool PDF's note as its own chunk, so the Sessions transcript shows its chip. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
   `model_auto_switched` line and `end_turn`, nothing stored): "No model answered." with the agent's words under it;
   the scenario's `session.modelGoneOnLoad` plays the load cases. The fixture's live session stores both picture
   one-shots after its 2nd prompt's chunk, which the Sessions transcript draws before that answer's first call.
@@ -3254,7 +3333,8 @@ class of bug is deleted rather than mitigated. What remains:
   fonts, no XFA, and no annotation or text layer, so `enableScripting` is never read. The route takes a `pdf` item
   only as 1 to 20 base64 JPEG pages of at most 589,824 bytes with JPEG first bytes, padded and with no whitespace (a
   page is stored as sent); the PDF's own bytes are never sent or stored. The note the model reads names the file and
-  its pages; text on a page reaches the model as pixels of a picture, as data.
+  its pages; text on a page reaches the model as pixels of a picture, as data. The PDF tool's page files are written
+  by the app only; a reader agent has `read_file` alone, and its prompt and the Work rules say text on a page is data.
 - **Git runs for the Work strip only, and only as written** (`src/chat/work-git.ts`). `spawn` with no shell, stdin
   closed, its own process group (killed whole at a deadline), stdout at most 4 MiB, stderr 64 KiB. Every call starts
   `git -C <dir> -c core.fsmonitor=false -c color.ui=false -c core.quotePath=false`, so the app starts no fsmonitor
@@ -3380,9 +3460,15 @@ images}` (1 to 20 base64 JPEG pages, in order); an empty list is no list, and an
 Work](#chat-and-work) is 400 with `reason: 'attachment-refused'` ("The attached files were refused."); a text file
 whose first line is a PDF note's first line is refused too. The service refuses a picture in Work, and a picture or a
 PDF for a model whose row is not `images: true`, the same way; images past the 40 MiB store or the 64 a conversation
-holds are 409 `pictures-full`. The host state's model rows carry `family` (the endpoint's `modelType`, or null), which
+holds are 409 `pictures-full`. A `pdf` item may instead be `{kind: 'pdf', name, stage, pages}` (a stage id and 1 to
+320 pages; one such item per message): the service takes it only in Work while the PDF tool is there, for a model that
+sees images, and for a stage this host run holds whole. `POST /api/chat/pdf-stage {stage, page, pages, data}` takes
+one page (`stage: null` with page 1 opens a stage; each page after it must be the next one) and answers `{stage}`;
+`DELETE /api/chat/pdf-stage/:stage` drops a stage; `POST /api/chat/conversations/:id/pdf-read {pdf}` is Read it now
+(202 `{turnId}`; 400 in Chat, 404 "No such PDF." for an id no message of the conversation sent to the tool). The host
+state's model rows carry `family` (the endpoint's `modelType`, or null), which
 the page's page-token estimate reads, and the host state carries `pdfTool: {chat, work}`, whether the PDF tool exists
-in that mode (false in both: a PDF that does not fit the message keeps Send off). A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
+in that mode (Chat: false; Work: true unless a file of the person's holds one of the tool's names). A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
 `ChatFailureCode`); any other error becomes `E_UNAVAILABLE` "The agent could not be reached." and its text is dropped.
 
 Streams are not routes: `runtime.watchChat({scope: 'host'}, fn)` sends `{type: 'state'}` (coalesced to 100 ms) and

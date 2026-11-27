@@ -283,6 +283,19 @@ describe('cardDescription', () => {
     expect(cardDescription(bash('Execute `ls` — ', 'ls'))).toBeNull();
   });
 
+  it('a call that starts the PDF tool says what it reads, in place of the agent title', () => {
+    const read = (pages: number, readers: number) =>
+      cardDescription({
+        access: 'other',
+        title: 'Workflow: read-pdf',
+        command: null,
+        path: null,
+        pdfRead: { name: 'report.pdf', pages, readers },
+      });
+    expect(read(212, 53)).toBe('Read report.pdf with the PDF tool · 212 pages · 53 reader agents');
+    expect(read(1, 1)).toBe('Read report.pdf with the PDF tool · 1 page · 1 reader agent');
+  });
+
   it('draws only the words that follow the exact text, else the whole title', () => {
     expect(cardDescription(bash("Execute `ls` — hook 'mine' asks for confirmation", 'ls'))).toBe(
       "hook 'mine' asks for confirmation",

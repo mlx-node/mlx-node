@@ -232,6 +232,8 @@ describe('ChatService decision model filtering', () => {
     };
     const chat = new ChatService({
       paths,
+      homeDir: join(rootDir, 'home'),
+      workAgentHome: join(rootDir, 'agent-home'),
       readEndpoint: async () => endpoint,
       modelSize: async () => 1024,
       resolveAgent: () => ({ launch: { failure: 'agent-missing' }, source: 'none', tag: null }),

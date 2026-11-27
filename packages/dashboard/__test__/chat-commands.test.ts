@@ -20,6 +20,7 @@ import {
   HIDDEN,
   parseSlash,
   readCommands,
+  withoutAppWorkflow,
   type AgentCommand,
 } from '../src/chat/commands.js';
 import { routeError } from '../src/chat/route-errors.js';
@@ -270,6 +271,38 @@ describe('the agent’s rows', () => {
     expect(readCommandList({ result: { commands: [] } })).toBeNull();
     expect(readCommandsUpdate({ sessionUpdate: 'available_commands_update', availableCommands: [] })).toEqual([]);
     expect(readCommandsUpdate({ sessionUpdate: 'agent_message_chunk' })).toBeNull();
+  });
+});
+
+describe('the app’s own workflow', () => {
+  const APP = { name: 'read-pdf', paths: ['/home/workflows/read-pdf.rhai', '/real/home/workflows/read-pdf.rhai'] };
+  const flow = (name: string, workflowPath: string | null) => ({
+    name,
+    description: `Workflow: ${name}`,
+    hint: null,
+    workflow: true,
+    workflowPath,
+    skill: false,
+    qualifiedName: null,
+  });
+
+  // Mutation: return every row whatever `app` is → the app's `read-pdf` is listed and `/read-pdf` is allowed.
+  it('drops the row of the app’s file, by either path or none; another file of the name and other rows stay', () => {
+    const own = flow('Read-PDF', '/project/.mlx-agent/workflows/read-pdf.rhai');
+    const skill = { ...flow('read-pdf', null), workflow: false, skill: true };
+    expect(withoutAppWorkflow([skill], APP)).toEqual([skill]);
+    const rows = [flow('read-pdf', '/home/workflows/read-pdf.rhai'), flow('release', '/home/workflows/release.rhai')];
+    expect(withoutAppWorkflow(rows, APP).map((r) => r.name)).toEqual(['release']);
+    expect(withoutAppWorkflow([flow('read-pdf', '/real/home/workflows/read-pdf.rhai')], APP)).toEqual([]);
+    expect(withoutAppWorkflow([flow('read-pdf', null)], APP)).toEqual([]);
+    expect(withoutAppWorkflow([own], APP)).toEqual([own]);
+    expect(withoutAppWorkflow(rows, null)).toEqual(rows);
+    const kept = readCommands(withoutAppWorkflow(rows, APP));
+    expect(allowedCommands('work', kept).map((r) => r.name)).toEqual(['release']);
+    expect(checkCommand('work', '/read-pdf {"pdf":"p1"}', kept)).toBe('refused');
+    expect(checkCommand('work', '/workflow read-pdf {"pdf":"p1"}', [...kept, row('workflow', 'builtin')])).toBe(
+      'allowed',
+    );
   });
 });
 

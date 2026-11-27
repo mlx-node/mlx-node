@@ -9,6 +9,7 @@ import { CHAT, fill } from './chat-strings';
 import { formatElapsed } from './chat-turns';
 import type { AgentDoing, HelperProgress } from './chat-types';
 import { formatCount, formatDuration } from './format';
+import { openedWords, type ReaderLabel } from './pdf-run';
 
 export function toolCallsWords(n: number): string {
   return n === 1 ? CHAT.subagent.toolCallsOne : fill(CHAT.subagent.toolCalls, { n: formatCount(n) });
@@ -56,6 +57,8 @@ export interface RowLive {
   stopping?: boolean;
   /** This window's host sent its stop. */
   stoppedByYou?: boolean;
+  /** An ended workflow agent leaves its step out of its facts (a PDF reader's step is the run's first). */
+  noStep?: boolean;
 }
 
 export interface RowWords {
@@ -102,7 +105,7 @@ function countsOf(live: boolean, turns: number | undefined, toolCalls: number | 
 export function rowWords(agent: AgentNow, live: RowLive): RowWords {
   const { row, state } = agent;
   const workflow = row.run !== null;
-  const step = workflow ? row.phase : null;
+  const step = workflow && live.noStep !== true ? row.phase : null;
   const time = row.durationMs > 0 ? formatDuration(row.durationMs) : null;
   const entry = row.entry;
   const attempts = attemptWords(row);
@@ -166,4 +169,42 @@ export function rowWords(agent: AgentNow, live: RowLive): RowWords {
     case 'unfinished':
       return ended('unfinished', CHAT.agent.state.unfinished, 'neutral', [step]);
   }
+}
+
+/** What a reader row of the PDF tool adds to its words. */
+export interface ReaderFacts {
+  reader: ReaderLabel;
+  /** What the engine does for the reader's session now (`readerFact`); null when no request names it. */
+  engine: string | null;
+  /** The newest page its `read_file` opened while it runs; null with none seen. */
+  opened: number | null;
+}
+
+/**
+ * A reader row's words: while it runs, the engine's words for its session in place of the agent's (then its time), and
+ * the page it opened on the second line; a second try says so first; a failed reader says what becomes of its pages.
+ */
+export function readerWords(agent: AgentNow, live: RowLive, facts: ReaderFacts): RowWords {
+  const words = rowWords(agent, { ...live, noStep: true });
+  const p = CHAT.pdf;
+  const again = facts.reader.again ? [p.readerFacts.again] : [];
+  const runs = words.mark === 'running' || words.mark === 'quiet' || words.mark === 'asking';
+  const sub = runs && facts.opened !== null ? [...words.sub, openedWords(facts.opened)] : words.sub;
+  const capped = (list: string[]): string[] => list.slice(0, 3);
+  if (words.mark === 'failed') {
+    const reason = facts.reader.again ? p.readerFailedTwice : p.readerFailed;
+    return { ...words, facts: capped([...again, ...words.facts]), sub, reason };
+  }
+  if ((words.mark === 'running' || words.mark === 'quiet') && facts.engine !== null) {
+    const elapsed = elapsedOf(agent, live);
+    return {
+      ...words,
+      mark: 'running',
+      word: facts.engine,
+      tone: 'success',
+      facts: capped([...again, ...(elapsed === null ? [] : [elapsed])]),
+      sub,
+    };
+  }
+  return { ...words, facts: capped([...again, ...words.facts]), sub };
 }

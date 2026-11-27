@@ -44,19 +44,28 @@ function countsOf(row: RunRailRow): string[] {
   return out;
 }
 
-/** The request of an agent of `run` that waits first; null with none. */
-function askOf(needs: readonly AskRow[], run: RunRailRow): StripLine | null {
+/** The request of an agent of `run` that waits first; null with none. An ask names its run by the workflow's name. */
+function askOf(needs: readonly AskRow[], run: RunRailRow, name: string): StripLine | null {
   const ask = needs.find((row) => row.from.who === 'workflow' && row.from.run === run.title);
   if (ask === undefined || ask.from.who !== 'workflow') return null;
   const words = CHAT.run.asks[ask.access ?? 'other'];
-  return { kind: 'ask', id: ask.id, name: run.title, text: fill(words, { label: ask.from.label }) };
+  return { kind: 'ask', id: ask.id, name, text: fill(words, { label: ask.from.label }) };
 }
 
-/** The strip's lines; none while the host holds no live run. */
-export function runStripOf(activity: Pick<Activity, 'running' | 'needs'>): StripLine[] {
+/**
+ * The strip's lines; none while the host holds no live run. `names`: the name a run shows by its id in place of its
+ * workflow's name (`shownRunNames`: "Reading {file}" for a run of the PDF tool).
+ */
+export function runStripOf(
+  activity: Pick<Activity, 'running' | 'needs'>,
+  names: ReadonlyMap<string, string> = new Map(),
+): StripLine[] {
   const runs = activity.running.filter((row): row is RunRailRow => row.kind === 'workflow' && row.live);
   if (runs.length === 0) return [];
-  const asks = runs.map((run) => askOf(activity.needs, run)).filter((line): line is StripLine => line !== null);
+  const nameOf = (run: RunRailRow): string => names.get(run.id) ?? run.title;
+  const asks = runs
+    .map((run) => askOf(activity.needs, run, nameOf(run)))
+    .filter((line): line is StripLine => line !== null);
   if (runs.length > STRIP_RUN_LINES) {
     let agents = 0;
     for (const run of runs) agents += run.agentsRunning;
@@ -72,7 +81,7 @@ export function runStripOf(activity: Pick<Activity, 'running' | 'needs'>): Strip
     out.push({
       kind: 'run',
       id: run.id,
-      name: run.title,
+      name: nameOf(run),
       step: runStepWords(run),
       counts: countsOf(run),
       running: run.agentsRunning,
@@ -81,7 +90,7 @@ export function runStripOf(activity: Pick<Activity, 'running' | 'needs'>): Strip
       stoppable: run.stoppable,
       anchor: run.anchor,
     });
-    const ask = askOf(activity.needs, run);
+    const ask = askOf(activity.needs, run, nameOf(run));
     if (ask !== null) out.push(ask);
   }
   return out;

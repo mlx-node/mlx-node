@@ -118,7 +118,8 @@ beforeEach(() => {
 
   runtime = createDashboardRuntime({
     inProcessWorker: true,
-    chat: { tempRoots: [] },
+    chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+    agentHome: join(base, 'agent-home'),
     dbPath: ':memory:',
     tracesDir,
     modelsDir,
@@ -1584,7 +1585,8 @@ describe('dashboard api — cache trend scoping', () => {
     symlinkSync(cacheRoot, linkRoot);
     const linked = createDashboardRuntime({
       inProcessWorker: true,
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -1815,7 +1817,8 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
 
     defaulted = createDashboardRuntime({
       inProcessWorker: true,
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -2211,7 +2214,8 @@ describe('dashboard api — the RPC transport carries the error model over a por
     writeFileSync(join(rpcCacheRoot, hexBlock(2)), Buffer.alloc(200));
 
     rpcRuntime = createDashboardRuntime({
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(rpcBase, 'chat'), homeDir: join(rpcBase, 'home') },
+      agentHome: join(rpcBase, 'agent-home'),
       dbPath: ':memory:',
       tracesDir: rpcTracesDir,
       modelsDir: rpcModelsDir,

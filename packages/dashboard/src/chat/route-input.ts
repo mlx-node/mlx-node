@@ -24,6 +24,8 @@ import {
   IMAGE_MAX_BYTES,
   isBase64,
   isPdfNoteText,
+  isStageId,
+  isToolPdf,
   magicMatches,
   MESSAGE_FILES_MAX_BYTES,
   MESSAGE_IMAGES_MAX_BASE64,
@@ -32,8 +34,11 @@ import {
   PAGE_MAX_BASE64_CHARS,
   PAGE_MAX_BYTES,
   PDF_MESSAGE_PAGES,
+  PDF_TOOL_MAX_PAGES,
+  pdfIdPages,
   pdfNotes,
   safeName,
+  SESSION_ID_SIZED,
   storedPictureChars,
   wellFormed,
   utf8Bytes,
@@ -151,6 +156,12 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
     if (!isBase64(data) || base64Bytes(data) > IMAGE_MAX_BYTES || !magicMatches(mediaType, data)) throw refused;
     return { attachment: { kind: 'image', mediaType, data }, textBytes: 0 };
   }
+  if (item.kind === 'pdf' && Object.hasOwn(item, 'stage')) {
+    if (!hasExactKeys(item, ['kind', 'name', 'stage', 'pages'])) throw refused;
+    const { name, stage, pages } = item;
+    if (!checkName(name) || typeof stage !== 'string' || !isStageId(stage) || !isPageCount(pages)) throw refused;
+    return { attachment: { kind: 'pdf', name: safeName(name), stage, pages }, textBytes: 0 };
+  }
   if (item.kind === 'pdf') {
     if (!hasExactKeys(item, ['kind', 'name', 'images'])) throw refused;
     const { name, images } = item;
@@ -158,10 +169,7 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
     if (!Array.isArray(images) || images.length === 0 || images.length > PDF_MESSAGE_PAGES) throw refused;
     const pages: string[] = [];
     for (const page of images as unknown[]) {
-      if (typeof page !== 'string' || page.length < 4 || page.length > PAGE_MAX_BASE64_CHARS) throw refused;
-      if (!isBase64(page) || base64Bytes(page) > PAGE_MAX_BYTES || !magicMatches('image/jpeg', page)) throw refused;
-      // A page is stored as sent and counted as padded base64, so it must be exactly that or it outgrows its count.
-      if (page.length !== Math.ceil(base64Bytes(page) / 3) * 4) throw refused;
+      if (!isPageData(page)) throw refused;
       pages.push(page);
     }
     return { attachment: { kind: 'pdf', name: safeName(name), images: pages }, textBytes: 0 };
@@ -169,13 +177,27 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
   throw refused;
 }
 
+/** A page count of the PDF tool: a whole number from 1 to {@link PDF_TOOL_MAX_PAGES}. */
+function isPageCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= PDF_TOOL_MAX_PAGES;
+}
+
+/** One page image: JPEG of at most {@link PAGE_MAX_BYTES}, as padded base64 with no whitespace. */
+function isPageData(page: unknown): page is string {
+  if (typeof page !== 'string' || page.length < 4 || page.length > PAGE_MAX_BASE64_CHARS) return false;
+  if (!isBase64(page) || base64Bytes(page) > PAGE_MAX_BYTES || !magicMatches('image/jpeg', page)) return false;
+  // A page is stored as sent and counted as padded base64, so it must be exactly that or it outgrows its count.
+  return page.length === Math.ceil(base64Bytes(page) / 3) * 4;
+}
+
 /**
  * The attachments of a message, every limit checked: at most {@link ATTACH_MAX}; a file is well-formed text with no
  * NUL and a cleaned name, and does not start like a PDF note; a picture is PNG or JPEG base64 whose first bytes match
- * its type; a PDF is 1 to 20 JPEG pages of at most {@link PAGE_MAX_BYTES} each, as padded base64 with no whitespace.
- * In all, at most {@link PDF_MESSAGE_PAGES} pages, {@link MESSAGE_IMAGES_MAX_BASE64} of picture and page base64, and
- * the message text with the numbered file and note text under the agent's prompt cut. Empty is no attachments. Any
- * failure is `attachment-refused`.
+ * its type; a PDF is 1 to 20 JPEG pages of at most {@link PAGE_MAX_BYTES} each, as padded base64 with no whitespace,
+ * or a stage id and its page count for the PDF tool (the service checks the stage). In all, at most
+ * {@link PDF_MESSAGE_PAGES} pages, one PDF for the tool, {@link MESSAGE_IMAGES_MAX_BASE64} of picture and page base64,
+ * and the message text with the numbered file and note text under the agent's prompt cut. Empty is no attachments.
+ * Any failure is `attachment-refused`.
  */
 export function checkAttachments(value: unknown[], text: string): AttachmentInput[] | undefined {
   if (value.length === 0) return undefined;
@@ -183,15 +205,17 @@ export function checkAttachments(value: unknown[], text: string): AttachmentInpu
   if (value.length > ATTACH_MAX) throw refused;
   let bytes = utf8Bytes(text);
   let pages = 0;
+  let tool = 0;
   const out: AttachmentInput[] = [];
   for (const item of value) {
     const { attachment, textBytes } = checkAttachment(item);
     bytes += textBytes;
-    if (attachment.kind === 'pdf') pages += attachment.images.length;
+    if (isToolPdf(attachment)) tool += 1;
+    else if (attachment.kind === 'pdf') pages += attachment.images.length;
     out.push(attachment);
   }
-  for (const note of pdfNotes(out)) bytes += numberedBytes(note);
-  if (bytes > MESSAGE_FILES_MAX_BYTES || pages > PDF_MESSAGE_PAGES) throw refused;
+  for (const note of pdfNotes(out, SESSION_ID_SIZED)) bytes += numberedBytes(note);
+  if (bytes > MESSAGE_FILES_MAX_BYTES || pages > PDF_MESSAGE_PAGES || tool > 1) throw refused;
   if (storedPictureChars(out.map(attachmentView)) > MESSAGE_IMAGES_MAX_BASE64) throw refused;
   return out;
 }
@@ -294,6 +318,44 @@ export function promptInput(body: unknown): PromptInput {
     ...(record.plan === undefined ? {} : { plan: record.plan as boolean }),
     ...(whenBusy === undefined ? {} : { whenBusy }),
   };
+}
+
+export interface PdfStageInput {
+  /** Null opens a new stage with page 1. */
+  stage: string | null;
+  page: number;
+  pages: number;
+  /** The page's JPEG bytes. */
+  data: Buffer;
+}
+
+/**
+ * `POST /api/chat/pdf-stage`: exactly `{stage, page, pages, data}`; `stage` a stage id, or null with `page` 1; `page`
+ * from 1 to `pages`, `pages` at most {@link PDF_TOOL_MAX_PAGES}; `data` one page as a PDF item carries it. Any
+ * failure is `attachment-refused`.
+ */
+export function pdfStageInput(body: unknown): PdfStageInput {
+  const refused = chatRouteError('attachment-refused');
+  if (!isPlainObject(body) || !hasExactKeys(body, ['stage', 'page', 'pages', 'data'])) throw refused;
+  const { stage, page, pages, data } = body;
+  if (stage !== null && (typeof stage !== 'string' || !isStageId(stage))) throw refused;
+  if (!isPageCount(pages) || !isPageCount(page) || page > pages || (stage === null && page !== 1)) throw refused;
+  if (!isPageData(data)) throw refused;
+  return { stage, page, pages, data: Buffer.from(data, 'base64') };
+}
+
+/** `:stage` of a stage route. */
+export function stageParam(value: string | undefined): string {
+  if (value === undefined || !isStageId(value)) throw bad('Not a stage id.');
+  return value;
+}
+
+/** `POST …/:id/pdf-read`: exactly `{pdf}`, the id of a PDF the tool reads. */
+export function pdfReadInput(body: unknown): { pdf: string } {
+  const record = exactBody(body, { pdf: 'string' }, ['pdf']);
+  const pdf = record.pdf as string;
+  if (pdfIdPages(pdf) === null) throw bad('Field "pdf" is not a PDF id.');
+  return { pdf };
 }
 
 /** `POST …/queue/:qid/send`: exactly `{how: "now"}`. */

@@ -125,7 +125,10 @@ describe.skipIf(BIN === undefined)('slash commands on the real agent', () => {
       const rows = await rowsOf(real.host, sessionId);
       const builtinNames = new Set(AGENT_BUILTINS.flatMap((b) => [b.name, ...b.aliases]));
       const skillless = (list: Json[]) => list.filter((r) => (r._meta as Json | undefined)?.bareName === undefined);
-      const agentBuiltins = skillless(rows);
+      // The agent lists the app's own `read-pdf` as a user workflow; the host drops that row from the view.
+      const appRows = rows.filter((r) => r.name === 'read-pdf').map((r) => (r._meta as Json).workflowPath);
+      expect(appRows).toEqual([join(real.agentHome, 'workflows', 'read-pdf.rhai')]);
+      const agentBuiltins = skillless(rows).filter((r) => r.name !== 'read-pdf');
       expect(agentBuiltins.map((r) => r.name).filter((name) => !builtinNames.has(name as string))).toEqual([]);
 
       // 2. The fake agent plays the same rows for a Work session with the same skill.
@@ -151,7 +154,7 @@ describe.skipIf(BIN === undefined)('slash commands on the real agent', () => {
       expect(skillRow(fakeRows)).toEqual(skillRow(rows));
 
       // 3. Refused on the host before anything is sent.
-      for (const text of ['/yolo on', '/compact', '/hooks-trust', '/status', '/nope'])
+      for (const text of ['/yolo on', '/compact', '/hooks-trust', '/status', '/nope', '/read-pdf {"pdf":"p1"}'])
         expect([text, codeOf(() => real.host.startTurn(sessionId, text, load))]).toEqual([text, 'slash-text']);
 
       // 4. The push after an answer: the list the host holds is replaced by the agent's.

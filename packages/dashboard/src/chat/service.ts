@@ -41,6 +41,14 @@ import { findUserHooks } from './agent/auto.js';
 import type { EndpointReader, InferenceEndpoint } from './agent/endpoint.js';
 import { safeReader } from './agent/endpoint.js';
 import { folderKey, NeverRules, neverNote } from './agent/never-rules.js';
+import {
+  HOST_START_FAMILIES,
+  pdfToolBlocked,
+  pdfToolShadowed,
+  READ_PDF_WORKFLOW,
+  readPdfCommand,
+} from './agent/pdf-tool.js';
+import type { PdfFacts } from './agent/permissions.js';
 import { ALLOW_ONCE_OPTION_ID, chatPrompt, REJECT_ONCE_OPTION_ID } from './agent/profiles.js';
 import { tempRoots, type AllowedRoot } from './agent/roots.js';
 import { UNLOAD_MAX_MS, unloadModels } from './agent/select-model.js';
@@ -51,6 +59,9 @@ import {
   CHAT_IMAGES_MAX,
   CHAT_PICTURES_MAX_BASE64,
   imageCount,
+  isToolPdf,
+  pdfToolId,
+  type PdfStartBy,
   storedPictureChars,
 } from './attachment-rule.js';
 import { checkCommand } from './commands.js';
@@ -60,6 +71,7 @@ import { PermissionDraft } from './draft-mode.js';
 import { readWorkIndexSync, writeWorkIndex, type WorkIndex } from './index-file.js';
 import { readModelWindowsSync, writeModelWindows } from './model-windows.js';
 import { removeChatPromptHistory, type ChatPaths } from './paths.js';
+import { PdfStore, readPdfMeta, removePdf, removeSessionPdfs } from './pdf-store.js';
 import {
   changedSettings,
   markOf,
@@ -72,7 +84,7 @@ import {
 } from './permission-log.js';
 import type { ProvidersService } from './providers/service.js';
 import type { ProviderSource } from './providers/source.js';
-import { ConversationQueue, QUEUE_FULL_MESSAGE } from './queue.js';
+import { ConversationQueue, QUEUE_FULL_MESSAGE, type QueueRow } from './queue.js';
 import { needleList, redactText } from './redact.js';
 import { answerEnd, planFiles, rewindCounts, targetOf } from './rewind-target.js';
 import { chatRouteError, folderNotMadeError, routeError, workGitError } from './route-errors.js';
@@ -83,6 +95,7 @@ import {
   type InteractionAnswerInput,
   isSlashText,
   type PatchConversationInput,
+  type PdfStageInput,
   PLAN_WORK_ONLY,
   type QueuePatchInput,
   type RewindInput,
@@ -184,6 +197,10 @@ export function conversationContext(info: SessionInfoFacts | null, stored: numbe
 const QUEUE_ROW_GONE = 'No such queued message.';
 const STEER_WORK_ONLY = 'Send now is for Work conversations only.';
 const GOAL_WORK_ONLY = 'A goal is for Work conversations only.';
+const PDF_READ_WORK_ONLY = 'The PDF tool is for Work conversations only.';
+const PDF_GONE = 'No such PDF.';
+/** Ends of a turn after which the host starts a PDF read the model did not start. */
+const HOST_START_OUTCOMES: ReadonlySet<TurnOutcome> = new Set(['completed', 'output-limit', 'tool-loop']);
 const STEER_NOT_NOW = 'No answer takes it now. The message stays queued.';
 const STEER_BUSY = 'The answer takes no message at this step.';
 const STEER_LATE = 'The agent did not answer in time. The message stays queued.';
@@ -460,6 +477,18 @@ export class ChatService {
   private readonly gitChains = new Map<string, Promise<unknown>>();
   /** The work tree tops where `git switch` runs now: no Work conversation starts or sends in them. */
   private readonly switching: string[] = [];
+  /** The page files of the PDF tool while the page sends them. */
+  private readonly pdfStore: PdfStore;
+  /** Work, before its first agent start: whether no file of the person's holds a PDF tool name (read once). */
+  private pdfToolChecked: Promise<boolean> | null = null;
+  /**
+   * The host's own start of a PDF read, the newest by conversation, from the turn `turnId` that sent the PDF: the turn
+   * it started, null when it started none.
+   */
+  private readonly hostStarts = new Map<
+    string,
+    { pdf: string; turnId: string; started: Promise<{ turnId: string } | null> }
+  >();
 
   constructor(options: ChatServiceOptions) {
     this.opts = options;
@@ -468,6 +497,8 @@ export class ChatService {
     this.workSettings = readWorkSettingsSync(options.paths.workSettings);
     this.appEnds = (options.appEnds ?? Promise.resolve([])).catch(() => []);
     this.now = options.now ?? Date.now;
+    this.pdfStore = new PdfStore(options.paths.pdfStage, this.now);
+    void this.pdfStore.sweep().catch(() => {});
     this.readEndpoint = safeReader(options.readEndpoint);
     this.providers = options.providers;
     options.providers.attach({
@@ -519,7 +550,6 @@ export class ChatService {
       refused: [
         options.paths.root,
         join(home, '.mlx-node'),
-        join(homedir(), '.mlx-node'),
         workHome,
         join(home, '.mlx-agent'),
         join(home, 'Library', 'Keychains'),
@@ -559,6 +589,7 @@ export class ChatService {
         permission: { modeOf: (id) => this.modeOf(id), watched: () => this.hostSinks.size > 0 },
         never: this.never,
         sessionDir: (id) => this.workSessionDir(id),
+        pdfFacts: (sessionId, pdf) => this.pdfFacts(sessionId, pdf),
         listener: this.listenerFor('work'),
       }),
     };
@@ -644,6 +675,11 @@ export class ChatService {
       const modelId = input.modelId ?? (await this.state()).defaultModelId ?? undefined;
       if (modelId === undefined) throw chatRouteError('no-models');
       await this.checkImages(mode, modelId, input.attachments);
+      for (const item of input.attachments ?? []) {
+        if (isToolPdf(item) && !this.pdfStore.complete(item.stage, item.pages)) {
+          throw chatRouteError('attachment-refused');
+        }
+      }
       if (none) {
         cwd = await this.newScratch();
         this.hold(cwd);
@@ -808,6 +844,7 @@ export class ChatService {
     if (grant !== null) await this.applyDraft(conversation, grant);
     let turnId: string;
     try {
+      await this.placePdfs(conversation, input.attachments ?? []);
       turnId = this.startTurn(conversation, input.text, undefined, input.attachments, input.plan).turnId;
     } catch (error) {
       if (this.modeOf(session.sessionId) !== 'ask') this.lower(conversation, 'ask', 'user');
@@ -1132,11 +1169,31 @@ export class ChatService {
     if (busyFails && host.isBusy(conversation.info.id)) throw chatRouteError('conversation-busy');
     await this.endpoint();
     if (cwd !== undefined) this.assertNotSwitching(cwd);
+    await this.placePdfs(conversation, attachments);
     return cwd;
   }
 
   /**
-   * A picture goes only to a Chat conversation, a PDF to either mode, and both only when the model row takes images
+   * Moves the stage of each PDF for the tool to the conversation's page folders; a stage already moved for it stays
+   * there. A stage that is not complete, or is another conversation's, is `attachment-refused`.
+   */
+  private async placePdfs(conversation: Conversation, attachments: readonly AttachmentInput[]): Promise<void> {
+    for (const item of attachments) {
+      if (!isToolPdf(item)) continue;
+      const id = await this.pdfStore.place(
+        item.stage,
+        item.pages,
+        this.opts.paths.workPdf,
+        conversation.info.id,
+        item.name,
+      );
+      if (id === null) throw chatRouteError('attachment-refused');
+    }
+  }
+
+  /**
+   * A picture goes only to a Chat conversation, a PDF to either mode (one for the PDF tool to Work while the tool is
+   * there), and both only when the model row takes images
    * (`images`, as the host state lists it). The page blocks it first; this settles a model change that landed before
    * this check. A change still in flight is caught by the engine's 400 and the agent's retry without the images.
    */
@@ -1148,6 +1205,9 @@ export class ChatService {
     const pictures = attachments.some((a) => a.kind === 'image');
     if (!pictures && !attachments.some((a) => a.kind === 'pdf')) return;
     if (pictures && mode === 'work') throw chatRouteError('attachment-refused');
+    if (attachments.some(isToolPdf) && (mode !== 'work' || !(await this.pdfToolWork()))) {
+      throw chatRouteError('attachment-refused');
+    }
     const row = (await this.state()).models.find((m) => m.id === modelId);
     if (row?.images !== true) throw chatRouteError('attachment-refused');
   }
@@ -1166,6 +1226,131 @@ export class ChatService {
       return { stopped: true };
     }
     return this.prompt(id, `/goal ${action}`);
+  }
+
+  /**
+   * A page of a PDF for the PDF tool, sent as the page draws it. `{stage}`: the stage that holds it. A page out of
+   * order or of another count is `attachment-refused`.
+   */
+  async stagePdf(input: PdfStageInput): Promise<{ stage: string }> {
+    this.assertOpen();
+    let stage: string | null;
+    try {
+      stage = await this.pdfStore.stagePage(input.stage, input.page, input.pages, input.data);
+    } catch {
+      throw new ApiError('E_UNAVAILABLE', 'The page could not be saved.', 'pdf-save');
+    }
+    if (stage === null) throw chatRouteError('attachment-refused');
+    return { stage };
+  }
+
+  /** A PDF's chip was removed before Send: its stage goes. */
+  async dropPdfStage(stage: string): Promise<Record<string, never>> {
+    await this.pdfStore.drop(stage);
+    return {};
+  }
+
+  /**
+   * Work: Read it now. The agent starts `read-pdf` on the PDF `pdf` of a message of this conversation by its own
+   * `/workflow` command, with the message's text as the question: no model call, no permission request. 404 for a PDF
+   * no message of the conversation sent to the tool; `conversation-busy` while it works or a run of the tool is not
+   * over. Once the turn that sent the PDF ended, while the host decides its own start and while the turn of that start
+   * runs, the answer is that turn.
+   */
+  async readPdf(id: string, pdf: string): Promise<{ turnId: string }> {
+    this.assertOpen();
+    const mark = this.hostStarts.get(id);
+    if (mark?.pdf === pdf && this.hosts.work.turnState(id)?.turnId !== mark.turnId) {
+      const started = await mark.started;
+      if (started !== null && this.hosts.work.turnState(id)?.turnId === started.turnId) return started;
+    }
+    return this.startPdfRead(id, pdf, 'you');
+  }
+
+  private async startPdfRead(id: string, pdf: string, by: PdfStartBy): Promise<{ turnId: string }> {
+    const conversation = await this.known(id);
+    if (conversation.info.mode !== 'work') throw ApiError.badRequest(PDF_READ_WORK_ONLY);
+    if (!conversation.hasBase()) await this.loadBase(conversation);
+    const sent = conversation.toolPdf(pdf);
+    const facts = sent === null ? null : await this.pdfFacts(id, pdf);
+    if (sent === null || facts === null || facts.session !== id) throw ApiError.notFound(PDF_GONE);
+    if (!facts.images || !facts.tool) throw chatRouteError('attachment-refused');
+    const text = readPdfCommand(pdf, sent.text, sent.name, by);
+    await this.checkSlash(conversation, text);
+    const cwd = await this.sendChecks(conversation, [], true);
+    // Checked in the tick that starts the turn: a run that started, or a move down to Ask, during the awaits counts.
+    if (this.hosts.work.runs(id).some((r) => r.name === READ_PDF_WORKFLOW && (r.live || r.waiting))) {
+      throw chatRouteError('conversation-busy');
+    }
+    if (by === 'app' && this.modeOf(id) === 'ask') throw chatRouteError('conversation-busy');
+    // The host selects the model before the prompt goes: a move down to Ask during that wait counts too.
+    const sendable = by === 'app' ? () => this.modeOf(id) !== 'ask' : undefined;
+    return { turnId: this.startTurn(conversation, text, cwd, [], undefined, sendable).turnId };
+  }
+
+  /** {@link hostStartPdf} once the turn `turn` that sent `pdf` ends, kept in {@link hostStarts} from its start. */
+  private hostStart(
+    conversation: Conversation,
+    turn: { turnId: string; done: Promise<TurnResult> },
+    pdf: string,
+  ): void {
+    const id = conversation.info.id;
+    const started = turn.done.then((end) => this.hostStartPdf(conversation, end.outcome, pdf)).catch(() => null);
+    const mark = { pdf, turnId: turn.turnId, started };
+    this.hostStarts.set(id, mark);
+    void started.then((made) => {
+      if (made === null && this.hostStarts.get(id) === mark) this.hostStarts.delete(id);
+    });
+  }
+
+  /**
+   * Work in Auto or Bypass, a model of {@link HOST_START_FAMILIES}: the turn that sent the PDF `pdf` to the tool ended
+   * and no `read-pdf` call of the model named it, whatever its answer, so the host starts it as Read it now does, in a
+   * fork too (the PDF was sent there). Not in Ask, not after a Stop, a deny or a failed turn, and not while another turn
+   * or a run of the tool goes on (Read it now stays offered).
+   */
+  private async hostStartPdf(
+    conversation: Conversation,
+    outcome: TurnOutcome | undefined,
+    pdf: string,
+  ): Promise<{ turnId: string } | null> {
+    if (outcome === undefined || !HOST_START_OUTCOMES.has(outcome)) return null;
+    const id = conversation.info.id;
+    if (this.conversations.get(id) !== conversation) return null;
+    if (this.modeOf(id) === 'ask') return null;
+    const family = (await this.state()).models.find((m) => m.id === conversation.info.modelId)?.family;
+    if (family === null || family === undefined || !HOST_START_FAMILIES.has(family)) return null;
+    if (conversation.pdfCalled(pdf) !== false) return null;
+    return this.startPdfRead(id, pdf, 'app');
+  }
+
+  /** Work: the PDF tool is there, by the last agent start, else by the files in the agent home. */
+  private pdfToolWork(): Promise<boolean> {
+    const started = this.hosts.work.pdfTool();
+    if (started !== null) return Promise.resolve(started);
+    this.pdfToolChecked ??= pdfToolBlocked(this.workHome).then(
+      (blocked) => !blocked,
+      () => false,
+    );
+    return this.pdfToolChecked;
+  }
+
+  /**
+   * Work: the page folder `pdf` names, whether the model of conversation `sessionId` sees images, and whether the
+   * agent finds the app's PDF tool by its names there.
+   */
+  private async pdfFacts(sessionId: string, pdf: string): Promise<PdfFacts | null> {
+    const meta = await readPdfMeta(this.opts.paths.workPdf, pdf);
+    const conversation = this.conversations.get(sessionId);
+    if (meta === null || conversation === undefined) return null;
+    const modelId = conversation.info.modelId;
+    const images = (await this.state()).models.find((m) => m.id === modelId)?.images === true;
+    const cwd = conversation.info.cwd;
+    const tool =
+      cwd !== null &&
+      (await this.pdfToolWork()) &&
+      !(await pdfToolShadowed(cwd, this.workHome, this.home).catch(() => true));
+    return { id: pdf, session: meta.session, name: meta.name, pages: meta.pages, images, tool };
   }
 
   /** The user's Stop: the queue is held, so nothing runs on by itself after it. */
@@ -1231,8 +1416,10 @@ export class ChatService {
   async queueRemove(id: string, rowId: string): Promise<Record<string, never>> {
     const conversation = await this.known(id);
     const queue = this.queues.get(id);
-    if (queue === undefined || !queue.remove(rowId)) throw ApiError.notFound(QUEUE_ROW_GONE);
+    const row = queue?.row(rowId);
+    if (queue === undefined || row === undefined || !queue.remove(rowId)) throw ApiError.notFound(QUEUE_ROW_GONE);
     this.queueChanged(conversation, queue);
+    await this.dropQueuedPdfs(conversation, queue, [row]);
     return {};
   }
 
@@ -1240,9 +1427,31 @@ export class ChatService {
     const conversation = await this.known(id);
     const queue = this.queues.get(id);
     if (queue === undefined || (queue.size === 0 && queue.held === null)) return {};
+    const before = queue.stored();
     queue.clear();
     this.queueChanged(conversation, queue);
+    const left = new Set(queue.stored().map((r) => r.id));
+    const gone = before.filter((r) => !left.has(r.id));
+    await this.dropQueuedPdfs(conversation, queue, gone);
     return {};
+  }
+
+  /**
+   * The page folders of the PDFs for the tool that the removed rows `rows` carried: placed at their Send, they go with
+   * the row unless a row still queued or a message of the conversation names them.
+   */
+  private async dropQueuedPdfs(conv: Conversation, queue: ConversationQueue, rows: readonly QueueRow[]): Promise<void> {
+    const toolPdfs = (of: readonly QueueRow[]) =>
+      new Set(of.flatMap((r) => r.attachments.filter(isToolPdf).map((a) => pdfToolId(a.stage, a.pages))));
+    const ids = toolPdfs(rows);
+    if (ids.size === 0) return;
+    if (!conv.hasBase()) await this.loadBase(conv).catch(() => {});
+    if (!conv.hasBase()) return;
+    const kept = toolPdfs(queue.stored());
+    for (const pdf of ids) {
+      if (kept.has(pdf) || conv.toolPdf(pdf) !== null) continue;
+      await removePdf(this.opts.paths.workPdf, pdf, conv.info.id).catch(() => {});
+    }
   }
 
   /**
@@ -2390,6 +2599,7 @@ export class ChatService {
       await this.forgetQueue(id);
       conversation.gone('deleted');
       this.conversations.delete(id);
+      this.hostStarts.delete(id);
       this.originChanged(id, null);
       this.emitHost({ type: 'conversations-changed' });
       return {};
@@ -2461,9 +2671,11 @@ export class ChatService {
       this.logged.delete(id);
       this.settingsBase.delete(id);
       await this.permissionLog.remove(id).catch(() => {});
+      await removeSessionPdfs(this.opts.paths.workPdf, id).catch(() => {});
       await this.forgetQueue(id);
       conversation.gone('deleted');
       this.conversations.delete(id);
+      this.hostStarts.delete(id);
       this.originChanged(id, null);
       const cwd = conversation.info.cwd;
       if (cwd !== null && this.isScratchFolder(cwd) && !this.cwdInUse(cwd, id)) await this.removeScratch(cwd);
@@ -3035,6 +3247,7 @@ export class ChatService {
     cwd?: string,
     attachments: readonly AttachmentInput[] = [],
     plan?: boolean,
+    sendable?: () => boolean,
   ): { turnId: string } {
     const id = conversation.info.id;
     const host = this.hosts[conversation.info.mode];
@@ -3054,7 +3267,7 @@ export class ChatService {
           ...(conversation.info.thinking === undefined ? {} : { thinking: conversation.info.thinking }),
         },
         attachments,
-        { plan: plan === true },
+        { plan: plan === true, ...(sendable === undefined ? {} : { sendable }) },
       );
     } catch (error) {
       if (error instanceof AgentHostError) throw chatRouteError(error.code);
@@ -3070,6 +3283,10 @@ export class ChatService {
     }
     conversation.userPrompt(text, attachments.map(attachmentView));
     void started.done.catch(() => {});
+    const toolPdf = conversation.info.mode === 'work' ? attachments.find(isToolPdf) : undefined;
+    if (toolPdf !== undefined) {
+      this.hostStart(conversation, started, pdfToolId(toolPdf.stage, toolPdf.pages));
+    }
     this.updateLive();
     this.busyChanged();
     return { turnId: started.turnId };
@@ -3155,9 +3372,11 @@ export class ChatService {
           // A hook blocked the prompt: the agent stores none of it, so it leaves the thread and its text goes back to
           // the message box (not an automatic `continue`, which nobody typed).
           const blocked = result.outcome === 'hook-stopped' ? c.typedPrompt() : null;
+          // A start held back by its send gate: nobody typed it and it never went, so it leaves the thread.
+          const held = result.unsent === true && result.outcome === undefined && result.failure === undefined;
           if (result.unsent === true) c.promptUnsent();
           c.turnEnded(blocked === null || blocked.continued === true ? result : { ...result, blocked: blocked.text });
-          if (blocked !== null) c.dropTypedPrompt(hostView(this.hosts[mode], id));
+          if (blocked !== null || held) c.dropTypedPrompt(hostView(this.hosts[mode], id));
           c.info = { ...c.info, updatedAt: this.now(), hot: this.hosts[mode].isHot(id) };
           this.emitHost({ type: 'conversations-changed' });
         }
@@ -3444,7 +3663,7 @@ export class ChatService {
       tempRoot: typedTop(this.tempRoots[0]),
       tempTop: this.tempRoots[0]?.top ?? null,
       scratchRoot: this.scratch,
-      pdfTool: { chat: false, work: false },
+      pdfTool: { chat: false, work: await this.pdfToolWork() },
       appEnds,
     };
   }

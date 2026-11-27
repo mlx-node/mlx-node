@@ -55,6 +55,14 @@
   white-space: nowrap;
 }
 
+/* The shimmer's text sits in an inline block that springs to a new label's width; clipped there, it ends with an ellipsis, not a cut letter. */
+.root .label.label > span > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @keyframes live-dot-ping {
   from {
     opacity: 0.4;

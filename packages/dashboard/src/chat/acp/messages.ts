@@ -676,7 +676,7 @@ export function readTitle(update: Json): string | null {
 /**
  * One `AvailableCommand` (`{name, description, input: {hint} | null, _meta?}`); null when the name or the words are
  * not strings. A skill row's `_meta` carries `scope`, `path`, `bareName`, `qualifiedName`; a workflow row's
- * `workflowSource` (`S/session/slash_commands.rs` `available_commands`).
+ * `workflowSource` and `workflowPath` (`S/session/slash_commands.rs` `available_commands`).
  */
 function readCommandRow(value: unknown): CommandRow | null {
   if (!isRecord(value) || typeof value.name !== 'string' || typeof value.description !== 'string') return null;
@@ -687,6 +687,7 @@ function readCommandRow(value: unknown): CommandRow | null {
     description: value.description,
     hint: str(input.hint),
     workflow: typeof meta.workflowSource === 'string',
+    workflowPath: str(meta.workflowPath),
     skill: typeof meta.bareName === 'string' || typeof meta.scope === 'string',
     qualifiedName: str(meta.qualifiedName),
   };

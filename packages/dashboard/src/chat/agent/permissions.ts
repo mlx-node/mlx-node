@@ -7,9 +7,11 @@
 import { posix, win32 } from 'node:path';
 
 import type { PermissionRequest, PromptResultFacts } from '../acp/messages.js';
+import { parsePages, PDF_READER_PAGES } from '../attachment-rule.js';
 import { redactText } from '../redact.js';
 import type { ChatMode, CommandFlag, PermissionInteraction, PlanInteraction, TurnOutcome } from '../types.js';
 import { agentPath, commandFlags, landsOutside, pathFlags, type WorkPlace } from './command-flags.js';
+import { READ_PDF_WORKFLOW } from './pdf-tool.js';
 import {
   ALLOW_EDITS_SESSION_OPTION_ID,
   ALLOW_ONCE_OPTION_ID,
@@ -168,6 +170,75 @@ export function decideChatPermission(req: PermissionRequest, ctx: ChatPermission
     return { kind: 'approve', answer: selected(ALLOW_ONCE_OPTION_ID), row: 6 };
   }
   return { kind: 'approve', answer: selected(ALLOW_ONCE_OPTION_ID), row: 7 };
+}
+
+/** The args of a `workflow` call that starts the PDF tool by name, as the model sent them. */
+export interface PdfLaunch {
+  pdf: string;
+  question: string | null;
+  pages: string | null;
+}
+
+const LAUNCH_KEYS: ReadonlySet<string> = new Set(['variant', 'source', 'agent_budget', 'args', 'validate_only']);
+const LAUNCH_ARGS: ReadonlySet<string> = new Set(['pdf', 'question', 'pages']);
+
+/**
+ * A `workflow` call of the main agent that starts `read-pdf` by name: no budget, no dry run, and args with a text
+ * `pdf` and at most a text `question` and `pages`. Null for any other call: a script, a script path, another name,
+ * resume, pause, stop, a helper's request, any other key.
+ */
+export function readPdfLaunch(req: PermissionRequest): PdfLaunch | null {
+  const raw = req.rawInput;
+  if (req.tool?.name !== 'workflow' || req.requester !== null || !isPlainObject(raw)) return null;
+  if (raw.variant !== 'Workflow' || Object.keys(raw).some((key) => !LAUNCH_KEYS.has(key))) return null;
+  if ((raw.agent_budget ?? null) !== null || (raw.validate_only ?? false) !== false) return null;
+  const source = raw.source;
+  if (!isPlainObject(source) || !hasExactKeys(source, ['type', 'name'])) return null;
+  if (source.type !== 'name' || source.name !== READ_PDF_WORKFLOW) return null;
+  const args = raw.args;
+  if (!isPlainObject(args) || Object.keys(args).some((key) => !LAUNCH_ARGS.has(key))) return null;
+  const { pdf, question, pages } = args;
+  if (typeof pdf !== 'string') return null;
+  if (question !== undefined && typeof question !== 'string') return null;
+  if (pages !== undefined && typeof pages !== 'string') return null;
+  return { pdf, question: question ?? null, pages: pages ?? null };
+}
+
+/** What the host read for a launch's `pdf`: its page folder's `meta.json`, and the session model's `images`. */
+export interface PdfFacts {
+  id: string;
+  /** The session the folder's `meta.json` names. */
+  session: string;
+  name: string;
+  pages: number;
+  /** The model row of the session that asks says `images: true`. */
+  images: boolean;
+  /**
+   * The agent finds the app's `read-pdf` and `pdf-reader` by those names for that session: the tool is on and no file
+   * of its Work folder takes either name first.
+   */
+  tool: boolean;
+}
+
+/** What the Ask card says of a launch: the PDF's name, the pages it reads and its reader agents. */
+export interface PdfLaunchWords {
+  name: string;
+  pages: number;
+  readers: number;
+}
+
+/**
+ * A `read-pdf` launch the app may let run: {@link readPdfLaunch}, a `pdf` whose page folder names the session that
+ * asks, a model that sees images, the app's own tool by that name, and at least one page picked. Null for any other
+ * request.
+ */
+export function pdfLaunchRow(req: PermissionRequest, facts: PdfFacts | null): PdfLaunchWords | null {
+  const launch = readPdfLaunch(req);
+  if (launch === null || facts === null || facts.id !== launch.pdf) return null;
+  if (facts.session !== req.sessionId || !facts.images || !facts.tool) return null;
+  const pages = parsePages(launch.pages ?? `1-${facts.pages}`, facts.pages).length;
+  if (pages === 0) return null;
+  return { name: facts.name, pages, readers: Math.ceil(pages / PDF_READER_PAGES) };
 }
 
 const TITLE_MAX = 200;

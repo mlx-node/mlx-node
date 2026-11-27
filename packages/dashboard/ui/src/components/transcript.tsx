@@ -1,4 +1,4 @@
-import { BellRing, Cpu, RotateCw } from 'lucide-react';
+import { BellRing, Cpu, FileText, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactElement, type ReactNode } from 'react';
 
 import { type AgentRow as AgentRowData, agentState, runAgents, subagentRows } from '../lib/agents';
@@ -7,8 +7,9 @@ import { thoughtDuration } from '../lib/chat-turns';
 import { formatClock, formatDuration } from '../lib/format';
 import { rowWords } from '../lib/helper-words';
 import type { LinkRule } from '../lib/link-rule';
+import { hostStartWords, pdfNames, pdfRunName, pdfUnread } from '../lib/pdf-run';
 import { neverNoteWords } from '../lib/permission-text';
-import { type RunsAt, runsAt } from '../lib/run-view';
+import { type RunsAt, runsAt, startedPdfs } from '../lib/run-view';
 import { groupTurns, turnTitle, wakeTitle, type TurnGroup } from '../lib/sessions';
 import type { TranscriptEntry, TurnMetric } from '../lib/types';
 import { visibleText, workCallOf } from '../lib/work-tools';
@@ -39,6 +40,7 @@ import { CompactionMark } from './compaction-mark';
 import { RecapRow } from './history-mark';
 import { NoteRow } from './note-row';
 import { NoticeRow } from './notice-row';
+import { PdfUnreadRow } from './pdf-unread-row';
 import { PlanModeLine } from './plan-mode-line';
 import { RuleRow } from './rule-row';
 import { RunBlock } from './run-block';
@@ -173,9 +175,19 @@ interface GroupView {
   index: number;
 }
 
-function GroupTitle({ group, trailing, live }: { group: TurnGroup; trailing: boolean; live: boolean }): ReactElement {
+function GroupTitle({
+  group,
+  trailing,
+  live,
+  names,
+}: {
+  group: TurnGroup;
+  trailing: boolean;
+  live: boolean;
+  names: ReadonlyMap<string, string>;
+}): ReactElement {
   if (group.number === 0) return <span>Earlier messages</span>;
-  const summary = turnTitle(group.entries);
+  const summary = turnTitle(group.entries, names);
   return (
     <span className="flex min-w-0 items-baseline gap-2">
       <span className="inline-block min-w-[7ch] shrink-0 tabular-nums">
@@ -230,6 +242,8 @@ interface BodyProps {
   helpers: ReadonlyMap<string, readonly AgentRowData[]>;
   subagents: ReadonlyMap<string, AgentRowData>;
   places: RunsAt;
+  /** The name of each PDF the session's messages sent to the PDF tool, by its id. */
+  pdfNames: ReadonlyMap<string, string>;
   /** The session runs in an agent process now (its body says so), fresh or not. */
   sessionLive: boolean;
   sessionId: string | null;
@@ -279,6 +293,7 @@ function GroupBody(props: BodyProps): ReactElement {
           onJump={props.onJump}
           launch={facts.launch}
           workHref={props.sessionId === null ? undefined : `/chat?c=${encodeURIComponent(props.sessionId)}`}
+          pdf={facts.pdf}
         />
       </Anchor>
     );
@@ -383,6 +398,19 @@ function GroupBody(props: BodyProps): ReactElement {
           );
           break;
         }
+        const started = hostStartWords(entry.text, props.pdfNames);
+        if (started !== null) {
+          items.push(
+            <EventRow
+              key={at}
+              icon={<FileText size={14} strokeWidth={1.75} />}
+              label={started}
+              text=""
+              ts={entry.ts}
+            />,
+          );
+          break;
+        }
         items.push(
           <Message
             key={at}
@@ -403,10 +431,16 @@ function GroupBody(props: BodyProps): ReactElement {
         break;
       case 'wake': {
         const runId = entry.cause === 'workflow' ? entry.workflow?.runId : undefined;
+        const pdf = runId === undefined ? null : (places.runs.get(runId)?.pdf ?? null);
         items.push(
           runId !== undefined ? (
             <Anchor key={at} at={at}>
-              <RunEndRow entry={entry} runAt={places.runs.get(runId)?.place.at ?? null} onJump={props.onJump} />
+              <RunEndRow
+                entry={entry}
+                runAt={places.runs.get(runId)?.place.at ?? null}
+                onJump={props.onJump}
+                {...(pdf === null ? {} : { name: pdfRunName(pdf) })}
+              />
             </Anchor>
           ) : (
             <EventRow
@@ -521,6 +555,9 @@ function GroupBody(props: BodyProps): ReactElement {
     }
   }
 
+  for (const pdf of pdfUnread(group.entries, 0, open, startedPdfs(places), props.sessionId))
+    items.push(<PdfUnreadRow key={`pdf-${pdf.id}`} pdf={pdf} />);
+
   const end = group.end;
   if (end !== null && group.number > 0) {
     const elapsed = end.elapsedMs !== undefined ? ` · ${formatDuration(end.elapsedMs)}` : '';
@@ -577,6 +614,7 @@ export function TranscriptStream(props: TranscriptStreamProps): ReactElement {
   const helpers = useMemo(() => runAgents(entries), [entries]);
   const subagents = useMemo(() => subagentRows(entries), [entries]);
   const places = useMemo(() => runsAt(entries), [entries]);
+  const names = useMemo(() => pdfNames(entries), [entries]);
   const modelAt = useMemo(() => modelsAt(entries), [entries]);
   const shownText = useRef(new Map<number, string>()).current;
   return (
@@ -595,6 +633,7 @@ export function TranscriptStream(props: TranscriptStreamProps): ReactElement {
         helpers={helpers}
         subagents={subagents}
         places={places}
+        pdfNames={names}
         sessionLive={props.live}
         sessionId={props.sessionId}
         onJump={() => undefined}
@@ -614,6 +653,7 @@ export function Transcript(props: TranscriptProps): ReactElement {
   const helpers = useMemo(() => runAgents(props.entries), [props.entries]);
   const subagents = useMemo(() => subagentRows(props.entries), [props.entries]);
   const places = useMemo(() => runsAt(props.entries), [props.entries]);
+  const names = useMemo(() => pdfNames(props.entries), [props.entries]);
   const modelAt = useMemo(() => modelsAt(props.entries), [props.entries]);
   const shownText = useRef(new Map<number, string>()).current;
 
@@ -770,7 +810,7 @@ export function Transcript(props: TranscriptProps): ReactElement {
               data-turn={group.number}
             >
               <Disclosure
-                title={<GroupTitle group={group} trailing={trailing} live={live} />}
+                title={<GroupTitle group={group} trailing={trailing} live={live} names={names} />}
                 meta={<GroupMeta group={group} />}
                 open={openSet.has(index)}
                 onOpenChange={(next) => {
@@ -796,6 +836,7 @@ export function Transcript(props: TranscriptProps): ReactElement {
                   helpers={helpers}
                   subagents={subagents}
                   places={places}
+                  pdfNames={names}
                   sessionLive={props.sessionLive}
                   sessionId={props.sessionId ?? null}
                   onJump={jump}

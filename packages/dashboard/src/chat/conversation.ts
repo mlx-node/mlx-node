@@ -8,6 +8,7 @@
 import { mergeRunState, type RunState } from '../agent-sessions/run-state.js';
 import { TranscriptReducer, type UpdateLine } from '../agent-sessions/transcript.js';
 import type { TranscriptEntry, TurnMetric } from '../agent-sessions/types.js';
+import { readPdfCallId } from './agent/pdf-tool.js';
 import { shownCut } from './agent/permissions.js';
 import { heldImages, type UserAttachment } from './attachment-rule.js';
 import {
@@ -203,6 +204,31 @@ export class Conversation {
       if (entry.kind === 'user' && entry.attachments !== undefined) out.push(...entry.attachments);
     }
     return out;
+  }
+
+  /** The message that sent the PDF `id` to the PDF tool: its text and the PDF's name; null when none did. */
+  toolPdf(id: string): { text: string; name: string } | null {
+    for (const entry of this.base?.view ?? []) {
+      if (entry.kind !== 'user' || entry.attachments === undefined) continue;
+      for (const item of entry.attachments) {
+        if (item.kind === 'pdf' && item.way === 'tool' && item.id === id) return { text: entry.text, name: item.name };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Whether a `workflow` call of the model that starts `read-pdf` by name named the PDF `id` after the message that
+   * sent it, whatever the answer to the call; null when no message sent it.
+   */
+  pdfCalled(id: string): boolean | null {
+    let sent = false;
+    for (const entry of this.base?.view ?? []) {
+      if (entry.kind === 'user' && entry.attachments?.some((a) => a.kind === 'pdf' && a.id === id) === true)
+        sent = true;
+      else if (sent && entry.kind === 'tool' && readPdfCallId(entry.name, entry.input) === id) return true;
+    }
+    return sent ? false : null;
   }
 
   /** The images the current base holds ({@link heldImages}), live ones included. */

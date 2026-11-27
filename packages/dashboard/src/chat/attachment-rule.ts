@@ -57,6 +57,17 @@ export const FLASH_NEXT_FAMILY = 'qwen4_exp';
 export const FLASH_NEXT_IMAGES_MAX = 4;
 /** The first line of the note a PDF carries in the prompt; a text file that starts with it is refused. */
 export const PDF_NOTE_MARKER = 'Portato PDF note 1';
+/** Pages the PDF tool gives one reader agent. */
+export const PDF_READER_PAGES = 4;
+/**
+ * Who sent a `/workflow read-pdf` prompt, as its `by` arg: the person's Read it now, or the app itself after a turn
+ * whose model did not start the tool.
+ */
+export type PdfStartBy = 'you' | 'app';
+/** A stage id: lowercase base32 letters; its first {@link PDF_ID_LETTERS} name the page folder. */
+export const PDF_STAGE_CHARS = 26;
+export const PDF_ID_LETTERS = 8;
+const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
 
 export type ImageMediaType = 'image/png' | 'image/jpeg';
 
@@ -65,15 +76,32 @@ export type AttachmentInput =
   /** `data` is base64 with no `data:` prefix. */
   | { kind: 'image'; mediaType: ImageMediaType; data: string }
   /** The pages of a PDF, in order: base64 JPEG, no `data:` prefix. */
-  | { kind: 'pdf'; name: string; images: string[] };
+  | { kind: 'pdf'; name: string; images: string[] }
+  /** A PDF for the PDF tool: its `pages` pages are already at the host, in the stage `stage`. */
+  | { kind: 'pdf'; name: string; stage: string; pages: number };
+
+/** A PDF whose pages the PDF tool reads from files. */
+export type ToolPdfInput = Extract<AttachmentInput, { stage: string }>;
 
 export type PdfWay = 'message' | 'tool';
 
 export type UserAttachment =
   | { kind: 'file'; name: string; bytes: number }
   | { kind: 'image'; mediaType: string; bytes: number }
-  /** `bytes`, `chars`: decoded size and stored base64 of the pages the message carries (none by the tool). */
-  | { kind: 'pdf'; name: string; pages: number; way: PdfWay; bytes: number; chars: number; id?: string };
+  /**
+   * `bytes`, `chars`: decoded size and stored base64 of the pages the message carries (none by the tool). `session`:
+   * the conversation a stored tool note was sent in, which a fork's copy of the message keeps.
+   */
+  | {
+      kind: 'pdf';
+      name: string;
+      pages: number;
+      way: PdfWay;
+      bytes: number;
+      chars: number;
+      id?: string;
+      session?: string;
+    };
 
 const URI_PREFIX = 'file:///attached/';
 /** UTF-8 length of '→', the agent's separator between a line number and its line. */
@@ -293,9 +321,29 @@ function storedChars(bytes: number): number {
   return Math.ceil(bytes / 3) * 4;
 }
 
+export function isToolPdf(item: AttachmentInput): item is ToolPdfInput {
+  return item.kind === 'pdf' && 'stage' in item;
+}
+
+/** A stage id as the host makes them: {@link PDF_STAGE_CHARS} lowercase base32 letters. */
+export function isStageId(text: string): boolean {
+  if (text.length !== PDF_STAGE_CHARS) return false;
+  for (let i = 0; i < text.length; i += 1) if (!BASE32.includes(text.charAt(i))) return false;
+  return true;
+}
+
+/** The id the PDF tool reads a stage's pages by, once placed: the stage's first letters, `-`, the page count. */
+export function pdfToolId(stage: string, pages: number): string {
+  return `${stage.slice(0, PDF_ID_LETTERS)}-${pages}`;
+}
+
 export function attachmentView(input: AttachmentInput): UserAttachment {
   if (input.kind === 'file') return { kind: 'file', name: safeName(input.name), bytes: utf8Bytes(input.text) };
   if (input.kind === 'image') return { kind: 'image', mediaType: input.mediaType, bytes: base64Bytes(input.data) };
+  if (isToolPdf(input)) {
+    const id = pdfToolId(input.stage, input.pages);
+    return { kind: 'pdf', name: safeName(input.name), pages: input.pages, way: 'tool', bytes: 0, chars: 0, id };
+  }
   let bytes = 0;
   let chars = 0;
   for (const page of input.images) {
@@ -439,11 +487,14 @@ function pagesTokens(family: string | null, sizes: readonly PageSize[]): number 
 
 /**
  * What the note of a PDF says: `message`, its pages are the message's images `from` (from 1, among its image blocks)
- * on; `tool`, they are files the PDF tool reads by `id`.
+ * on; `tool`, they are files the PDF tool reads by `id`, placed for the conversation `session`.
  */
 export type PdfNote =
   | { name: string; pages: number; way: 'message'; from: number }
-  | { name: string; pages: number; way: 'tool'; id: string };
+  | { name: string; pages: number; way: 'tool'; id: string; session: string };
+
+/** As long as an agent's session id: it sizes a tool note before its conversation is known. */
+export const SESSION_ID_SIZED = '00000000-0000-0000-0000-000000000000';
 
 /** The note a PDF carries in the prompt: `key: value` lines the model reads, then one sentence. */
 export function pdfNote(note: PdfNote): string {
@@ -453,6 +504,7 @@ export function pdfNote(note: PdfNote): string {
     return [
       ...head,
       `id: ${note.id}`,
+      `session: ${note.session}`,
       `The pages are image files on disk, not in this message. To read them, call the workflow tool with name read-pdf and args ${args}. Add "pages": "40-60" to read only some pages.`,
     ].join('\n');
   }
@@ -497,14 +549,18 @@ function countOf(text: string | null): number | null {
   return n;
 }
 
-/** A tool id: 8 lowercase letters or digits, `-`, the page count. */
-function isPdfId(id: string, pages: number): boolean {
-  if (id.length < 10 || id.charCodeAt(8) !== 0x2d) return false;
-  for (let i = 0; i < 8; i += 1) {
+/**
+ * The page count a PDF tool id holds: 8 lowercase letters or digits, `-`, then the count, 1 to
+ * {@link PDF_TOOL_MAX_PAGES}; null for anything else.
+ */
+export function pdfIdPages(id: string): number | null {
+  if (id.length < PDF_ID_LETTERS + 2 || id.charCodeAt(PDF_ID_LETTERS) !== 0x2d) return null;
+  for (let i = 0; i < PDF_ID_LETTERS; i += 1) {
     const code = id.charCodeAt(i);
-    if (!((code >= 0x61 && code <= 0x7a) || (code >= 0x30 && code <= 0x39))) return false;
+    if (!((code >= 0x61 && code <= 0x7a) || (code >= 0x30 && code <= 0x39))) return null;
   }
-  return countOf(id.slice(9)) === pages;
+  const pages = countOf(id.slice(PDF_ID_LETTERS + 1));
+  return pages === null || pages > PDF_TOOL_MAX_PAGES ? null : pages;
 }
 
 /** The note `text` is, read line by line; null when it is not one the app writes. */
@@ -517,8 +573,9 @@ export function readPdfNote(text: string): PdfNote | null {
   if (name === null || name === '' || safeName(name) !== name || pages === null) return null;
   if (way === 'tool') {
     const id = fieldOf(lineAt(lines, 4), 'id');
-    if (id === null || pages > PDF_TOOL_MAX_PAGES || !isPdfId(id, pages)) return null;
-    return { name, pages, way, id };
+    const session = fieldOf(lineAt(lines, 5), 'session');
+    if (id === null || pdfIdPages(id) !== pages || session === null || session === '') return null;
+    return { name, pages, way, id, session };
   }
   if (way !== 'message' || pages > PDF_MESSAGE_PAGES) return null;
   const range = fieldOf(lineAt(lines, 4), 'images');
@@ -530,17 +587,57 @@ export function readPdfNote(text: string): PdfNote | null {
   return { name, pages, way, from };
 }
 
-/** The note of each PDF among `attachments`, in order: the pictures come first among the image blocks, then the pages. */
-export function pdfNotes(attachments: readonly AttachmentInput[]): string[] {
+/**
+ * The note of each PDF among `attachments`, in order: the pictures come first among the image blocks, then the pages
+ * of the PDFs the message carries. A PDF for the tool names its id and the conversation `session` it is sent in.
+ */
+export function pdfNotes(attachments: readonly AttachmentInput[], session: string): string[] {
   let from = 1;
   for (const item of attachments) if (item.kind === 'image') from += 1;
   const notes: string[] = [];
   for (const item of attachments) {
     if (item.kind !== 'pdf') continue;
+    if (isToolPdf(item)) {
+      const id = pdfToolId(item.stage, item.pages);
+      notes.push(pdfNote({ name: item.name, pages: item.pages, way: 'tool', id, session }));
+      continue;
+    }
     notes.push(pdfNote({ name: item.name, pages: item.images.length, way: 'message', from }));
     from += item.images.length;
   }
   return notes;
+}
+
+function isDigits(text: string): boolean {
+  if (text === '' || text.length > 6) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x30 || code > 0x39) return false;
+  }
+  return true;
+}
+
+/**
+ * The pages a `pages` arg of the PDF tool picks, as its script reads it: parts split at `,`, each a page or `a-b` (in
+ * either order), cut to 1..`total`; a part that is not one is skipped. In order, each page once.
+ */
+export function parsePages(text: string, total: number): number[] {
+  const marks: boolean[] = Array.from({ length: total + 1 }, () => false);
+  for (const raw of text.split(',')) {
+    const part = raw.trim();
+    if (part === '') continue;
+    const dash = part.indexOf('-');
+    const first = dash === -1 ? part : part.slice(0, dash).trim();
+    const second = dash === -1 ? part : part.slice(dash + 1).trim();
+    if (!isDigits(first) || !isDigits(second)) continue;
+    let a = Number(first);
+    let b = Number(second);
+    if (a > b) [a, b] = [b, a];
+    for (let page = Math.max(a, 1); page <= Math.min(b, total); page += 1) marks[page] = true;
+  }
+  const out: number[] = [];
+  for (let page = 1; page < marks.length; page += 1) if (marks[page]) out.push(page);
+  return out;
 }
 
 /**
@@ -570,6 +667,13 @@ export function estimateTokens(text: string, attachments: readonly TokenItem[], 
   let pages = 0;
   for (const item of attachments) {
     if (item.kind !== 'pdf') continue;
+    if ('stage' in item) {
+      const id = pdfToolId(item.stage, item.pages);
+      bytes += numberedBytes(
+        pdfNote({ name: item.name, pages: item.pages, way: 'tool', id, session: SESSION_ID_SIZED }),
+      );
+      continue;
+    }
     const count = item.images.length;
     bytes += numberedBytes(pdfNote({ name: item.name, pages: count, way: 'message', from }));
     from += count;
@@ -665,7 +769,8 @@ export function planPdfs(input: PdfPlanInput): PdfPlan {
       ways.push('tool');
       tools += 1;
       readTokens += tokens;
-      bytes += numberedBytes(pdfNote({ name: pdf.name, pages: count, way: 'tool', id: `xxxxxxxx-${count}` }));
+      const id = `xxxxxxxx-${count}`;
+      bytes += numberedBytes(pdfNote({ name: pdf.name, pages: count, way: 'tool', id, session: SESSION_ID_SIZED }));
     }
   }
   const problem = misses > 0 ? 'room' : tools > 1 ? 'one' : null;

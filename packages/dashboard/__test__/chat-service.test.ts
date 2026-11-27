@@ -23,17 +23,26 @@ import { basename, dirname, join } from 'node:path';
 
 import { describe, expect, it, onTestFinished } from 'vite-plus/test';
 
+import { AgentSessionsReader } from '../src/agent-sessions/reader.js';
 import { ApiError } from '../src/api/errors.js';
 import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
+import { readPdfCommand, readPdfScript } from '../src/chat/agent/pdf-tool.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
+import { attachmentView, type AttachmentInput, pdfToolId, readPdfNote } from '../src/chat/attachment-rule.js';
 import { readWorkIndexSync } from '../src/chat/index-file.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
 import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
 import { routeError } from '../src/chat/route-errors.js';
 import type { ChatService } from '../src/chat/service.js';
-import type { ChatHostEvent, ChatHostState, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
+import type {
+  ChatHostEvent,
+  ChatHostState,
+  ConversationEvent,
+  CwdProblem,
+  Interaction,
+  PermissionMode,
+} from '../src/chat/types.js';
 import { CWD_PROBLEM_MESSAGES } from '../src/chat/work-folder.js';
 import { readScratchRecordsSync, stampName } from '../src/chat/work-scratch.js';
 import type { RuntimeLive } from '../src/live.js';
@@ -1147,6 +1156,371 @@ describe('Chat service — attachments', () => {
     );
   }, 20_000);
 
+  describe('a PDF for the tool', () => {
+    const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]);
+    /** Stages `pages` pages through the route's method, as the page sends them. */
+    async function staged(svc: ChatService, pages: number): Promise<string> {
+      const { stage } = await svc.stagePdf({ stage: null, page: 1, pages, data: JPEG });
+      for (let page = 2; page <= pages; page++) await svc.stagePdf({ stage, page, pages, data: JPEG });
+      return stage;
+    }
+    const tool = (stage: string, pages: number): AttachmentInput => ({ kind: 'pdf', name: 'report.pdf', stage, pages });
+    const prompts = (fake: FakeService) =>
+      fake
+        .sent()
+        .filter((m) => m.method === 'session/prompt')
+        .map((m) => m.params as Json);
+
+    // Mutations: the stage not placed on Send; Read it now not the agent's own command; Read it now with a reader of the
+    // Work folder's that takes the tool's name; the page folders kept on delete → red.
+    it('Work: Send moves the stage to the page folder of its id, the note names the id; Read it now starts read-pdf', async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          expect((await svc.state()).pdfTool).toEqual({ chat: false, work: true });
+          const stage = await staged(svc, 3);
+          const item = tool(stage, 3);
+          const id = pdfToolId(stage, 3);
+          const { conversation } = await svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [item] });
+          const page = new Page(svc, conversation.id);
+          // The first turn can end before the page is attached: its sync then shows no turn.
+          const done = () => {
+            const first = page.events[0];
+            return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0);
+          };
+          await until(() => page.events.length > 0 && done() === 1, 5_000);
+          expect(prompts(fake)[0]).toEqual(promptParams(conversation.id, 'read', [item], { mode: 'agent' }));
+          const folder = join(fake.paths.workPdf, id);
+          expect(readdirSync(folder).sort()).toEqual(['meta.json', 'page-001.jpg', 'page-002.jpg', 'page-003.jpg']);
+          expect(JSON.parse(readFileSync(join(folder, 'meta.json'), 'utf8'))).toMatchObject({
+            session: conversation.id,
+            name: 'report.pdf',
+            pages: 3,
+          });
+          expect(existsSync(join(fake.paths.pdfStage, stage))).toBe(false);
+          expect(readFileSync(join(fake.root, 'agent-home', 'workflows', 'read-pdf.rhai'), 'utf8')).toBe(
+            readPdfScript(fake.paths.workPdf),
+          );
+          await svc.prompt(conversation.id, 'and again', [item]);
+          await until(() => done() === 2, 5_000);
+          expect(prompts(fake)[1]).toEqual(promptParams(conversation.id, 'and again', [item], { mode: 'agent' }));
+          const own = join(project, '.mlx-agent', 'agents', 'pdf-reader.md');
+          mkdirSync(join(own, '..'), { recursive: true });
+          writeFileSync(own, '---\nname: pdf-reader\n---\nmine\n');
+          expect(refusedAs(await apiError(svc.readPdf(conversation.id, id)))).toEqual(REFUSED);
+          rmSync(join(project, '.mlx-agent'), { recursive: true });
+          await svc.readPdf(conversation.id, id);
+          await until(() => done() === 3, 5_000);
+          const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
+          expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf', 'you') });
+          const work = new AgentSessionsReader({ agentHome: join(fake.root, 'agent-home') });
+          const stored = work.detail(conversation.id)!.transcript;
+          const command = stored.findIndex((e) => e.kind === 'user' && e.text.startsWith('/workflow read-pdf '));
+          expect(stored.slice(command + 1).find((e) => e.kind === 'user' || e.kind === 'turn-end')?.kind).toBe(
+            'turn-end',
+          );
+          const gone = await apiError(svc.readPdf(conversation.id, pdfToolId('b'.repeat(26), 3)));
+          expect([gone.code, gone.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
+          page.detach();
+          await svc.delete(conversation.id);
+          expect(existsSync(folder)).toBe(false);
+        },
+        { endpointModels: [SEES], mutate: scripted },
+      );
+    }, 30_000);
+
+    // Mutations: a removed row's page folder kept, on Remove or on Clear; a folder removed that a sent message names,
+    // or that a row still queued carries → red.
+    it('Work: a queued row that is removed or cleared takes its page folder, unless a message or a row names it', async () => {
+      let gate = '';
+      const hold = (scenario: Json) => {
+        gate = join(String(scenario.recordTo), '..', 'gate');
+        const end = [{ text: 'Done.', chunk: 5 }, { end: { stopReason: 'end_turn' } }];
+        scenario.prompts = [{ match: 'hold', steps: [{ holdOn: gate }, ...end] }, ...(scenario.prompts as Json[])];
+      };
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          const folder = (stage: string, pages: number) => join(fake.paths.workPdf, pdfToolId(stage, pages));
+          const sent = await staged(svc, 2);
+          const created = await svc.create({ mode: 'work', text: 'hold', cwd: project, attachments: [tool(sent, 2)] });
+          const id = created.conversation.id;
+          const page = new Page(svc, id);
+          await until(() => prompts(fake).length === 1, 5_000);
+          const queued = async (stage: string, pages: number): Promise<string> => {
+            const reply = await svc.prompt(id, 'later', [tool(stage, pages)], undefined, 'queue');
+            if (!('queued' in reply)) throw new Error('not queued');
+            return reply.queued;
+          };
+          const [a, b, twice] = [await staged(svc, 3), await staged(svc, 2), await staged(svc, 4)];
+          const rowA = await queued(a, 3);
+          await queued(b, 2);
+          const rowSent = await queued(sent, 2);
+          const rowTwice = await queued(twice, 4);
+          await queued(twice, 4);
+          const on = () =>
+            [folder(sent, 2), folder(a, 3), folder(b, 2), folder(twice, 4)].map((path) => existsSync(path));
+          expect(on()).toEqual([true, true, true, true]);
+          await svc.queueRemove(id, rowA);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueRemove(id, rowSent);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueRemove(id, rowTwice);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueClear(id);
+          expect(on()).toEqual([true, false, false, false]);
+          writeFileSync(gate, '');
+          await until(() => page.ends().length === 1, 5_000);
+          page.detach();
+          await svc.delete(id);
+          expect(on()).toEqual([false, false, false, false]);
+        },
+        { endpointModels: [SEES], mutate: hold },
+      );
+    }, 20_000);
+
+    it('is refused in Chat, with a stage that is not complete, and on a model that does not see images', async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          const half = (await svc.stagePdf({ stage: null, page: 1, pages: 3, data: JPEG })).stage;
+          const refusedWith = async (input: Parameters<ChatService['create']>[0]) =>
+            refusedAs(await apiError(svc.create(input)));
+          expect(await refusedWith({ mode: 'work', text: 'read', cwd: project, attachments: [tool(half, 3)] })).toEqual(
+            REFUSED,
+          );
+          const whole = await staged(svc, 2);
+          expect(
+            await refusedWith({
+              mode: 'work',
+              text: 'read',
+              cwd: project,
+              modelId: BLIND.name,
+              attachments: [tool(whole, 2)],
+            }),
+          ).toEqual(REFUSED);
+          expect(await refusedWith({ mode: 'chat', text: 'read', attachments: [tool(whole, 2)] })).toEqual(REFUSED);
+          expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+          const late = await apiError(svc.stagePdf({ stage: half, page: 3, pages: 3, data: JPEG }));
+          expect(refusedAs(late)).toEqual(REFUSED);
+          expect(await svc.dropPdfStage(half)).toEqual({});
+          expect(existsSync(join(fake.paths.pdfStage, half))).toBe(false);
+        },
+        { endpointModels: [SEES, BLIND] },
+      );
+    }, 20_000);
+
+    // Mutation: the tool reported on while a file of the person's holds its name → red.
+    // Mutations: the host start left out; the family check dropped; a start in Ask; a start after a move down to Ask
+    // during its checks, or while the host selects the model; that held start left in the thread; no start for a PDF
+    // sent inside a fork; Read it now in a fork on a PDF copied from the original (the session check dropped); a tool
+    // note that does not name the conversation it is sent in; a start after the model's call of the PDF, after any
+    // call of the tool, or after a deny; the start sent as the person's; Read it now while a run of the tool goes on;
+    // Read it now during the host's start not answered with its turn → red.
+    it('Work Auto and Bypass: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
+      const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
+      const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
+      await withWork(
+        'chat-harness',
+        async (fake, project) => {
+          const svc = fake.service;
+          const texts = (session: string): string[] =>
+            prompts(fake)
+              .filter((p) => p.sessionId === session)
+              .map((p) => (p.prompt as Array<{ text?: string }>)[0]!.text ?? '');
+          const ended = (page: Page) => () => {
+            const first = page.events[0];
+            return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0) > 0;
+          };
+          let drafts = 0;
+          /** Sends `text` with a 3-page tool PDF on `model` in `mode`; its page, and its first turn's end as the page saw it. */
+          const send = async (text: string, model: string, mode: PermissionMode) => {
+            const stage = await staged(svc, 3);
+            const draft = `d${++drafts}`;
+            if (mode !== 'ask') await svc.setDraftPermissionMode(draft, mode, true, project, null);
+            const { conversation, turnId } = await svc.create({
+              mode: 'work',
+              text,
+              cwd: project,
+              modelId: model,
+              attachments: [tool(stage, 3)],
+              draft,
+            });
+            expect(conversation.permissionMode).toBe(mode);
+            const page = new Page(svc, conversation.id);
+            return { id: conversation.id, pdf: pdfToolId(stage, 3), turnId, page, ended: ended(page) };
+          };
+          const settle = () => new Promise((resolve) => setTimeout(resolve, 500));
+          const answered = async (p: Awaited<ReturnType<typeof send>>, optionId: string) => {
+            await until(() => interactionsOf(p.page).length === 1, 10_000);
+            await svc.answer(p.id, interactionsOf(p.page)[0]!.id, { optionId });
+            await until(p.ended, 10_000);
+            await settle();
+          };
+          const quiet = async (p: Awaited<ReturnType<typeof send>>) => {
+            await until(p.ended, 10_000);
+            await settle();
+            expect(interactionsOf(p.page)).toEqual([]);
+          };
+
+          const skipped = await send('pdfnot', GEMMA.name, 'bypass');
+          let pressed: Promise<{ turnId: string }> | null = null;
+          let hostTurn: string | null = null;
+          const stopWatch = svc.watchConversation(skipped.id, (event) => {
+            if (pressed !== null || event.type !== 'turn' || event.turn === null) return;
+            if (event.turn.turnId === skipped.turnId) return;
+            hostTurn = event.turn.turnId;
+            pressed = svc.readPdf(skipped.id, skipped.pdf);
+          });
+          await until(() => texts(skipped.id).length === 2, 10_000);
+          expect(texts(skipped.id)).toEqual(['pdfnot', readPdfCommand(skipped.pdf, 'pdfnot', 'report.pdf', 'app')]);
+          await until(() => pressed !== null, 5_000);
+          expect(await pressed!).toEqual({ turnId: hostTurn });
+          stopWatch();
+
+          const auto = await send('pdfnot', GEMMA.name, 'auto');
+          await until(() => texts(auto.id).length === 2, 10_000);
+          expect(texts(auto.id)).toEqual(['pdfnot', readPdfCommand(auto.pdf, 'pdfnot', 'report.pdf', 'app')]);
+
+          const facts = svc as unknown as { pdfFacts: (sessionId: string, pdf: string) => Promise<unknown> };
+          const realFacts = facts.pdfFacts.bind(svc);
+          let watched: { id: string; pdf: string } | null = null;
+          let lowered = false;
+          facts.pdfFacts = async (sessionId, pdf) => {
+            if (!lowered && watched?.id === sessionId && watched.pdf === pdf) {
+              lowered = true;
+              expect(await svc.setPermissionMode(sessionId, 'ask', false)).toEqual({ mode: 'ask' });
+            }
+            return realFacts(sessionId, pdf);
+          };
+          const movedDown = await send('pdfnot', GEMMA.name, 'bypass');
+          watched = movedDown;
+          await quiet(movedDown);
+          facts.pdfFacts = realFacts;
+          expect(lowered).toBe(true);
+          expect(texts(movedDown.id)).toEqual(['pdfnot']);
+          await svc.readPdf(movedDown.id, movedDown.pdf);
+          await until(() => texts(movedDown.id).length === 2, 10_000);
+          expect(texts(movedDown.id)).toEqual(['pdfnot', readPdfCommand(movedDown.pdf, 'pdfnot', 'report.pdf', 'you')]);
+
+          type Select = (
+            running: unknown,
+            session: { id: string },
+            turn: { turnId: string },
+            endpoint: unknown,
+          ) => Promise<unknown>;
+          const host = (svc as unknown as { hosts: { work: { selectFor: Select } } }).hosts.work;
+          const realSelect = host.selectFor.bind(host);
+          let selecting: { id: string; turnId: string } | null = null;
+          let loweredOnSelect = false;
+          host.selectFor = async (running, session, turn, endpoint) => {
+            if (!loweredOnSelect && session.id === selecting?.id && turn.turnId !== selecting.turnId) {
+              loweredOnSelect = true;
+              expect(await svc.setPermissionMode(session.id, 'ask', false)).toEqual({ mode: 'ask' });
+            }
+            return realSelect(running, session, turn, endpoint);
+          };
+          const lateMove = await send('pdfnot', GEMMA.name, 'bypass');
+          selecting = { id: lateMove.id, turnId: lateMove.turnId };
+          await until(() => loweredOnSelect, 10_000);
+          await settle();
+          host.selectFor = realSelect;
+          expect(texts(lateMove.id)).toEqual(['pdfnot']);
+          expect(interactionsOf(lateMove.page)).toEqual([]);
+          expect(lateMove.page.texts('user')).toEqual(['pdfnot']);
+          await svc.readPdf(lateMove.id, lateMove.pdf);
+          await until(() => texts(lateMove.id).length === 2, 10_000);
+          expect(texts(lateMove.id)).toEqual(['pdfnot', readPdfCommand(lateMove.pdf, 'pdfnot', 'report.pdf', 'you')]);
+
+          const asked = await send('pdfnot', GEMMA.name, 'ask');
+          await quiet(asked);
+          expect(texts(asked.id)).toEqual(['pdfnot']);
+
+          const forked = (await svc.fork(asked.id)).id;
+          expect(await svc.setPermissionMode(forked, 'bypass', true)).toEqual({ mode: 'bypass' });
+          const forkPage = new Page(svc, forked);
+          const copied = await apiError(svc.readPdf(forked, asked.pdf));
+          expect([copied.code, copied.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
+          const stage = await staged(svc, 3);
+          await svc.prompt(forked, 'pdfnot', [tool(stage, 3)]);
+          const noteOf = (session: string) =>
+            prompts(fake)
+              .filter((p) => p.sessionId === session)
+              .flatMap((p) => p.prompt as Array<{ type: string; resource?: { text?: string } }>)
+              .find((block) => block.type === 'resource')?.resource?.text ?? '';
+          await until(() => texts(forked).length === 2, 10_000);
+          expect(readPdfNote(noteOf(forked))).toMatchObject({ id: pdfToolId(stage, 3), session: forked });
+          expect(readPdfNote(noteOf(asked.id))).toMatchObject({ id: asked.pdf, session: asked.id });
+          expect(texts(forked)).toEqual(['pdfnot', readPdfCommand(pdfToolId(stage, 3), 'pdfnot', 'report.pdf', 'app')]);
+          forkPage.detach();
+
+          const other = await send('pdfnot', INKLING.name, 'bypass');
+          await quiet(other);
+          expect(texts(other.id)).toEqual(['pdfnot']);
+
+          const own = await send('pdftool', GEMMA.name, 'bypass');
+          await quiet(own);
+          expect(texts(own.id)).toEqual(['pdftool']);
+          const busy = await apiError(svc.readPdf(own.id, own.pdf));
+          expect(busy.code).toBe('E_CONFLICT');
+          expect(texts(own.id)).toEqual(['pdftool']);
+
+          const called = await send('pdfcall', GEMMA.name, 'bypass');
+          await quiet(called);
+          expect(texts(called.id)).toEqual(['pdfcall']);
+
+          const wrong = await send('pdfwrong', GEMMA.name, 'auto');
+          await answered(wrong, 'allow-once');
+          expect(texts(wrong.id)).toEqual(['pdfwrong', readPdfCommand(wrong.pdf, 'pdfwrong', 'report.pdf', 'app')]);
+
+          const wrongDenied = await send('pdfwrong', GEMMA.name, 'auto');
+          await answered(wrongDenied, 'reject-once');
+          expect(wrongDenied.page.ends()[0]).toMatchObject({ outcome: 'denied' });
+          expect(texts(wrongDenied.id)).toEqual(['pdfwrong']);
+          for (const p of [skipped, auto, movedDown, lateMove, asked, other, own, called, wrong, wrongDenied])
+            p.page.detach();
+        },
+        { endpointModels: [GEMMA, INKLING] },
+      );
+    }, 90_000);
+
+    // Mutation: Read it now with the tool off once the person's file took its name → red.
+    it("Work: a file of the person's named like the tool's turns it off, before any agent start", async () => {
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const first = fake.service;
+          const stage = await staged(first, 2);
+          const sent = await first.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(stage, 2)] });
+          const page = new Page(first, sent.conversation.id);
+          await until(() => {
+            const head = page.events[0];
+            return page.ends().length > 0 || (head?.type === 'sync' && head.turn === null);
+          }, 5_000);
+          page.detach();
+          await first.close();
+          const agents = join(fake.root, 'agent-home', 'agents');
+          mkdirSync(agents, { recursive: true });
+          writeFileSync(join(agents, 'pdf-reader.md'), '---\nname: pdf-reader\n---\nmine\n');
+          const svc = fake.restart();
+          expect((await svc.state()).pdfTool).toEqual({ chat: false, work: false });
+          const off = await apiError(svc.readPdf(sent.conversation.id, pdfToolId(stage, 2)));
+          expect(refusedAs(off)).toEqual(REFUSED);
+          const again = await staged(svc, 2);
+          const refused = await apiError(
+            svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(again, 2)] }),
+          );
+          expect(refusedAs(refused)).toEqual(REFUSED);
+          expect(fake.sent().filter((m) => m.method === 'session/new')).toHaveLength(1);
+        },
+        { endpointModels: [SEES], mutate: scripted },
+      );
+    });
+  });
+
   const FULL = [
     'E_CONFLICT',
     'pictures-full',
@@ -1486,6 +1860,25 @@ describe('Chat service — Work', () => {
       }
       expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
     });
+  });
+
+  it("a service given its own home takes no folder rule from the user's home", async () => {
+    const user = mkdtempSync(join(tmpdir(), 'chat-user-home-'));
+    const folder = join(user, 'work');
+    mkdirSync(folder);
+    symlinkSync(folder, join(user, '.mlx-node'));
+    const before = process.env.HOME;
+    process.env.HOME = user;
+    try {
+      await withWork('work-always', async (fake) => {
+        process.env.HOME = before;
+        const { conversation } = await fake.service.create({ mode: 'work', text: 'list', cwd: folder });
+        expect(conversation.cwd).toBe(realpathSync(folder));
+      });
+    } finally {
+      process.env.HOME = before;
+      rmSync(user, { recursive: true, force: true });
+    }
   });
 
   it('creates in the resolved folder, writes the index, and answers a card through the service', async () => {

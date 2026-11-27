@@ -6,7 +6,9 @@ import {
   CHAT_PERMISSIONS_PER_TURN_MAX,
   decideChatPermission,
   planAnswer,
+  pdfLaunchRow,
   planInteraction,
+  readPdfLaunch,
   readPlanRequest,
   showableWhole,
   turnOutcome,
@@ -616,5 +618,88 @@ describe('Work plans', () => {
     expect(planAnswer('rejected')).toEqual({ outcome: 'cancelled' });
     expect(planAnswer('rejected', ' ')).toEqual({ outcome: 'cancelled' });
     expect(planAnswer('rejected', 'Smaller.')).toEqual({ outcome: 'cancelled', feedback: 'Smaller.' });
+  });
+});
+
+describe('Work: a launch of the PDF tool', () => {
+  const ONCE = [
+    { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+    { optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+  ];
+  const ARGS = { pdf: 'k3f7a2c4-40', question: 'What are the findings?' };
+  /** The request the agent raised for the model's call, as measured on agent 0.3.6. */
+  function launch(over: Record<string, unknown> = {}, meta: Record<string, unknown> = {}): PermissionRequest {
+    return readPermissionRequest({
+      sessionId: 's',
+      toolCall: {
+        toolCallId: 'toolu_wf',
+        kind: 'other',
+        title: 'Workflow: read-pdf',
+        rawInput: {
+          variant: 'Workflow',
+          source: { type: 'name', name: 'read-pdf' },
+          agent_budget: null,
+          args: ARGS,
+          validate_only: false,
+          ...over,
+        },
+        _meta: { 'x.ai/tool': { name: 'workflow', read_only: false } },
+      },
+      options: ONCE,
+      ...(Object.keys(meta).length === 0 ? {} : { _meta: meta }),
+    })!;
+  }
+  const FACTS = { id: 'k3f7a2c4-40', session: 's', name: 'report.pdf', pages: 40, images: true, tool: true };
+
+  // Mutation: the row by the tool's name alone → red.
+  it('is read only from a call by name with the args the script takes, and nothing else', () => {
+    expect(readPdfLaunch(launch())).toEqual({ pdf: 'k3f7a2c4-40', question: 'What are the findings?', pages: null });
+    expect(readPdfLaunch(launch({ args: { pdf: 'k3f7a2c4-40' } }))).toEqual({
+      pdf: 'k3f7a2c4-40',
+      question: null,
+      pages: null,
+    });
+    expect(readPdfLaunch(launch({ args: { ...ARGS, pages: '1-4' } }))?.pages).toBe('1-4');
+    expect(readPdfLaunch(launch({ agent_budget: undefined, validate_only: undefined }))).not.toBeNull();
+    const refused: Array<[string, PermissionRequest]> = [
+      ['a script', launch({ source: { type: 'script', script: 'complete("x")' } })],
+      ['a script path', launch({ source: { type: 'path', path: '/tmp/read-pdf.rhai' } })],
+      ['another name', launch({ source: { type: 'name', name: 'deep-research' } })],
+      ['a resume', launch({ source: { type: 'resume', resume_from_run_id: 'wf_1' } })],
+      ['a source key more', launch({ source: { type: 'name', name: 'read-pdf', path: '/x' } })],
+      ['a budget', launch({ agent_budget: 400 })],
+      ['a dry run', launch({ validate_only: true })],
+      ['an arg more', launch({ args: { ...ARGS, effort: 'high' } })],
+      ['a pdf that is not text', launch({ args: { pdf: 40 } })],
+      ['a question that is not text', launch({ args: { pdf: 'k3f7a2c4-40', question: ['x'] } })],
+      ['pages that are not text', launch({ args: { pdf: 'k3f7a2c4-40', pages: 4 } })],
+      ['no args', launch({ args: undefined })],
+      ['a key more', launch({ effort: 'high' })],
+      ['another variant', launch({ variant: 'Task' })],
+    ];
+    for (const [label, req] of refused) expect([label, readPdfLaunch(req)]).toEqual([label, null]);
+    const helper = launch(
+      {},
+      { 'x.ai/requester': { label: 'pages 1-4', sessionId: 'child-1', runId: 'wf_1', cwd: '/w' } },
+    );
+    expect(helper.requester).not.toBeNull();
+    expect(readPdfLaunch(helper)).toBeNull();
+    expect(readPdfLaunch(bash('/workflow read-pdf {}'))).toBeNull();
+  });
+
+  it("may run only on a PDF of this session, on a model that sees images, with the app's tool, a page picked", () => {
+    expect(pdfLaunchRow(launch(), FACTS)).toEqual({ name: 'report.pdf', pages: 40, readers: 10 });
+    expect(pdfLaunchRow(launch({ args: { ...ARGS, pages: '1-12, 15' } }), FACTS)).toEqual({
+      name: 'report.pdf',
+      pages: 13,
+      readers: 4,
+    });
+    expect(pdfLaunchRow(launch(), null)).toBeNull();
+    expect(pdfLaunchRow(launch(), { ...FACTS, session: 'other' })).toBeNull();
+    expect(pdfLaunchRow(launch(), { ...FACTS, id: 'k3f7a2c4-41' })).toBeNull();
+    expect(pdfLaunchRow(launch(), { ...FACTS, images: false })).toBeNull();
+    expect(pdfLaunchRow(launch(), { ...FACTS, tool: false })).toBeNull();
+    expect(pdfLaunchRow(launch({ args: { ...ARGS, pages: '41-50' } }), FACTS)).toBeNull();
+    expect(pdfLaunchRow(launch({ agent_budget: 9 }), FACTS)).toBeNull();
   });
 });

@@ -75,7 +75,8 @@ beforeEach(() => {
 
   order = [];
   runtime = createDashboardRuntime({
-    chat: { tempRoots: [] },
+    chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+    agentHome: join(base, 'agent-home'),
     dbPath: ':memory:',
     tracesDir,
     modelsDir,
@@ -160,7 +161,8 @@ describe('dashboard runtime — coding agents sandbox', () => {
   it('looks up instruction files under the home it was given, never the real one', async () => {
     const home = join(base, 'home');
     const sandboxed = createDashboardRuntime({
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -203,7 +205,13 @@ describe('dashboard runtime — thread split', () => {
 
   it('answers a transport-thread route before the worker has even booted', async () => {
     // A cancel click during startup must not wait for the database to open.
-    const fresh = createDashboardRuntime({ chat: { tempRoots: [] }, dbPath: ':memory:', tracesDir, modelsDir });
+    const fresh = createDashboardRuntime({
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
+      dbPath: ':memory:',
+      tracesDir,
+      modelsDir,
+    });
     try {
       const settled: string[] = [];
       const boot = fresh.call({ method: 'GET', path: '/api/health' }).then(() => settled.push('worker'));
@@ -253,6 +261,7 @@ describe('dashboard runtime — route ownership', () => {
       'POST /api/chat/conversations/:id/fork',
       'POST /api/chat/conversations/:id/recap',
       'POST /api/chat/conversations/:id/goal',
+      'POST /api/chat/conversations/:id/pdf-read',
       'POST /api/chat/conversations/:id/runs/:runId/stop',
       'POST /api/chat/conversations/:id/tasks/:taskId/stop',
       'POST /api/chat/conversations/:id/subagents/:childId/stop',
@@ -265,6 +274,8 @@ describe('dashboard runtime — route ownership', () => {
       'DELETE /api/chat/conversations/:id/never/:ruleId',
       'POST /api/chat/conversations/:id/permission-mode',
       'POST /api/chat/drafts/:draft/permission-mode',
+      'POST /api/chat/pdf-stage',
+      'DELETE /api/chat/pdf-stage/:stage',
       'GET /api/chat/work/hooks',
       'GET /api/chat/work/git',
       'POST /api/chat/work/git/switch',
@@ -319,7 +330,8 @@ describe('dashboard runtime — live', () => {
     const liveTraces = join(liveBase, 'traces');
     mkdirSync(liveTraces, { recursive: true });
     const periodic = createDashboardRuntime({
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir: liveTraces,
       modelsDir,
@@ -425,7 +437,8 @@ describe('dashboard runtime — shutdown', () => {
 describe('dashboard runtime — worker death', () => {
   it('settles an in-flight call when the worker dies under it', async () => {
     const crashed = createDashboardRuntime({
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -456,7 +469,8 @@ describe('dashboard runtime — worker death', () => {
 
   it('rejects an unconfirmed drain and still closes on a bounded timeout', async () => {
     const wedged = createDashboardRuntime({
-      chat: { tempRoots: [] },
+      chat: { tempRoots: [], root: join(base, 'chat'), homeDir: join(base, 'home') },
+      agentHome: join(base, 'agent-home'),
       dbPath: ':memory:',
       tracesDir,
       modelsDir,

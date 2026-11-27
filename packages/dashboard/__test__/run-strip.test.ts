@@ -83,6 +83,20 @@ describe('the dock strip', () => {
     ]);
   });
 
+  // Mutations: the names left out → a PDF run's line reads "read-pdf"; the ask matched by the shown name → it is lost.
+  it('a run shows the name it is given by id; its ask still finds it by its workflow name', () => {
+    const pdf = run('p', { title: 'read-pdf' });
+    const lines = runStripOf(
+      { running: [pdf, run('a')], needs: [ask('p1', 'read-pdf', 'pages 1-4')] },
+      new Map([['p', 'Reading report.pdf']]),
+    );
+    expect(lines.map((line) => [line.kind, 'name' in line ? line.name : null])).toEqual([
+      ['run', 'Reading report.pdf'],
+      ['ask', 'Reading report.pdf'],
+      ['run', 'research-a'],
+    ]);
+  });
+
   // Mutation: compare with `>=` → two runs read as one summary line.
   // Mutation: count the agents of the first run only → "3 workflows running · 1 agent running".
   it('three or four runs read as one line with their running agents, then the first ask', () => {

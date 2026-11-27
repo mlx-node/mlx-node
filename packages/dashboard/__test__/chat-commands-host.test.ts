@@ -5,7 +5,7 @@
  * checked once its session loaded, and a refused one ends unsent before `session/prompt`.
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
@@ -254,6 +254,56 @@ describe('the command list on the host', () => {
           ];
         },
       },
+    );
+  }, 20_000);
+
+  /** `listed`, plus a `read-pdf` workflow row whose file is the agent home's `workflows/read-pdf.rhai`. */
+  const withReadPdf = (scenario: Json) => {
+    listed(scenario);
+    const commands = (scenario.session as Json).commands as Json;
+    commands.workflows = [...(commands.workflows as Json[]), { name: 'read-pdf', description: 'read', inHome: true }];
+  };
+  const names = (fake: FakeHost, id: string) => fake.host.commandsOf(id)?.map((c) => c.name);
+
+  // Mutations: drop `withoutAppWorkflow` at the pull → `read-pdf` is listed and `/read-pdf` goes; at the push → it
+  // comes back after the turn.
+  it('the app’s own read-pdf is neither listed nor sent typed; its /workflow start still goes', async () => {
+    await withHost(
+      async (fake) => {
+        const load = { modelId: MODEL, cwd: fake.project };
+        const { sessionId: id } = await fake.host.createSession(load);
+        await until(() => fake.events.commands.length === 1);
+        expect(names(fake, id)).toEqual(['deep-research', 'workflow', 'goal', 'loop', 'commit', 'release']);
+        expect(codeOf(() => fake.host.startTurn(id, '/read-pdf {"pdf":"p1"}', load))).toBe('slash-text');
+        const hello = fake.host.startTurn(id, 'hello', load);
+        expect((await hello.done).outcome).toBe('completed');
+        expect(names(fake, id)).not.toContain('read-pdf');
+        expect(codeOf(() => fake.host.startTurn(id, '/READ-PDF', load))).toBe('slash-text');
+        const start = fake.host.startTurn(id, '/workflow read-pdf {"pdf":"p1"}', load);
+        expect((await start.done).outcome).toBe('completed');
+        expect(prompts(fake)).toEqual(['hello', '/workflow read-pdf {"pdf":"p1"}']);
+      },
+      { mode: 'work', mutate: withReadPdf },
+    );
+  }, 20_000);
+
+  // Mutation: `appReadPdfPaths` skips the marker check → a person's own `read-pdf` is hidden and refused.
+  it('a person’s own read-pdf in the agent home, without the app’s marker, is listed and sent', async () => {
+    await withHost(
+      async (fake) => {
+        const own = 'workflow(#{ name: "read-pdf" });\n';
+        mkdirSync(join(fake.agentHome, 'workflows'), { recursive: true });
+        writeFileSync(join(fake.agentHome, 'workflows', 'read-pdf.rhai'), own);
+        const load = { modelId: MODEL, cwd: fake.project };
+        const { sessionId: id } = await fake.host.createSession(load);
+        await until(() => fake.events.commands.length === 1);
+        expect(names(fake, id)).toContain('read-pdf');
+        const typed = fake.host.startTurn(id, '/read-pdf go', load);
+        expect((await typed.done).outcome).toBe('completed');
+        expect(prompts(fake)).toEqual(['/read-pdf go']);
+        expect(readFileSync(join(fake.agentHome, 'workflows', 'read-pdf.rhai'), 'utf8')).toBe(own);
+      },
+      { mode: 'work', mutate: withReadPdf },
     );
   }, 20_000);
 

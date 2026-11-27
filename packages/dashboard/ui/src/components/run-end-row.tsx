@@ -16,6 +16,8 @@ export interface RunEndRowProps {
   /** The entry the run's block is drawn at: `Show run ↑`; null when it is not in the loaded transcript. */
   runAt: number | null;
   onJump?: (at: number) => void;
+  /** The block's own name when it has one (a run of the PDF tool reads `Reading {file}`). */
+  name?: string;
 }
 
 function glyphOf(row: EndRow, status: string | undefined): ReactNode {
@@ -31,7 +33,7 @@ function glyphOf(row: EndRow, status: string | undefined): ReactNode {
  * answer of the wake turn follows it.
  */
 export function RunEndRow(props: RunEndRowProps): ReactElement | null {
-  const row = endRowOf(props.entry);
+  const row = endRowOf(props.entry, props.name);
   if (row === null) return null;
   const status = props.entry.workflow?.snapshot?.status;
   const runAt = props.runAt;

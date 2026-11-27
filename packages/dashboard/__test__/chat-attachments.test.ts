@@ -16,6 +16,7 @@ import {
   PAGE_MAX_BYTES,
   type PageSize,
   PDF_SOURCE_MAX_BYTES,
+  planPdfs,
 } from '../src/chat/attachment-rule.js';
 import {
   attachQueue,
@@ -28,14 +29,22 @@ import {
   type ImageCodec,
   ingestFiles,
   noteName,
-  pageRate,
   type PdfProgress,
+  type PdfStageSink,
   type PdfWatch,
 } from '../ui/src/lib/chat-attachments.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { normalizeMime } from '../ui/src/lib/file-read.js';
 import { type PdfCodec, type PdfOpenFailure, PdfOpenError } from '../ui/src/lib/pdf-pages.js';
-import { type AttachFacts, attachProblem } from '../ui/src/pages/chat/blockers.js';
+import { rateWords } from '../ui/src/lib/pdf-run.js';
+import {
+  type AttachFacts,
+  attachPlan,
+  attachProblem,
+  messageInputs,
+  resendFiles,
+  sentStages,
+} from '../ui/src/pages/chat/blockers.js';
 import {
   drawingCount,
   forgetPlace,
@@ -603,6 +612,100 @@ describe('ingestFiles: a PDF is drawn page by page', () => {
   });
 });
 
+/** A stage sink that records each page it is sent; `fails` makes the page's call throw, as the route's error does. */
+function recordSink(fails: (page: number) => boolean = () => false): {
+  sink: PdfStageSink;
+  pages: Array<[string | null, number, number]>;
+  dropped: string[];
+} {
+  const pages: Array<[string | null, number, number]> = [];
+  const dropped: string[] = [];
+  const sink: PdfStageSink = {
+    page: async (stage, page, total, data) => {
+      pages.push([stage, page, total]);
+      if (fails(page) || !magicMatches('image/jpeg', data)) throw new Error('The page could not be saved.');
+      return stage ?? STAGE;
+    },
+    drop: (stage) => dropped.push(stage),
+  };
+  return { sink, pages, dropped };
+}
+
+describe("ingestFiles: the PDF tool's stage", () => {
+  // Mutation: pages over 20 kept in memory → a 320-page PDF holds every page in the window.
+  it('with the tool, 21 pages go to the stage as drawn, in order, and none stay in the draft', async () => {
+    const stage = recordSink();
+    const pdf = fakePdf(Array(21).fill(A4));
+    const result = await ingestFiles([pdfFile()], { ...WORK_PAGES, stage: stage.sink }, undefined, pdf.codec);
+    expect(result.refused).toEqual([]);
+    expect(stage.pages).toEqual(Array.from({ length: 21 }, (_, i) => [i === 0 ? null : STAGE, i + 1, 21]));
+    const draft = result.added[0]!;
+    if (draft.kind !== 'pdf') throw new Error('not a PDF');
+    expect(draft.images).toEqual([]);
+    expect(draft.sizes).toHaveLength(21);
+    expect(draft.stage).toBe(STAGE);
+    expect(atob(draft.thumbnail.slice(draft.thumbnail.indexOf(',') + 1))).toContain('PAGE1');
+    expect(draftInput(draft, 'tool')).toEqual({ kind: 'pdf', name: 'paper.pdf', stage: STAGE, pages: 21 });
+    expect(stage.dropped).toEqual([]);
+  });
+
+  it('with the tool, a short PDF keeps its pages for the message and has a stage for the tool as well', async () => {
+    const stage = recordSink();
+    const result = await ingestFiles(
+      [pdfFile()],
+      { ...WORK_PAGES, stage: stage.sink },
+      undefined,
+      fakePdf([A4, A4, A4]).codec,
+    );
+    const draft = result.added[0]!;
+    if (draft.kind !== 'pdf') throw new Error('not a PDF');
+    expect(draft.images).toHaveLength(3);
+    expect(draft.stage).toBe(STAGE);
+    expect(draftInput(draft)).toEqual({ kind: 'pdf', name: 'paper.pdf', images: draft.images });
+    expect(stage.pages.map(([, page]) => page)).toEqual([1, 2, 3]);
+  });
+
+  it('with the tool, over 320 pages is one sentence and nothing is drawn or sent', async () => {
+    const stage = recordSink();
+    const long = fakePdf(Array(321).fill(A4));
+    const result = await ingestFiles([pdfFile()], { ...WORK_PAGES, stage: stage.sink }, undefined, long.codec);
+    expect(result.refused).toEqual([fill(e.pdfTooManyPages, { name: 'paper.pdf', n: 321 })]);
+    expect(long.draws).toEqual([]);
+    expect(stage.pages).toEqual([]);
+  });
+
+  it('a page the host could not save refuses the PDF and removes its stage', async () => {
+    const second = recordSink((page) => page === 2);
+    const failed = await ingestFiles(
+      [pdfFile()],
+      { ...WORK_PAGES, stage: second.sink },
+      undefined,
+      fakePdf([A4, A4, A4]).codec,
+    );
+    expect(failed).toEqual({ added: [], refused: [fill(e.pdfSave, { name: 'paper.pdf' })] });
+    expect(second.dropped).toEqual([STAGE]);
+    const first = recordSink((page) => page === 1);
+    await ingestFiles([pdfFile()], { ...WORK_PAGES, stage: first.sink }, undefined, fakePdf([A4, A4]).codec);
+    expect(first.dropped).toEqual([]);
+  });
+
+  it('removing the chip after page 3 removes the stage and sends no page 4', async () => {
+    const stage = recordSink();
+    const seen = recordWatch((progress, stop) => {
+      if (progress.done === 3) stop.abort();
+    });
+    const result = await ingestFiles(
+      [pdfFile()],
+      { ...WORK_PAGES, stage: stage.sink, watch: seen.watch },
+      undefined,
+      fakePdf(Array(30).fill(A4)).codec,
+    );
+    expect(result).toEqual({ added: [], refused: [] });
+    expect(stage.pages.map(([, page]) => page)).toEqual([1, 2, 3]);
+    expect(stage.dropped).toEqual([STAGE]);
+  });
+});
+
 describe('pending PDFs', () => {
   const entry = (id: string): PendingPdf => ({
     id,
@@ -660,7 +763,7 @@ describe('pending PDFs', () => {
   });
 });
 
-describe('drawCaption, drawingNow and pageRate', () => {
+describe('drawCaption, drawingNow and rateWords', () => {
   it('pages drawn of all; the time once past 1 s; the rate once 8 pages and 1 s have passed', () => {
     const at = (done: number, ms: number) =>
       drawCaption({ done, total: 20, startedAt: 5_000, at: 5_000 + ms }, 5_000 + ms);
@@ -698,15 +801,21 @@ describe('drawCaption, drawingNow and pageRate', () => {
   });
 
   it('per second from 1 a second, else per minute; whole numbers from 10', () => {
-    expect(pageRate(34.2)).toBe('34 pages/s');
-    expect(pageRate(1)).toBe('1.0 pages/s');
-    expect(pageRate(9.4 / 60)).toBe('9.4 pages/min');
-    expect(pageRate(0.5)).toBe('30 pages/min');
+    expect(rateWords(34.2)).toBe('34 pages/s');
+    expect(rateWords(1)).toBe('1.0 pages/s');
+    expect(rateWords(9.4 / 60)).toBe('9.4 pages/min');
+    expect(rateWords(0.5)).toBe('30 pages/min');
   });
 });
 
-/** A PDF draft of `pages` A4 pages, each `chars` of base64. */
-function pdfDraft(name: string, pages: number, chars = 200_000, size: PageSize = { width: 861, height: 1_217 }) {
+/** A PDF draft of `pages` A4 pages, each `chars` of base64; `stage` names the host's stage of its pages. */
+function pdfDraft(
+  name: string,
+  pages: number,
+  chars = 200_000,
+  size: PageSize = { width: 861, height: 1_217 },
+  stage: string | null = null,
+) {
   return {
     id: `pdf-${name}`,
     kind: 'pdf' as const,
@@ -715,8 +824,12 @@ function pdfDraft(name: string, pages: number, chars = 200_000, size: PageSize =
     chars: pages * chars,
     images: Array<string>(pages).fill('/9j/AAAA'),
     sizes: Array<PageSize>(pages).fill(size),
+    stage,
+    thumbnail: 'data:image/jpeg;base64,/9j/AAAA',
   };
 }
+
+const STAGE = 'abcdefghijklmnopqrstuvwxyz';
 
 const PICTURE_DRAFT: DraftAttachment = {
   id: 'pic',
@@ -751,8 +864,9 @@ describe('attachProblem with PDFs', () => {
       CHAT.attach.blockedPdfModel,
     );
     const tool = { ...FACTS, pdfTool: true, heldImages: 60 };
-    expect(attachProblem({ ...tool, files: [one, pdfDraft('b.pdf', 5)] })).toBe(CHAT.attach.blockedPdfOne);
-    expect(attachProblem({ ...tool, files: [one] })).toBeNull();
+    const staged = (name: string) => pdfDraft(name, 5, undefined, undefined, STAGE);
+    expect(attachProblem({ ...tool, files: [staged('a.pdf'), staged('b.pdf')] })).toBe(CHAT.attach.blockedPdfOne);
+    expect(attachProblem({ ...tool, files: [staged('a.pdf')] })).toBeNull();
     const full = { ...FACTS, heldPictures: CHAT_PICTURES_MAX_BASE64 - 1_000_000 };
     expect(attachProblem({ ...full, files: [PICTURE_DRAFT] })).toBe(CHAT.sendErrors['pictures-full'][0]);
   });
@@ -772,6 +886,68 @@ describe('attachProblem with PDFs', () => {
     expect(attachProblem({ ...FACTS, files: [pdfDraft('a.pdf', 5)], windowTokens: 6_000, contextUsed: 1_000 })).toBe(
       CHAT.attach.blockedPdfRoom,
     );
+  });
+});
+
+describe('the way each PDF goes, and what Send sends', () => {
+  const TOOL: AttachFacts = { ...FACTS, mode: 'work', seesImages: false, pdfTool: true };
+
+  it('a PDF the plan sends to the tool sends its stage and page count; the others their pages', () => {
+    const long = pdfDraft('long.pdf', 21, 1_000, undefined, STAGE);
+    const short = pdfDraft('short.pdf', 2, 1_000, undefined, 'bcdefghijklmnopqrstuvwxyza');
+    const files = [short, long];
+    const plan = attachPlan({ ...TOOL, files });
+    expect(plan?.ways).toEqual(['message', 'tool']);
+    expect(messageInputs(files, plan)).toEqual([
+      { kind: 'pdf', name: 'short.pdf', images: short.images },
+      { kind: 'pdf', name: 'long.pdf', stage: STAGE, pages: 21 },
+    ]);
+    expect(attachProblem({ ...TOOL, files })).toBeNull();
+  });
+
+  it('a PDF drawn while the mode had no tool has no stage: past the message it keeps Send off', () => {
+    const files = [pdfDraft('a.pdf', 5)];
+    expect(attachProblem({ ...TOOL, files, heldImages: 60 })).toBe(CHAT.attach.blockedPdfRoom);
+    expect(messageInputs(files, attachPlan({ ...TOOL, files, heldImages: 60 }))[0]).toHaveProperty('images');
+    const staged = [pdfDraft('a.pdf', 5, undefined, undefined, STAGE)];
+    expect(attachProblem({ ...TOOL, files: staged, heldImages: 60 })).toBeNull();
+    expect(messageInputs(staged, attachPlan({ ...TOOL, files: staged, heldImages: 60 }))).toEqual([
+      { kind: 'pdf', name: 'a.pdf', stage: STAGE, pages: 5 },
+    ]);
+  });
+
+  // Mutation: the copy kept for a resend keeps its dropped stage → Send again plans the tool way for a stage that is gone.
+  it('a PDF sent in the message drops its stage, and a resend of that message holds the PDF with none', () => {
+    const short = pdfDraft('a.pdf', 5, 1_000, undefined, STAGE);
+    const long = pdfDraft('b.pdf', 21, 1_000, undefined, 'bcdefghijklmnopqrstuvwxyza');
+    const files = [short, long];
+    expect(sentStages(files, messageInputs(files, attachPlan({ ...TOOL, files })))).toEqual([STAGE]);
+    const kept = resendFiles(files, new Set([STAGE]));
+    expect(kept.map((file) => (file.kind === 'pdf' ? file.stage : undefined))).toEqual([
+      null,
+      'bcdefghijklmnopqrstuvwxyza',
+    ]);
+    expect(attachProblem({ ...TOOL, files: [kept[0]!], heldImages: 60 })).toBe(CHAT.attach.blockedPdfRoom);
+    expect(resendFiles(files, new Set())).toEqual(files);
+  });
+
+  it('a model change moves a short PDF between the two ways with no second draw', () => {
+    const files = [pdfDraft('a.pdf', 12, 1_000, undefined, STAGE)];
+    const small = { ...TOOL, files, windowTokens: 12_000, contextUsed: 0 };
+    expect(attachPlan({ ...small, family: 'qwen3_5' })?.ways).toEqual(['tool']);
+    expect(attachPlan({ ...small, family: 'gemma4' })?.ways).toEqual(['message']);
+    const plan = planPdfs({
+      text: TOOL.text,
+      attachments: [],
+      pdfs: files,
+      family: 'qwen3_5',
+      window: 12_000,
+      contextUsed: 0,
+      held: 0,
+      stored: 0,
+      tool: true,
+    });
+    expect(attachPlan({ ...small, family: 'qwen3_5' })).toEqual(plan);
   });
 });
 

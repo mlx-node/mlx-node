@@ -275,6 +275,129 @@ describe('Auto', () => {
     );
   });
 
+  describe('a launch of the PDF tool', () => {
+    const PDF = 'k3f7a2c4-40';
+    const READ_PDF = {
+      variant: 'Workflow',
+      source: { type: 'name', name: 'read-pdf' },
+      agent_budget: null,
+      args: { pdf: PDF, question: 'What are the findings?' },
+      validate_only: false,
+    };
+    const launchStep = (rawInput: Json = READ_PDF) =>
+      toolStep('workflow', rawInput, { title: 'Workflow: read-pdf', options: EDIT_OPTIONS.slice(1) });
+    /** The host's read of a page folder: this session's, 40 pages, on a model that sees images. */
+    const facts =
+      (over: Json = {}): FakeHostOptions['pdfFacts'] =>
+      async (sessionId, pdf) =>
+        pdf === PDF
+          ? { id: PDF, session: sessionId, name: 'report.pdf', pages: 40, images: true, tool: true, ...over }
+          : null;
+
+    // Mutation: the launch row left out of the host (every workflow a card) → red.
+    it('on a PDF of this conversation runs with no card: allow-once after its line, the card naming the PDF', async () => {
+      await withAuto(
+        [launchStep()],
+        async (fake, sw, id) => {
+          const turn = start(fake, id);
+          await until(() => fake.events.ends.length === 1 || fake.events.interactions.length > 0, 5_000);
+          expect(fake.events.interactions).toEqual([]);
+          expect((await turn.done).outcome).toBe('completed');
+          expect(answers(fake)).toEqual([ALLOW_ONCE]);
+          expect(sw.marks.map((m) => [m.access, m.card?.toolName, m.card?.pdfRead])).toEqual([
+            ['other', 'workflow', { name: 'report.pdf', pages: 40, readers: 10 }],
+          ]);
+        },
+        { pdfFacts: facts() },
+      );
+    });
+
+    it("asks (helper-start) for another conversation's PDF, a model that sees no images, or another workflow", async () => {
+      const cases: Array<[string, Json[], FakeHostOptions['pdfFacts']]> = [
+        ['another session', [launchStep()], facts({ session: 'someone-else' })],
+        ['no images', [launchStep()], facts({ images: false })],
+        ['no page folder', [launchStep({ ...READ_PDF, args: { pdf: 'k3f7a2c4-12' } })], facts()],
+        ['another workflow', [launchStep({ ...READ_PDF, source: { type: 'name', name: 'deep-research' } })], facts()],
+      ];
+      for (const [label, steps, pdfFacts] of cases) {
+        await withAuto(
+          steps,
+          async (fake, sw, id) => {
+            const turn = start(fake, id);
+            const card = await nth(fake, 1);
+            expect([label, card.toolName, card.autoAsk]).toEqual([label, 'workflow', 'helper-start']);
+            fake.host.answer(id, card.id, 'reject-once');
+            await turn.done;
+            expect(sw.marks).toEqual([]);
+          },
+          { pdfFacts },
+        );
+      }
+    }, 30_000);
+
+    // Mutation: the host not wired to the runs of the tool (a launch allowed while one goes on) → red.
+    it('asks (pdf-busy) while a run of the tool of this conversation goes on; once it ended, a launch runs again', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'mlx-pdf-gate-'));
+      const gate = join(dir, 'go');
+      try {
+        await withAuto(
+          [],
+          async (fake, _sw, id) => {
+            expect((await start(fake, id, 'p1').done).outcome).toBe('completed');
+            expect(fake.events.interactions).toEqual([]);
+            expect(fake.host.runs(id).map((r) => [r.runId, r.name, r.live])).toEqual([['wf_1', 'read-pdf', true]]);
+            const busy = start(fake, id, 'p2');
+            const card = await nth(fake, 1);
+            expect([card.toolName, card.autoAsk, card.pdfRead]).toEqual([
+              'workflow',
+              'pdf-busy',
+              { name: 'report.pdf', pages: 40, readers: 10 },
+            ]);
+            fake.host.answer(id, card.id, 'reject-once');
+            await busy.done;
+            writeFileSync(gate, '');
+            await until(() => fake.host.runs(id).every((r) => !r.live && !r.waiting), 5_000);
+            const before = answers(fake).length;
+            expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+            expect(fake.events.interactions).toHaveLength(1);
+            expect(answers(fake).slice(before)).toEqual([ALLOW_ONCE]);
+          },
+          {
+            name: 'work-workflow-run',
+            mutate: (scenario) => {
+              const run = { runId: 'wf_1', name: 'read-pdf', completeOn: gate, ask: false, wake: false };
+              scenario.prompts = [
+                { match: 'p1', steps: [launchStep(), { workflow: run }, ...END] },
+                { match: 'p2', steps: [launchStep(), ...END] },
+              ];
+            },
+            pdfFacts: facts(),
+          },
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // Mutation: the card without the PDF it reads → red.
+    it('in Ask the card opens with the PDF it reads: its name, the pages picked and the readers', async () => {
+      await withAuto(
+        [launchStep({ ...READ_PDF, args: { pdf: PDF, question: 'q', pages: '1-12, 15' } })],
+        async (fake, sw, id) => {
+          sw.mode = 'ask';
+          const turn = start(fake, id);
+          const card = await nth(fake, 1);
+          expect(card.autoAsk).toBeUndefined();
+          expect(card.pdfRead).toEqual({ name: 'report.pdf', pages: 13, readers: 4 });
+          expect(card.options.map((o) => o.optionId)).toEqual(['allow-once', 'reject-once']);
+          fake.host.answer(id, card.id, 'allow-once');
+          expect((await turn.done).outcome).toBe('completed');
+        },
+        { pdfFacts: facts() },
+      );
+    });
+  });
+
   describe('the helpers of a workflow run', () => {
     const gates: string[] = [];
     afterEach(() => {

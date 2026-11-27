@@ -71,7 +71,7 @@ function metaOf(item: AttachmentChipItem): string {
   if (item.kind === 'pdf') {
     if (item.drawing === true) return a.pdfDrawing;
     const n = item.pages ?? 0;
-    if (item.way === 'tool') return fill(a.pdfTool, { n });
+    if (item.way === 'tool') return n === 1 ? a.pdfToolOne : fill(a.pdfTool, { n });
     return n === 1 ? fill(a.pdfPage, { size }) : fill(a.pdfPages, { n, size });
   }
   const type = typeLabel(item.mediaType);

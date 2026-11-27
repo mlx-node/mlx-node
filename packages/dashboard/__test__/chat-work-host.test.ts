@@ -26,6 +26,7 @@ import { afterEach, describe, expect, it } from 'vite-plus/test';
 import { parseUpdates, TranscriptReducer } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { AgentHostError, FAILURE_MESSAGES, InteractionError } from '../src/chat/agent/agent-host.js';
+import { PDF_READER_TEXT, readPdfScript } from '../src/chat/agent/pdf-tool.js';
 import { WORK_GUARD_PREFIX, workGuardHookName, workGuardManifest } from '../src/chat/agent/profiles.js';
 import { REDACTED } from '../src/chat/redact.js';
 import type { McpInteraction, PermissionInteraction, PlanInteraction } from '../src/chat/types.js';
@@ -130,6 +131,42 @@ describe('the Work guard', () => {
         'Execute `ls`',
       ]);
     });
+  });
+});
+
+describe('the PDF tool files', () => {
+  // Mutation: the files not written at the Work agent start → red.
+  it('the Work agent start writes the workflow and its reader agent into the agent home', async () => {
+    await withWork('work-always', async (fake) => {
+      expect(fake.host.pdfTool()).toBeNull();
+      await session(fake);
+      expect(fake.host.pdfTool()).toBe(true);
+      expect(readFileSync(join(fake.agentHome, 'workflows', 'read-pdf.rhai'), 'utf8')).toBe(
+        readPdfScript(fake.paths.workPdf),
+      );
+      expect(readFileSync(join(fake.agentHome, 'agents', 'pdf-reader.md'), 'utf8')).toBe(PDF_READER_TEXT);
+    });
+  });
+
+  // Mutation: a person's file replaced at the agent start → red.
+  it("a file of the person's under either name stays as it is, and the tool is off", async () => {
+    const theirs = '---\nname: read-pdf\n---\nmine\n';
+    await withWork(
+      'work-always',
+      async (fake) => {
+        await session(fake);
+        expect(fake.host.pdfTool()).toBe(false);
+        expect(readFileSync(join(fake.agentHome, 'agents', 'pdf-reader.md'), 'utf8')).toBe(theirs);
+        expect(existsSync(join(fake.agentHome, 'workflows', 'read-pdf.rhai'))).toBe(false);
+      },
+      {
+        mutate: (scenario) => {
+          const home = join(dirname(String(scenario.recordTo)), 'agent-home');
+          mkdirSync(join(home, 'agents'), { recursive: true });
+          writeFileSync(join(home, 'agents', 'pdf-reader.md'), theirs);
+        },
+      },
+    );
   });
 });
 

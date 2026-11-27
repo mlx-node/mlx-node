@@ -2,8 +2,9 @@
  * The app data folder of Chat and Work (`~/.mlx-node/chat`). Every file the app writes here is metadata or a fixed
  * text, except `web-ledger/`, which holds the web addresses of live Chat sessions, `composer/<id>.json`, which holds
  * the messages the user queued (with their files) until they are sent, `never-allow.json`, which holds the words of
- * the commands the user never allows in a Work folder, and `scratch-folders.json`, which holds the paths of the folders
- * Work without a folder made; any other chat text is written only by the agent, into its own home `chat-agent/`.
+ * the commands the user never allows in a Work folder, `scratch-folders.json`, which holds the paths of the folders
+ * Work without a folder made, and `pdf-stage/` and `work-pdf/`, which hold the page images of the PDFs the PDF tool
+ * reads; any other chat text is written only by the agent, into its own home `chat-agent/`.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -50,6 +51,10 @@ export interface ChatPaths {
   workSettings: string;
   /** Work: the folders Work without a folder made (`work-scratch.ts`): real path, device and inode, mode 0600. */
   scratchFolders: string;
+  /** The pages of PDFs for the PDF tool while the page sends them, one folder per stage (`pdf-store.ts`). */
+  pdfStage: string;
+  /** Work: the pages the PDF tool reads, one folder per PDF id with its `meta.json`. */
+  workPdf: string;
 }
 
 export function chatPaths(root: string = defaultChatRoot()): ChatPaths {
@@ -75,6 +80,8 @@ export function chatPaths(root: string = defaultChatRoot()): ChatPaths {
     neverAllow: join(root, 'never-allow.json'),
     workSettings: join(root, 'work-settings.json'),
     scratchFolders: join(root, 'scratch-folders.json'),
+    pdfStage: join(root, 'pdf-stage'),
+    workPdf: join(root, 'work-pdf'),
   };
 }
 
