@@ -1066,9 +1066,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 
   Model gate: `images` on a host state model row is the loaded model's own `supportsImages()` while it is in memory
   (the engine's live file, per model `images`), else discovery's answer (the endpoint file). Discovery gives a
-  `qwen3_5` GGUF image support only with a sibling `mmproj-*.gguf` (`config.json` does not count), a `gemma4` GGUF only
-  with both the vision marker of its `config.json` and a sibling `mmproj-*.gguf` (its load looks for a projector only
-  then), and a `qwen3_5_moe` GGUF none (its load takes no mmproj); MLX checkpoints and Clairic keep their rule.
+  `qwen3_5` or `inkling2` GGUF image support only with a sibling `mmproj-*.gguf` (`config.json` does not count), a
+  `gemma4` GGUF only with both the vision marker of its `config.json` and a sibling `mmproj-*.gguf` (its load looks for
+  a projector only then), and a `qwen3_5_moe` GGUF none (its load takes no mmproj); MLX checkpoints and Clairic keep
+  their rule.
   Discovery reads only the file name of the projector: one of the wrong kind or width (Qwen `projection_dim`, `gemma4v`
   against `gemma4uv`) or a Prism-Hadamard Qwen file still reads as images until the first load. That cold turn
   answers without the picture, then the loaded model's own answer takes over; after each unload the guess comes back.

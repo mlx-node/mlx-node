@@ -409,13 +409,14 @@ export async function discoverLocalChatModels(
       return;
     }
 
-    // A Qwen3.5 or Gemma4 GGUF load takes its vision tower only from a sibling mmproj, and a Qwen3.5 MoE GGUF load
-    // never takes one (native_gguf_preflight). Qwen3.5 ignores config.json; Gemma4 looks for the projector only when
-    // config.json declares a vision tower (gemma4_native_preflight).
+    // A Qwen3.5, Inkling2 or Gemma4 GGUF load takes its vision tower only from a sibling mmproj, and a Qwen3.5 MoE
+    // GGUF load never takes one (native_gguf_preflight). Qwen3.5 and Inkling2 ignore config.json; Gemma4 looks for the
+    // projector only when config.json declares a vision tower (gemma4_native_preflight).
     let supportsImages: boolean;
     if (modelType === 'clef') supportsImages = false;
     else if (format === 'gguf' && modelType === 'qwen3_5_moe') supportsImages = false;
-    else if (format === 'gguf' && modelType === 'qwen3_5') supportsImages = await hasSiblingMmprojGguf(metadataRoot);
+    else if (format === 'gguf' && (modelType === 'qwen3_5' || modelType === 'inkling2'))
+      supportsImages = await hasSiblingMmprojGguf(metadataRoot);
     else if (format === 'gguf' && modelType === 'gemma4')
       supportsImages = metadata.supportsImages && (await hasSiblingMmprojGguf(metadataRoot));
     else
