@@ -1418,31 +1418,20 @@ jobs:
           path: packages/core/artifacts
       - uses: actions/download-artifact@v8
         with:
-          name: mlx-node-linux-arm64-gnu
-          path: packages/core/artifacts
-      - uses: actions/download-artifact@v8
-        with:
           name: mlx-metallib
           path: packages/core/npm/darwin-arm64/
-      - uses: actions/download-artifact@v8
-        with:
-          name: mlx-cuda-include-linux-arm64-gnu
-          path: packages/core/npm/linux-arm64-gnu/include/
       # Not a bare `napi artifacts`: `napi.targets` also lists
       # `aarch64-pc-windows-msvc` (`win32-arm64-msvc`), which stays
       # desktop-only and is never downloaded here, and @napi-rs/cli >= 3.8
       # fails on a configured target with no `.node`.
       # `yarn workspace @mlx-node/core artifacts` runs the same collector
-      # over the targets this repo actually publishes (`darwin-arm64` and
-      # `linux-arm64-gnu`), derived from its own optionalDependencies +
-      # `packages/core/npm/*` (see packages/core/publish-targets.ts).
+      # over the targets this repo actually publishes, derived from its own
+      # optionalDependencies + the non-private `packages/core/npm/*`
+      # (see packages/core/publish-targets.ts). `linux-arm64-gnu` is private
+      # until it has an npm trusted publisher, so its addon is not downloaded
+      # here: napi fails on an artifact for a target it does not collect.
       - name: move artifacts
         run: yarn workspace @mlx-node/core artifacts
-      - name: Verify published Linux arm64 package layout
-        run: |
-          set -euo pipefail
-          test -f packages/core/npm/linux-arm64-gnu/mlx-core.linux-arm64-gnu.node
-          test -f packages/core/npm/linux-arm64-gnu/include/cccl/cuda/std/array
       - name: List dir
         run: ls -R packages/core
       - name: Publish package
