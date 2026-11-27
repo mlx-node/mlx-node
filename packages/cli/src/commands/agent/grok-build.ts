@@ -1881,7 +1881,6 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     // An inherited GROK_HOME, GROK_AUTH_PATH or GROK_CONFIG_PATH is grok-build's own.
     env.GROK_HOME = agentConfigDir();
     for (const name of GROK_BUILD_ENV_REMOVED) delete env[name];
-    env.GROK_DISABLE_AUTOUPDATER = '1';
     if (serve) {
       env.GROK_MODELS_BASE_URL = serve.url;
       env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;

@@ -132,7 +132,6 @@ export function chatAgentEnv(input: ChatEnvInput): Record<string, string> {
     ...baseUrls(input.endpoint),
     XAI_API_KEY: input.endpoint.token,
     GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS: LOOPBACK_CONNECT_ATTEMPTS,
-    GROK_DISABLE_AUTOUPDATER: '1',
     GROK_IMAGE_GEN: '0',
     GROK_IMAGE_EDIT: '0',
     GROK_VIDEO_GEN: '0',
@@ -234,7 +233,6 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   Object.assign(env, baseUrls(input.endpoint));
   env.XAI_API_KEY = input.endpoint.token;
   env.GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS ??= LOOPBACK_CONNECT_ATTEMPTS;
-  env.GROK_DISABLE_AUTOUPDATER = '1';
   for (const name of ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN']) env[name] ??= '0';
   env.GROK_RESUME_COMMAND ??= 'mlx agent';
   env.GROK_TURN_SUMMARY = '0';

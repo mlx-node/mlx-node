@@ -66,7 +66,6 @@ describe('chatAgentEnv', () => {
         GROK_XAI_API_BASE_URL: 'http://127.0.0.1:4321/v1',
         XAI_API_KEY: 'tok-INFERENCE',
         GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS: '3',
-        GROK_DISABLE_AUTOUPDATER: '1',
         GROK_IMAGE_GEN: '0',
         GROK_IMAGE_EDIT: '0',
         GROK_VIDEO_GEN: '0',
@@ -126,7 +125,6 @@ describe('workAgentEnv', () => {
     expect(env.EXA_API_KEY).toBe('new-exa');
     expect(env.XAI_API_KEY).toBe('tok-INFERENCE');
     expect(env.GROK_MODELS_BASE_URL).toBe('http://127.0.0.1:4321/v1');
-    expect(env.GROK_DISABLE_AUTOUPDATER).toBe('1');
     expect(env.GROK_IMAGE_GEN).toBe('1');
     expect(env.GROK_IMAGE_EDIT).toBe('0');
     expect(env.GROK_RESUME_COMMAND).toBe('mlx agent');

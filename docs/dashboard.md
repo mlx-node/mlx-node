@@ -133,7 +133,7 @@ checkpoint templates kept in `crates/mlx-core/src/tokenizer/fixtures`). The defa
 that names it runs as one that names none. No level raises the 12,000 budget, so the caps above hold for every family
 whose engine enforces that budget. Inkling2's engine does not (`ThinkingPolicy::None`):
 its levels only set the effort number in its prompt (Off 0, Low 0.2, Medium 0.7, High 0.9), so at any level a long
-Inkling2 thought can use the answer room. The agent (the app and `mlx agent` need mlx-agent v0.3.6 or later,
+Inkling2 thought can use the answer room. The agent (the app and `mlx agent` need mlx-agent v0.3.7 or later,
 `MLX_AGENT_MIN_RELEASE`) builds its `reasoning_effort` session option from those rows and adds the level as
 `extra_body.reasoning_effort` (`none` for Off, never `minimal`) only for a model whose `/v1/models` row has
 `owned_by: "mlx-node"` and lists `reasoningEfforts` or `reasoning_efforts` (it reads `reasoningEfforts` first). There it goes beside `output_config.effort` and

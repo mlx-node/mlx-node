@@ -163,11 +163,16 @@ describe('launchFromProbe', () => {
     expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.5' })).toEqual({
       failure: 'agent-too-old',
     });
+    // Mutation: the minimum left at v0.3.6 → Work starts an agent that reads `.grok` project folders and sends no
+    // `tool_failure_count`.
     expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.6' })).toEqual({
+      failure: 'agent-too-old',
+    });
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.7' })).toEqual({
       command: '/m',
       args: ['--disable-web-search', 'agent', '--no-leader', 'stdio'],
       source: 'managed',
-      tag: 'mlx-agent-v0.3.6',
+      tag: 'mlx-agent-v0.3.7',
       versionVerified: true,
     });
     expect(launchFromProbe({ source: 'env', path: '/e' })).toMatchObject({
@@ -201,7 +206,6 @@ describe('Chat host', () => {
           'GROK_CURSOR_HOOKS_ENABLED',
           'GROK_CURSOR_MCPS_ENABLED',
           'GROK_CURSOR_SKILLS_ENABLED',
-          'GROK_DISABLE_AUTOUPDATER',
           'GROK_HOME',
           'GROK_IMAGE_EDIT',
           'GROK_IMAGE_GEN',

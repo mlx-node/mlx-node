@@ -32,7 +32,7 @@
  * Recap (the thread bar `⋯`, /recap, "Recap conversation" in the palette) shows "Writing a recap…" for 4 s in the fake
  * agent, then a Recap row; before the first finished answer the agent has none ("No recap this time."). The live Work
  * session holds one stored recap after its third answer.
- * Thinking: the fake agent reports mlx-agent-v0.3.6 and lists levels, so the model menu has a Thinking row: Off · Low ·
+ * Thinking: the fake agent reports mlx-agent-v0.3.7 and lists levels, so the model menu has a Thinking row: Off · Low ·
  * Medium · High on qwen3.5-4b and the Qwen3.8-27B builds, Low · High on qwen3.5-9b, "This model has no levels." on the
  * long-named model. A pick shows on the chip ("· Low") and is set in the agent before the next answer; switching
  * qwen3.5-4b at Medium to qwen3.5-9b steps it to Low.

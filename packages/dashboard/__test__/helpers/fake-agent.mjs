@@ -2899,7 +2899,7 @@ async function runPrompt(id, params) {
     const managed = builtin === 'workflow' ? (readPdfStart(session, text) ?? manageRun(session, text)) : null;
     const said = managed ?? (scripted ? scenario.hostTurnText?.[builtin] : undefined) ?? goalSaid ?? `Ran /${builtin}.`;
     update(session, 'agent_message_chunk', { content: { type: 'text', text: said }, _meta: { hostTurn: true } });
-    // v0.3.6 ends a `/workflow` turn with a live and stored `turn_completed`.
+    // v0.3.7 ends a `/workflow` turn with a live and stored `turn_completed`.
     if (builtin === 'workflow')
       update(session, 'turn_completed', { prompt_id: randomUUID(), stop_reason: 'end_turn', elapsed_ms: 28 }, true);
     persistSummary(session);
