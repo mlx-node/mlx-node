@@ -99,7 +99,14 @@ const spawn = (ms: number, id: string, label: string, extra: object = {}): strin
     ...extra,
   });
 
-const finished = (ms: number, id: string, tokens: number, durationMs: number, status = 'completed'): string =>
+const finished = (
+  ms: number,
+  id: string,
+  tokens: number,
+  durationMs: number,
+  status = 'completed',
+  extra: object = {},
+): string =>
   xai(ms, {
     sessionUpdate: 'subagent_finished',
     subagent_id: id,
@@ -109,7 +116,9 @@ const finished = (ms: number, id: string, tokens: number, durationMs: number, st
     turns: 1,
     duration_ms: durationMs,
     tokens_used: tokens,
+    ...extra,
   });
+const billed = (n: number) => ({ total_tokens_used: n });
 
 const roster = (agents: Array<[string, string, string, number, number]>) =>
   agents.map(([agent_id, label, state, tokens_used, duration_ms]) => ({
@@ -278,10 +287,27 @@ describe('runAgents: the rows of a run', () => {
   });
 
   // Mutation: take the newest attempt's run time alone → 120,527 ms.
-  it('a retried row built from its entries sums the run time of its attempts and reads its context at end', () => {
-    const rows = runAgents(read([...RETRIED, finished(T0 + 308_450, RETRY, 27_462, 120_527)])).get(RUN)!;
-    expect(rows[0]).toMatchObject({ childId: RETRY, durationMs: 308_450, tokens: { n: 27_462, kind: 'context' } });
-    expect(tokenWords(rows[0]!)).toBe(fill(CHAT.agent.facts.contextAtEnd, { n: '27.5K' }));
+  // Mutation: take the newest attempt's billed tokens alone → 13 tokens used.
+  // Mutation: read a run agent's context at end when it has no roster → 27.5K context at end.
+  it('a retried row built from its entries sums the run time and the billed tokens of its attempts', () => {
+    const lines = [
+      ...START,
+      finished(T0 + 187_923, child(0), 25_262, 187_923, 'completed', billed(43)),
+      ...RETRIED.slice(START.length + 1),
+      finished(T0 + 308_450, RETRY, 27_462, 120_527, 'completed', billed(13)),
+    ];
+    const rows = runAgents(read(lines)).get(RUN)!;
+    expect(rows[0]).toMatchObject({ childId: RETRY, durationMs: 308_450, tokens: { n: 56, kind: 'used' } });
+    expect(tokenWords(rows[0]!)).toBe(fill(CHAT.agent.facts.tokensUsed, { n: '56' }));
+  });
+
+  // Mutation: sum the attempts that have a figure → 13 tokens used, though the first attempt's use is unknown.
+  it('a row built from its entries has no token figure when an attempt has no billed tokens, never a context', () => {
+    const rows = runAgents(
+      read([...RETRIED, finished(T0 + 308_450, RETRY, 27_462, 120_527, 'completed', billed(13))]),
+    ).get(RUN)!;
+    expect(rows[0]!.tokens).toBeNull();
+    expect(tokenWords(rows[0]!)).toBeNull();
   });
 
   // Mutation: read the stored state alone → an agent with no end reads running after its run ended.
@@ -784,6 +810,18 @@ describe('Task subagent rows', () => {
     expect(attemptWords(rows.get(FOLLOW)!)).toEqual([
       fill(CHAT.agent.facts.continues, { label: 'Find the flaky test' }),
     ]);
+  });
+
+  // Mutation: give a Task subagent its billed tokens → its row reads 3,400 tokens used, not its context at end.
+  it('an ended Task subagent reads its context at end, also when its finish line names its billed tokens', () => {
+    const entries = read([
+      ...START,
+      task(T0 + 20, OTHER, 'Find the flaky test'),
+      finished(T0 + 30, OTHER, 1_200, 10, 'completed', billed(3_400)),
+    ]);
+    const row = subagentRows(entries).get(OTHER)!;
+    expect(row.tokens).toEqual({ n: 1_200, kind: 'context' });
+    expect(tokenWords(row)).toBe(fill(CHAT.agent.facts.contextAtEnd, { n: '1,200' }));
   });
 
   // Mutation: return a new map every time → every finished turn's rows re-render on each stream event.

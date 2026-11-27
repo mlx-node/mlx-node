@@ -1,12 +1,12 @@
 {
-  "description": "mlx-agent v0.3.6 stopping one agent of a running workflow (parallel alpha, beta): the client cancel, its reply, the parent lines that follow. Recorded with a throwaway home against a fake model.",
+  "description": "mlx-agent v0.3.7 stopping one agent of a running workflow (parallel alpha, beta): the client cancel, its reply, the parent lines that follow. Recorded with a throwaway home against a fake model.",
   "lines": [
     {
       "jsonrpc": "2.0",
       "id": 4,
       "method": "_x.ai/subagent/cancel",
       "params": {
-        "subagentId": "01a21856-39f1-7711-abda-6a9d19545507"
+        "subagentId": "01a21b94-c418-73b2-a56a-812bf327357e"
       }
     },
     {
@@ -14,7 +14,7 @@
       "id": 4,
       "result": {
         "result": {
-          "subagentId": "01a21856-39f1-7711-abda-6a9d19545507",
+          "subagentId": "01a21b94-c418-73b2-a56a-812bf327357e",
           "cancelled": true,
           "outcome": {
             "kind": "cancelled"
@@ -26,23 +26,24 @@
       "jsonrpc": "2.0",
       "method": "_x.ai/session_notification",
       "params": {
-        "sessionId": "01a21856-3918-73e2-8d92-c67b5a319337",
+        "sessionId": "01a21b94-c313-7440-9bce-ab5dbdde5add",
         "update": {
           "sessionUpdate": "subagent_finished",
-          "subagent_id": "01a21856-39f1-7711-abda-6a9d19545507",
-          "attempt_id": "at1.62f8a3c08f034c2eb84372b2c4e31acc",
-          "child_session_id": "01a21856-39f1-7711-abda-6a9d19545507",
+          "subagent_id": "01a21b94-c418-73b2-a56a-812bf327357e",
+          "attempt_id": "at1.9907d9f6861e4107b69defc144f2c2fc",
+          "child_session_id": "01a21b94-c418-73b2-a56a-812bf327357e",
           "status": "cancelled",
           "error": "Subagent was cancelled",
           "tool_calls": 0,
           "turns": 1,
-          "duration_ms": 2516,
+          "duration_ms": 2520,
           "tokens_used": 0,
+          "total_tokens_used": 0,
           "will_wake": false
         },
         "_meta": {
-          "eventId": "01a21856-3918-73e2-8d92-c67b5a319337-32",
-          "agentTimestampMs": 1795704636407
+          "eventId": "01a21b94-c313-7440-9bce-ab5dbdde5add-33",
+          "agentTimestampMs": 1795759066666
         }
       }
     },
@@ -50,10 +51,10 @@
       "jsonrpc": "2.0",
       "method": "_x.ai/session_notification",
       "params": {
-        "sessionId": "01a21856-3918-73e2-8d92-c67b5a319337",
+        "sessionId": "01a21b94-c313-7440-9bce-ab5dbdde5add",
         "update": {
           "sessionUpdate": "workflow_updated",
-          "run_id": "wf_01a2185639d376b2a1c4a4f482ca7fe1",
+          "run_id": "wf_01a21b94c3f67b31a50acab0e0ae8241",
           "revision": 6,
           "name": "stopprobe",
           "objective": "Stop one agent probe",
@@ -75,20 +76,20 @@
           "agents_reserved": 0,
           "agents_remaining": 126,
           "agent_usage_incomplete": false,
-          "elapsed_ms": 2573,
+          "elapsed_ms": 2591,
           "active_agents": 1,
           "current_agent_label": "beta",
           "agents": [
             {
-              "agent_id": "01a21856-39f1-7711-abda-6a9d19545507",
+              "agent_id": "01a21b94-c418-73b2-a56a-812bf327357e",
               "label": "alpha",
               "phase": "Work",
               "state": "failed",
               "tokens_used": 0,
-              "duration_ms": 2516
+              "duration_ms": 2520
             },
             {
-              "agent_id": "01a21856-39f1-7711-abda-6aa435da5f97",
+              "agent_id": "01a21b94-c418-73b2-a56a-813bec85bce0",
               "label": "beta",
               "phase": "Work",
               "state": "running",
@@ -98,11 +99,11 @@
           ],
           "last_event": "phase_entered",
           "last_event_detail": "Work",
-          "last_event_timestamp": "2026-11-26T14:50:33.837445+00:00"
+          "last_event_timestamp": "2026-11-27T05:57:44.084073+00:00"
         },
         "_meta": {
-          "eventId": "01a21856-3918-73e2-8d92-c67b5a319337-33",
-          "agentTimestampMs": 1795704636407
+          "eventId": "01a21b94-c313-7440-9bce-ab5dbdde5add-34",
+          "agentTimestampMs": 1795759066666
         }
       }
     }

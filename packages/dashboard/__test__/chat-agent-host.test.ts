@@ -41,7 +41,7 @@ import { gate } from './helpers/fake-engine.js';
 import { runView } from './helpers/run-views.js';
 
 const MODEL = 'qwen3.5-4b';
-/** The agent's own lines for a Stop of one workflow agent (mlx-agent v0.3.6, recorded). */
+/** The agent's own lines for a Stop of one workflow agent (mlx-agent v0.3.7, recorded). */
 const STOP_RECORD = JSON.parse(
   readFileSync(fileURLToPath(new URL('./fixtures/workflow-agent-stop.json', import.meta.url)), 'utf8'),
 ) as { lines: Array<{ params?: { update?: Json } }> };

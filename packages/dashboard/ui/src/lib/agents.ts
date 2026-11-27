@@ -32,7 +32,10 @@ export interface AgentRow {
   rosterTs: number | null;
   /** The child its first spawn resumed: `continues {label}`. */
   continues: { childId: string; label: string } | null;
-  /** The roster's total use once it ended (`used`), else the newest attempt's context at its end. */
+  /**
+   * The roster's total use once it ended (`used`). Else, for a run's agent, the sum of its attempts' billed tokens
+   * (`used`) when every attempt ended with one; for a Task subagent, its context at its end.
+   */
   tokens: { n: number; kind: 'used' | 'context' } | null;
   /** The roster's time once it ended, else the sum of its attempts' times. */
   durationMs: number;
@@ -131,6 +134,17 @@ function enteredBefore(run: RunEntry | undefined, ts: number): string | null {
   return phase;
 }
 
+function billed(draft: Draft | null): AgentRow['tokens'] {
+  if (draft === null) return null;
+  let n = 0;
+  for (const id of draft.attempts) {
+    const used = draft.entries.get(id)!.tokensUsed;
+    if (used === undefined) return null;
+    n += used;
+  }
+  return { n, kind: 'used' };
+}
+
 function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonly RosterRow[]): AgentRow {
   const childId = draft?.attempts.at(-1) ?? rostered[0]!.agentId;
   const entry = draft?.entries.get(childId);
@@ -141,15 +155,18 @@ function rowOf(draft: Draft | null, run: RunEntry | undefined, rostered: readonl
   const ended = roster !== null && ROSTER_ENDS.has(roster.state);
   let durationMs = 0;
   for (const id of draft?.attempts ?? []) durationMs += draft!.entries.get(id)!.durationMs ?? 0;
+  const runId = first?.run ?? run?.runId ?? null;
   const tokens: AgentRow['tokens'] = ended
     ? { n: roster.tokens, kind: 'used' }
-    : entry?.endTs !== undefined && entry.tokens !== undefined
-      ? { n: entry.tokens, kind: 'context' }
-      : null;
+    : runId !== null
+      ? billed(draft)
+      : entry?.endTs !== undefined && entry.tokens !== undefined
+        ? { n: entry.tokens, kind: 'context' }
+        : null;
   return {
     childId,
     label: named?.label ?? (description !== '' ? description : childId),
-    run: first?.run ?? run?.runId ?? null,
+    run: runId,
     phase: named?.phase ?? (first === undefined ? null : enteredBefore(run, first.ts)),
     ...(entry === undefined ? {} : { entry }),
     attempts: draft?.attempts ?? [childId],
@@ -358,7 +375,7 @@ export function agentStateWords(state: AgentEnd, stoppedByYou: boolean): string 
   }
 }
 
-/** `618K tokens used` from the roster, else `41K context at end`; null with neither. */
+/** `618K tokens used` (the roster's, or a run agent's attempts' sum), else `41K context at end`; null with neither. */
 export function tokenWords(row: AgentRow): string | null {
   if (row.tokens === null) return null;
   const n = formatCount(row.tokens.n);

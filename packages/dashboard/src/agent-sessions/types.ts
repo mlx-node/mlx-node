@@ -230,7 +230,10 @@ export type TranscriptEntry = (
       description: string;
       status?: string;
       durationMs?: number;
+      /** `tokens_used`: the context size at the end of this attempt. */
       tokens?: number;
+      /** `total_tokens_used`: input plus output tokens this attempt billed, nested subagents included; absent at 0. */
+      tokensUsed?: number;
       /** `subagent_finished`: the helper's tool calls and turns. */
       toolCalls?: number;
       turns?: number;

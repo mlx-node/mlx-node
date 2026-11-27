@@ -13,7 +13,7 @@ import { mergeRunState, parseRunState } from '../src/agent-sessions/run-state.js
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { readPdfCommand } from '../src/chat/agent/pdf-tool.js';
-import type { AgentEnd, AgentNow, AgentRow } from '../ui/src/lib/agents.js';
+import { type AgentEnd, type AgentNow, type AgentRow, agentsNow, runAgents } from '../ui/src/lib/agents.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ConversationEvent, RunBy, RunView } from '../ui/src/lib/chat-types.js';
@@ -354,6 +354,61 @@ describe('counts, budget and the glance line', () => {
     expect(summaryWords(run({ status: 'complete' }), agents).join(' · ')).toBe(
       '3 steps · 3 agents · 1 retry · 14.9M tokens used',
     );
+  });
+
+  // Mutation: count a row's tokens only with a roster → a run whose roster was never stored reads no tokens used.
+  it("an ended run's summary counts a retried agent with no roster by its attempts' billed tokens", () => {
+    const line = (ms: number, update: object) =>
+      JSON.stringify({
+        timestamp: Math.floor(ms / 1000),
+        method: '_x.ai/session/update',
+        params: { sessionId: 's', update, _meta: { eventId: `s-${ms}`, agentTimestampMs: ms } },
+      });
+    const spawn = (ms: number, id: string, extra: object = {}) =>
+      line(ms, {
+        sessionUpdate: 'subagent_spawned',
+        subagent_id: id,
+        child_session_id: id,
+        description: 'alpha',
+        workflow_run_id: RUN,
+        ...extra,
+      });
+    const end = (ms: number, id: string, total: number) =>
+      line(ms, {
+        sessionUpdate: 'subagent_finished',
+        subagent_id: id,
+        child_session_id: id,
+        status: 'completed',
+        tool_calls: 1,
+        turns: 1,
+        duration_ms: 100,
+        tokens_used: 13,
+        total_tokens_used: total,
+      });
+    const entries = parseUpdates(
+      `${[
+        line(T0, { sessionUpdate: 'workflow_updated', run_id: RUN, revision: 1, name: 'probe', status: 'active' }),
+        spawn(T0 + 10, 'a1'),
+        end(T0 + 400, 'a1', 43),
+        spawn(T0 + 450, 'a2', { resumed_from: 'a1', retry_of: 'a1' }),
+        end(T0 + 600, 'a2', 13),
+        line(T0 + 700, {
+          sessionUpdate: 'workflow_updated',
+          run_id: RUN,
+          revision: 2,
+          name: 'probe',
+          status: 'complete',
+        }),
+      ].join('\n')}\n`,
+    ).transcript;
+    const entry = entries.find((e): e is RunEntry => e.kind === 'workflow')!;
+    const agents = agentsNow(runAgents(entries).get(RUN)!, { live: false, now: 0, open: false });
+    expect(agents.map(({ row }) => [row.attempts, row.roster])).toEqual([[['a1', 'a2'], null]]);
+    expect(summaryWords(entry, agents)).toEqual([
+      CHAT.run.summary.agentsOne,
+      CHAT.run.summary.retriesOne,
+      fill(CHAT.run.summary.tokens, { tokens: '56' }),
+    ]);
   });
 
   it('the Stop confirm says how many agents stop', () => {

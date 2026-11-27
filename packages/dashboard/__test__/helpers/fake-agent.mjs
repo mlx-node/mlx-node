@@ -2000,6 +2000,7 @@ function endRunAgent(run, agent, status, fields = {}) {
       turns: 1,
       duration_ms: Date.now() - run.startedAt,
       tokens_used: agent.tokens,
+      total_tokens_used: agent.tokens,
       will_wake: false,
       ...fields,
     },
@@ -2013,7 +2014,12 @@ function endRunAgent(run, agent, status, fields = {}) {
  */
 function cancelRunAgent(run, agent) {
   agent.state = 'failed';
-  endRunAgent(run, agent, 'cancelled', { error: 'Subagent was cancelled', tool_calls: 0, tokens_used: 0 });
+  endRunAgent(run, agent, 'cancelled', {
+    error: 'Subagent was cancelled',
+    tool_calls: 0,
+    tokens_used: 0,
+    total_tokens_used: 0,
+  });
   workflowUpdate(run);
 }
 
@@ -2237,6 +2243,7 @@ function endHelpers(run, cancelled) {
         turns: 0,
         duration_ms: Date.now() - run.startedAt,
         tokens_used: 0,
+        total_tokens_used: 0,
         will_wake: false,
       },
       true,
@@ -3821,6 +3828,7 @@ function helperStep(session, h, toolCallId) {
         turns: 2,
         duration_ms: Date.now() - startedAt,
         tokens_used: 1200,
+        total_tokens_used: 3400,
         ...(status === 'completed' ? { output: 'Found it.' } : {}),
         will_wake: wake,
       },
@@ -4306,6 +4314,7 @@ async function fireSchedule(session, taskId, prompt, every, s) {
       turns: 1,
       duration_ms: Date.now() - startedAt,
       tokens_used: 900,
+      total_tokens_used: 2600,
       output: 'Checked.',
       will_wake: false,
     },

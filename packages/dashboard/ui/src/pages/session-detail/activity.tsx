@@ -522,9 +522,9 @@ function Subagents({
     },
     {
       id: 'tokens',
-      header: 'Tokens',
-      cell: (row) => <span className="tabular-nums">{formatNumber(row.entry?.tokens ?? null)}</span>,
-      sortValue: (row) => row.entry?.tokens ?? null,
+      header: 'Tokens used',
+      cell: (row) => <span className="tabular-nums">{formatNumber(row.entry?.tokensUsed ?? null)}</span>,
+      sortValue: (row) => row.entry?.tokensUsed ?? null,
       align: 'end',
       width: 88,
       minTableWidth: 640,

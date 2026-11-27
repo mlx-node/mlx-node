@@ -2304,6 +2304,8 @@ export class TranscriptReducer {
         if (durationMs !== null) entry.durationMs = durationMs;
         const tokens = num(update.tokens_used);
         if (tokens !== null) entry.tokens = tokens;
+        const tokensUsed = num(update.total_tokens_used);
+        if (tokensUsed !== null && tokensUsed > 0) entry.tokensUsed = tokensUsed;
         const toolCalls = num(update.tool_calls);
         if (toolCalls !== null) entry.toolCalls = toolCalls;
         const turns = num(update.turns);
