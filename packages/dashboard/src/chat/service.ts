@@ -71,7 +71,7 @@ import { PermissionDraft } from './draft-mode.js';
 import { readWorkIndexSync, writeWorkIndex, type WorkIndex } from './index-file.js';
 import { readModelWindowsSync, writeModelWindows } from './model-windows.js';
 import { removeChatPromptHistory, type ChatPaths } from './paths.js';
-import { PdfStore, readPdfMeta, removeSessionPdfs } from './pdf-store.js';
+import { PdfStore, readPdfMeta, removePdf, removeSessionPdfs } from './pdf-store.js';
 import {
   changedSettings,
   markOf,
@@ -84,7 +84,7 @@ import {
 } from './permission-log.js';
 import type { ProvidersService } from './providers/service.js';
 import type { ProviderSource } from './providers/source.js';
-import { ConversationQueue, QUEUE_FULL_MESSAGE } from './queue.js';
+import { ConversationQueue, QUEUE_FULL_MESSAGE, type QueueRow } from './queue.js';
 import { needleList, redactText } from './redact.js';
 import { answerEnd, planFiles, rewindCounts, targetOf } from './rewind-target.js';
 import { chatRouteError, folderNotMadeError, routeError, workGitError } from './route-errors.js';
@@ -1416,8 +1416,10 @@ export class ChatService {
   async queueRemove(id: string, rowId: string): Promise<Record<string, never>> {
     const conversation = await this.known(id);
     const queue = this.queues.get(id);
-    if (queue === undefined || !queue.remove(rowId)) throw ApiError.notFound(QUEUE_ROW_GONE);
+    const row = queue?.row(rowId);
+    if (queue === undefined || row === undefined || !queue.remove(rowId)) throw ApiError.notFound(QUEUE_ROW_GONE);
     this.queueChanged(conversation, queue);
+    await this.dropQueuedPdfs(conversation, queue, [row]);
     return {};
   }
 
@@ -1425,9 +1427,31 @@ export class ChatService {
     const conversation = await this.known(id);
     const queue = this.queues.get(id);
     if (queue === undefined || (queue.size === 0 && queue.held === null)) return {};
+    const before = queue.stored();
     queue.clear();
     this.queueChanged(conversation, queue);
+    const left = new Set(queue.stored().map((r) => r.id));
+    const gone = before.filter((r) => !left.has(r.id));
+    await this.dropQueuedPdfs(conversation, queue, gone);
     return {};
+  }
+
+  /**
+   * The page folders of the PDFs for the tool that the removed rows `rows` carried: placed at their Send, they go with
+   * the row unless a row still queued or a message of the conversation names them.
+   */
+  private async dropQueuedPdfs(conv: Conversation, queue: ConversationQueue, rows: readonly QueueRow[]): Promise<void> {
+    const toolPdfs = (of: readonly QueueRow[]) =>
+      new Set(of.flatMap((r) => r.attachments.filter(isToolPdf).map((a) => pdfToolId(a.stage, a.pages))));
+    const ids = toolPdfs(rows);
+    if (ids.size === 0) return;
+    if (!conv.hasBase()) await this.loadBase(conv).catch(() => {});
+    if (!conv.hasBase()) return;
+    const kept = toolPdfs(queue.stored());
+    for (const pdf of ids) {
+      if (kept.has(pdf) || conv.toolPdf(pdf) !== null) continue;
+      await removePdf(this.opts.paths.workPdf, pdf, conv.info.id).catch(() => {});
+    }
   }
 
   /**

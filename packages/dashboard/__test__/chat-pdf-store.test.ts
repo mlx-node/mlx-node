@@ -28,6 +28,7 @@ import {
   pageFile,
   PdfStore,
   readPdfMeta,
+  removePdf,
   removeSessionPdfs,
   STAGE_MAX_AGE_MS,
 } from '../src/chat/pdf-store.js';
@@ -172,6 +173,17 @@ describe('what goes', () => {
     expect(readdirSync(folder).sort()).toEqual([theirs!, 'notes'].sort());
     expect([mine, also].every((id) => id !== null && !existsSync(join(folder, id)))).toBe(true);
     await removeSessionPdfs(join(root, 'none'), 'session-a');
+  });
+
+  // Mutation: one folder removed whatever session its meta.json names → red.
+  it("a queued row's removal takes its page folder only when the folder is that conversation's", async () => {
+    const store = new PdfStore(stages);
+    const id = (await store.place(await staged(store, 2), 2, folder, 'session-a', 'a.pdf'))!;
+    await removePdf(folder, id, 'session-b');
+    expect(existsSync(join(folder, id))).toBe(true);
+    await removePdf(folder, id, 'session-a');
+    expect(existsSync(join(folder, id))).toBe(false);
+    await removePdf(folder, id, 'session-a');
   });
 
   // Mutation: the sweep removes a stage this run holds → red.

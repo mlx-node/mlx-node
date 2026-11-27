@@ -1230,6 +1230,57 @@ describe('Chat service — attachments', () => {
       );
     }, 30_000);
 
+    // Mutations: a removed row's page folder kept, on Remove or on Clear; a folder removed that a sent message names,
+    // or that a row still queued carries → red.
+    it('Work: a queued row that is removed or cleared takes its page folder, unless a message or a row names it', async () => {
+      let gate = '';
+      const hold = (scenario: Json) => {
+        gate = join(String(scenario.recordTo), '..', 'gate');
+        const end = [{ text: 'Done.', chunk: 5 }, { end: { stopReason: 'end_turn' } }];
+        scenario.prompts = [{ match: 'hold', steps: [{ holdOn: gate }, ...end] }, ...(scenario.prompts as Json[])];
+      };
+      await withWork(
+        'work-always',
+        async (fake, project) => {
+          const svc = fake.service;
+          const folder = (stage: string, pages: number) => join(fake.paths.workPdf, pdfToolId(stage, pages));
+          const sent = await staged(svc, 2);
+          const created = await svc.create({ mode: 'work', text: 'hold', cwd: project, attachments: [tool(sent, 2)] });
+          const id = created.conversation.id;
+          const page = new Page(svc, id);
+          await until(() => prompts(fake).length === 1, 5_000);
+          const queued = async (stage: string, pages: number): Promise<string> => {
+            const reply = await svc.prompt(id, 'later', [tool(stage, pages)], undefined, 'queue');
+            if (!('queued' in reply)) throw new Error('not queued');
+            return reply.queued;
+          };
+          const [a, b, twice] = [await staged(svc, 3), await staged(svc, 2), await staged(svc, 4)];
+          const rowA = await queued(a, 3);
+          await queued(b, 2);
+          const rowSent = await queued(sent, 2);
+          const rowTwice = await queued(twice, 4);
+          await queued(twice, 4);
+          const on = () =>
+            [folder(sent, 2), folder(a, 3), folder(b, 2), folder(twice, 4)].map((path) => existsSync(path));
+          expect(on()).toEqual([true, true, true, true]);
+          await svc.queueRemove(id, rowA);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueRemove(id, rowSent);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueRemove(id, rowTwice);
+          expect(on()).toEqual([true, false, true, true]);
+          await svc.queueClear(id);
+          expect(on()).toEqual([true, false, false, false]);
+          writeFileSync(gate, '');
+          await until(() => page.ends().length === 1, 5_000);
+          page.detach();
+          await svc.delete(id);
+          expect(on()).toEqual([false, false, false, false]);
+        },
+        { endpointModels: [SEES], mutate: hold },
+      );
+    }, 20_000);
+
     it('is refused in Chat, with a stage that is not complete, and on a model that does not see images', async () => {
       await withWork(
         'work-always',

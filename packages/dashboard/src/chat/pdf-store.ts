@@ -84,6 +84,12 @@ export async function readPdfMeta(folder: string, id: string): Promise<PdfMeta |
   }
 }
 
+/** Removes the page folder `id` under `folder` when its `meta.json` names `session`. */
+export async function removePdf(folder: string, id: string, session: string): Promise<void> {
+  if ((await readPdfMeta(folder, id))?.session === session)
+    await rm(join(folder, id), { recursive: true, force: true });
+}
+
 /** Removes every page folder under `folder` whose `meta.json` names `session`. */
 export async function removeSessionPdfs(folder: string, session: string): Promise<void> {
   let names: string[];
