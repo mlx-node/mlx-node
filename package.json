@@ -30,21 +30,21 @@
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/tts": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
-    "@napi-rs/cli": "~3.8.6",
+    "@napi-rs/cli": "~3.11.0",
     "@napi-rs/simple-git": "^1.2.0",
     "@oxc-node/cli": "^1.0.1",
     "@oxc-node/core": "^1.0.1",
     "@types/node": "^26.6.6",
     "octokit": "^5.0.5",
-    "openai": "7.53.0",
-    "oxc-parser": "^0.157.0",
+    "openai": "7.65.0",
+    "oxc-parser": "^0.160.0",
     "typescript": "^7.0.2",
     "vite": "catalog:",
     "vite-plus": "catalog:"
   },
   "resolutions": {
     "@yarnpkg/core/got": "npm:got@^16.0.0",
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.6.0"
   },
-  "packageManager": "yarn@4.18.1"
+  "packageManager": "yarn@4.19.0"
 }
