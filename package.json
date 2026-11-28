@@ -44,7 +44,7 @@
   },
   "resolutions": {
     "@yarnpkg/core/got": "npm:got@^16.0.0",
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@8.3.8001"
   },
   "packageManager": "yarn@4.18.1"
 }
