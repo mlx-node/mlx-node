@@ -12,6 +12,22 @@ function deferred<T = void>() {
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms waiting for ${label}`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 describe('ModelWorkCoordinator', () => {
   it('lets inference readers overlap', async () => {
     const coordinator = new ModelWorkCoordinator();
@@ -189,5 +205,266 @@ describe('ModelWorkCoordinator', () => {
     releaseWrite.resolve();
     await Promise.all([read1, write, read2]);
     expect(events).toEqual(['read1:start', 'read1:end', 'write:start', 'write:end', 'read2:start']);
+  });
+
+  it('wakes parked readers immediately when the only queued writer aborts behind an active reader', async () => {
+    const coordinator = new ModelWorkCoordinator();
+    const releaseRead1 = deferred();
+    const events: string[] = [];
+
+    const read1 = coordinator.withInference(async () => {
+      events.push('read1:start');
+      await releaseRead1.promise;
+      events.push('read1:end');
+    });
+    try {
+      await tick();
+
+      const abortWriter = new AbortController();
+      const write = coordinator.withModelLoad(
+        async () => {
+          events.push('write:start');
+        },
+        'aborted-model',
+        abortWriter.signal,
+      );
+      const read2 = coordinator.withInference(async () => {
+        events.push('read2:start');
+      });
+
+      await tick();
+      expect(coordinator.waitingWriters).toBe(1);
+      expect(events).toEqual(['read1:start']);
+
+      abortWriter.abort();
+      await withDeadline(expect(write).rejects.toThrow(), 2_000, 'aborted writer rejection');
+      await withDeadline(read2, 2_000, 'parked reader wake-up');
+
+      // read2 must have run while read1 is still active.
+      expect(coordinator.waitingWriters).toBe(0);
+      expect(coordinator.readerCount).toBe(1);
+      expect(coordinator.lastLoad).toBeNull();
+      expect(events).toEqual(['read1:start', 'read2:start']);
+    } finally {
+      releaseRead1.resolve();
+      await withDeadline(read1, 2_000, 'read1 completion');
+    }
+    expect(events).toEqual(['read1:start', 'read2:start', 'read1:end']);
+  });
+
+  it('keeps parked readers waiting until every queued writer ahead of them aborts or completes', async () => {
+    const coordinator = new ModelWorkCoordinator();
+    const releaseRead1 = deferred();
+    const events: string[] = [];
+
+    const read1 = coordinator.withInference(async () => {
+      events.push('read1:start');
+      await releaseRead1.promise;
+      events.push('read1:end');
+    });
+    try {
+      await tick();
+
+      const abortW1 = new AbortController();
+      const abortW2 = new AbortController();
+      const w1 = coordinator.withModelLoad(
+        async () => {
+          events.push('w1:start');
+        },
+        'm1',
+        abortW1.signal,
+      );
+      const w2 = coordinator.withModelLoad(
+        async () => {
+          events.push('w2:start');
+        },
+        'm2',
+        abortW2.signal,
+      );
+      const read2 = coordinator.withInference(async () => {
+        events.push('read2:start');
+      });
+
+      await tick();
+      expect(coordinator.waitingWriters).toBe(2);
+      expect(events).toEqual(['read1:start']);
+
+      abortW1.abort();
+      await withDeadline(expect(w1).rejects.toThrow(), 2_000, 'w1 abort');
+      await tick();
+      // w2 is still queued, so writer-preference fairness keeps read2 parked.
+      expect(coordinator.waitingWriters).toBe(1);
+      expect(events).toEqual(['read1:start']);
+
+      abortW2.abort();
+      await withDeadline(expect(w2).rejects.toThrow(), 2_000, 'w2 abort');
+      await withDeadline(read2, 2_000, 'read2 wake-up after w2 abort');
+      expect(coordinator.waitingWriters).toBe(0);
+      expect(events).toEqual(['read1:start', 'read2:start']);
+    } finally {
+      releaseRead1.resolve();
+      await withDeadline(read1, 2_000, 'read1 completion');
+    }
+  });
+
+  it('rejects a parked reader sharing the aborted signal with the last queued writer while waking live readers', async () => {
+    const coordinator = new ModelWorkCoordinator();
+    const releaseRead1 = deferred();
+    const releaseLiveRead = deferred();
+    const events: string[] = [];
+
+    const read1 = coordinator.withInference(async () => {
+      events.push('read1:start');
+      await releaseRead1.promise;
+      events.push('read1:end');
+    });
+    let liveReader: Promise<void> | undefined;
+    try {
+      await tick();
+
+      const sharedAbort = new AbortController();
+      const writer = coordinator.withModelLoad(
+        async () => {
+          events.push('writer:start');
+        },
+        'm1',
+        sharedAbort.signal,
+      );
+      const cancelledReader = coordinator.withInference(async () => {
+        events.push('cancelledReader:start');
+      }, sharedAbort.signal);
+      liveReader = coordinator.withInference(async () => {
+        events.push('liveReader:start');
+        await releaseLiveRead.promise;
+        events.push('liveReader:end');
+      });
+
+      await tick();
+      expect(coordinator.waitingWriters).toBe(1);
+      expect(events).toEqual(['read1:start']);
+
+      sharedAbort.abort();
+      await withDeadline(expect(writer).rejects.toThrow(), 2_000, 'shared writer abort');
+      await withDeadline(expect(cancelledReader).rejects.toThrow(), 2_000, 'shared reader abort');
+      await tick();
+
+      // Only liveReader woke; cancelledReader never ran and did not inflate readerCount.
+      expect(coordinator.waitingWriters).toBe(0);
+      expect(coordinator.readerCount).toBe(2);
+      expect(events).toEqual(['read1:start', 'liveReader:start']);
+    } finally {
+      releaseLiveRead.resolve();
+      releaseRead1.resolve();
+      const pending = liveReader ? [liveReader, read1] : [read1];
+      await withDeadline(Promise.allSettled(pending), 2_000, 'reader cleanup').catch(() => {});
+    }
+    expect(coordinator.readerCount).toBe(0);
+    expect(events).toEqual(['read1:start', 'liveReader:start', 'liveReader:end', 'read1:end']);
+  });
+
+  it('aborts without running fn or writing lastLoad when signal aborts after writer handoff before microtask resumes', async () => {
+    for (const instrumented of [false, true]) {
+      const coordinator = new ModelWorkCoordinator();
+      const releaseFirst = deferred();
+      const abortSecond = new AbortController();
+      const events: string[] = [];
+      let sawGrantedBeforeAbort = false;
+
+      const first = coordinator.withModelLoad(async () => {
+        events.push('first:start');
+        await releaseFirst.promise;
+        events.push('first:end');
+        // Queue a 2-hop microtask: hop 1 runs just before `withModelLoad`'s
+        // `finally -> releaseWrite() -> drain()` grants `second`, so hop 2
+        // lands strictly AFTER `grant()` removed `onAbort` and BEFORE
+        // `second`'s `await acquireWrite(signal)` continuation resumes.
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            sawGrantedBeforeAbort = coordinator.writerActive && coordinator.waitingWriters === 1;
+            abortSecond.abort();
+          });
+        });
+      }, 'first-model');
+      try {
+        await tick();
+
+        const second = instrumented
+          ? coordinator.withModelLoadInstrumented(
+              async () => {
+                events.push('second:start');
+              },
+              'second-model',
+              abortSecond.signal,
+            )
+          : coordinator.withModelLoad(
+              async () => {
+                events.push('second:start');
+              },
+              'second-model',
+              abortSecond.signal,
+            );
+        let lastLoadWhenThirdStarted: ModelWorkCoordinator['lastLoad'] = null;
+        const third = coordinator.withModelLoad(async () => {
+          lastLoadWhenThirdStarted = coordinator.lastLoad;
+          events.push('third:start');
+        }, 'third-model');
+        await tick();
+
+        releaseFirst.resolve();
+
+        await withDeadline(expect(second).rejects.toThrow(), 2_000, 'post-handoff second abort');
+        await withDeadline(Promise.all([first, third]), 2_000, 'first and third writers');
+
+        expect(sawGrantedBeforeAbort).toBe(true);
+        expect(lastLoadWhenThirdStarted).toMatchObject({ label: 'first-model', ok: true, error: null });
+        expect(events).toEqual(['first:start', 'first:end', 'third:start']);
+        expect(coordinator.writerActive).toBe(false);
+        expect(coordinator.waitingWriters).toBe(0);
+        expect(coordinator.lastLoad).toMatchObject({ label: 'third-model', ok: true });
+      } finally {
+        releaseFirst.resolve();
+        await withDeadline(first, 2_000, 'first writer cleanup');
+      }
+    }
+  });
+
+  it('aborts withInference without running fn if signal aborts after reader grant before microtask resumes', async () => {
+    const coordinator = new ModelWorkCoordinator();
+    const releaseWrite = deferred();
+    const abortRead = new AbortController();
+    const events: string[] = [];
+    let sawReaderGrantedBeforeAbort = false;
+
+    const write = coordinator.withModelLoad(async () => {
+      events.push('write:start');
+      await releaseWrite.promise;
+      events.push('write:end');
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          sawReaderGrantedBeforeAbort = coordinator.readerCount === 1;
+          abortRead.abort();
+        });
+      });
+    }, 'm1');
+    try {
+      await tick();
+
+      const cancelledRead = coordinator.withInference(async () => {
+        events.push('cancelledRead:start');
+      }, abortRead.signal);
+      await tick();
+
+      releaseWrite.resolve();
+
+      await withDeadline(expect(cancelledRead).rejects.toThrow(), 2_000, 'post-grant reader abort');
+      await withDeadline(write, 2_000, 'write completion');
+
+      expect(sawReaderGrantedBeforeAbort).toBe(true);
+      expect(events).toEqual(['write:start', 'write:end']);
+      expect(coordinator.readerCount).toBe(0);
+    } finally {
+      releaseWrite.resolve();
+      await withDeadline(write, 2_000, 'write cleanup');
+    }
   });
 });

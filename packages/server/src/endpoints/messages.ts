@@ -104,6 +104,7 @@ import { withNestedArguments } from '../mappers/tool-arguments.js';
 import type { TurnBudgetFrom } from '../metrics-trace.js';
 import {
   type ModelLoadAdmission,
+  ModelLoadCancelledError,
   ModelLoadQueueFullError,
   type ModelWorkCoordinator,
 } from '../model-work-coordinator.js';
@@ -1431,118 +1432,58 @@ export async function handleCreateMessage(
     }
   }
 
-  // Lazy-load hook for a requested name with no resident registry: give the
-  // host a chance to register it before we look it up. Resident requests skip
-  // this writer bracket so they can reach the continuous-batching lane.
-  //
-  // The load is bracketed by `idleSweeper.withSuspendedDrains` so the
-  // post-request drain timer armed by the PREVIOUS request's
-  // `endRequest()` cannot fire mid-load. In `mlx launch claude` mode
-  // `resolveModel` may invoke a 30s `loadModel()` on first sight of an
-  // unknown name; if the prior request's matching `endRequest()`
-  // armed the default 30s drain immediately before this load began,
-  // the timer would otherwise call `clearCache()` while weight
-  // materialization was still allocating through the Metal free pool —
-  // exactly the hot-load race `withSuspendedDrains` exists to prevent.
-  // The wrapper handles try/finally itself and is a pass-through on
-  // the disabled sweeper, so the bracket is unconditional whenever
-  // a sweeper is supplied.
-  if (resolveModel && !preDispatchRegistry) {
-    // A throw here (bad model path, corrupt weights, native loader failure)
-    // would otherwise bubble up to the outer `createHandler` catch which
-    // emits the OpenAI-shape `{ error: ... }` envelope via `sendInternalError`.
-    // This endpoint is Anthropic; clients parse the
-    // `{ type: 'error', error: { type, message } }` shape, so we must
-    // serialize the failure through `sendAnthropicInternalError` here. Mirrors
-    // the `mapAnthropicRequest` try/catch above.
-    try {
-      const resolveStartedAt = Date.now();
-      const runResolve = () =>
-        idleSweeper ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model)) : resolveModel(body.model);
-      if (modelWorkCoordinator) {
-        // Use the instrumented variant so we can tell whether this
-        // request actually drove the load (owner) or merely parked
-        // behind a peer's in-flight load. Without the split, two
-        // requests racing into a 60s cold-load both report
-        // `resolve_ms=60000` and observers can't tell which one paid
-        // the cost vs. inherited the wait.
-        //
-        // The coordinator internally partitions the call into a wait
-        // phase (`acquireWrite()`) and an own-execution phase (`fn`)
-        // so `waitMs + ownMs` covers the total elapsed time without
-        // overlap. We plumb them straight through into the matching
-        // observability fields:
-        //  - owner driving a cold load → waitMs ≈ 0, ownMs ≈ load duration
-        //  - follower parked behind peer → waitMs ≈ peer load, ownMs ≈ 0
-        // Resident requests bypass this block entirely and therefore omit all
-        // three load-timing fields.
-        // This matches the documented contract in `timing.ts` where
-        // `server_model_resolve_ms` excludes peer-wait time.
-        const outcome = await modelWorkCoordinator.withModelLoadInstrumented(runResolve);
-        serverLoadOwner = outcome.owner;
-        serverLoadWaitMs = outcome.waitMs;
-        serverModelResolveMs = outcome.ownMs;
-      } else {
-        await runResolve();
-        serverModelResolveMs = Date.now() - resolveStartedAt;
-      }
-    } catch (err) {
-      preDispatchAdmission?.release();
-      modelLoadAdmission?.release();
-      sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
-      return;
-    }
-  }
-  // NOTE: the permit is NOT released here. The request must stay counted
-  // through the remaining pre-lock work until `withExclusive` consumes
-  // the permit at placement. Only bail-out exits release.
-
-  const model = registry.get(body.model);
-  if (!model) {
-    preDispatchAdmission?.release();
-    modelLoadAdmission?.release();
-    sendAnthropicNotFound(res, `Model "${body.model}" not found`);
-    return;
-  }
-
-  // The lease keeps the binding's FIFO `execLock` chain alive across every
-  // await — a concurrent `unregister()` + `register(sameModel)` would otherwise
-  // tear down the old `SessionRegistry` and race two independent mutex chains
-  // against one shared native model. Must be released in the `finally` below.
-  const lease = registry.acquireDispatchLease(body.model);
-  if (!lease) {
-    preDispatchAdmission?.release();
-    modelLoadAdmission?.release();
-    sendAnthropicInternalError(res, 'session registry missing for registered model');
-    return;
-  }
-  const leaseModel = lease.model;
-  if (modelLoadAdmission) {
-    try {
-      preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
-    } catch (err) {
-      registry.releaseDispatchLease(leaseModel);
-      modelLoadAdmission.release();
-      if (err instanceof QueueFullError) {
-        sendAnthropicRateLimit(res, `${err.message}. Retry after 1s.`);
-        return;
-      }
-      throw err;
-    }
-  }
   // AbortController wired to disconnect events. Declared at function scope
-  // so the outer `finally` can detach listeners on early returns; the
+  // so the outer `finally` can detach listeners on early returns (including
+  // disconnects while parked behind another model load); the
   // `abortListenersAttached` flag gates the detach so pre-validation exits
   // skip it safely.
   const abortController = new AbortController();
-  const abortSocket = res.socket;
+  const abortReq = httpReq ?? (res as { req?: IncomingMessage }).req;
+  const abortSocket = res.socket ?? abortReq?.socket ?? null;
   const onAbortClose = (): void => {
     abortController.abort();
+  };
+  const onAbortReqClose = (): void => {
+    if (abortReq?.complete !== true) {
+      abortController.abort();
+    }
   };
   const onAbortError = (_err: unknown): void => {
     abortController.abort();
   };
+  const isTransportDisconnected = (): boolean =>
+    abortController.signal.aborted ||
+    res.destroyed ||
+    res.writableEnded ||
+    abortSocket?.destroyed === true ||
+    abortReq?.aborted === true;
   let abortListenersAttached = false;
+  const armAbortListeners = (): void => {
+    if (abortListenersAttached) return;
+    res.once('close', onAbortClose);
+    res.once('error', onAbortError);
+    if (abortSocket != null) {
+      abortSocket.once('close', onAbortClose);
+    }
+    if (abortReq) {
+      abortReq.once('aborted', onAbortClose);
+      abortReq.once('close', onAbortReqClose);
+      abortReq.once('error', onAbortError);
+    }
+    // Catch-up abort: a response torn down BEFORE the attach above has
+    // already emitted its terminal event, so the `once('close')`
+    // listeners will never fire. Consult the response-side socket state
+    // directly (a fully consumed IncomingMessage auto-destroys after 'end'
+    // on every normal request, so `abortReq.destroyed` is not a disconnect
+    // signal — only `abortReq.aborted` is). Makes `streamSignal.aborted`
+    // authoritative for pre-load and pre-dispatch disconnect checks.
+    if (isTransportDisconnected()) {
+      abortController.abort();
+    }
+    abortListenersAttached = true;
+  };
+  let acquiredLeaseModel: SessionCapableModel | undefined;
+  let leaseReleased = false;
   // Idle-sweeper bracket flags — hoisted so the outer `finally` can
   // observe whether the `beginRequest()` bump ever happened. Early
   // validation-failure returns skip the bump and therefore also skip
@@ -1571,31 +1512,123 @@ export async function handleCreateMessage(
   const onFinalizeEvent = (): void => {
     finalizeIdleRequest();
   };
+
   try {
-    const armAbortListeners = (): void => {
-      if (abortListenersAttached) return;
-      res.once('close', onAbortClose);
-      res.once('error', onAbortError);
-      if (abortSocket != null) {
-        abortSocket.once('close', onAbortClose);
-      }
-      if (httpReq) {
-        httpReq.once('close', onAbortClose);
-        httpReq.once('error', onAbortError);
-      }
-      // Catch-up abort: a response torn down BEFORE the attach above has
-      // already emitted its terminal event, so the `once('close')`
-      // listeners will never fire. Consult the response-side socket state
-      // directly (the REQUEST side is deliberately excluded — a fully
-      // consumed IncomingMessage auto-destroys after 'end' on every
-      // normal request, so `httpReq.destroyed` is not a disconnect
-      // signal). Makes `streamSignal.aborted` authoritative for the H2
-      // pre-dispatch disconnect check inside the mutex callback.
-      if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+    // Lazy-load hook for a requested name with no resident registry: give the
+    // host a chance to register it before we look it up. Resident requests skip
+    // this writer bracket so they can reach the continuous-batching lane.
+    //
+    // The load is bracketed by `idleSweeper.withSuspendedDrains` so the
+    // post-request drain timer armed by the PREVIOUS request's
+    // `endRequest()` cannot fire mid-load. In `mlx launch claude` mode
+    // `resolveModel` may invoke a 30s `loadModel()` on first sight of an
+    // unknown name; if the prior request's matching `endRequest()`
+    // armed the default 30s drain immediately before this load began,
+    // the timer would otherwise call `clearCache()` while weight
+    // materialization was still allocating through the Metal free pool —
+    // exactly the hot-load race `withSuspendedDrains` exists to prevent.
+    // The wrapper handles try/finally itself and is a pass-through on
+    // the disabled sweeper, so the bracket is unconditional whenever
+    // a sweeper is supplied.
+    if (resolveModel && !preDispatchRegistry) {
+      armAbortListeners();
+      if (isTransportDisconnected()) {
         abortController.abort();
+        return;
       }
-      abortListenersAttached = true;
-    };
+      // A throw here (bad model path, corrupt weights, native loader failure)
+      // would otherwise bubble up to the outer `createHandler` catch which
+      // emits the OpenAI-shape `{ error: ... }` envelope via `sendInternalError`.
+      // This endpoint is Anthropic; clients parse the
+      // `{ type: 'error', error: { type, message } }` shape, so we must
+      // serialize the failure through `sendAnthropicInternalError` here. Mirrors
+      // the `mapAnthropicRequest` try/catch above.
+      try {
+        const resolveStartedAt = Date.now();
+        const runResolve = () => {
+          if (isTransportDisconnected()) {
+            abortController.abort();
+            throw new ModelLoadCancelledError();
+          }
+          return idleSweeper
+            ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model))
+            : resolveModel(body.model);
+        };
+        if (modelWorkCoordinator) {
+          // Use the instrumented variant so we can tell whether this
+          // request actually drove the load (owner) or merely parked
+          // behind a peer's in-flight load. Without the split, two
+          // requests racing into a 60s cold-load both report
+          // `resolve_ms=60000` and observers can't tell which one paid
+          // the cost vs. inherited the wait.
+          //
+          // The coordinator internally partitions the call into a wait
+          // phase (`acquireWrite()`) and an own-execution phase (`fn`)
+          // so `waitMs + ownMs` covers the total elapsed time without
+          // overlap. We plumb them straight through into the matching
+          // observability fields:
+          //  - owner driving a cold load → waitMs ≈ 0, ownMs ≈ load duration
+          //  - follower parked behind peer → waitMs ≈ peer load, ownMs ≈ 0
+          // Resident requests bypass this block entirely and therefore omit all
+          // three load-timing fields.
+          // This matches the documented contract in `timing.ts` where
+          // `server_model_resolve_ms` excludes peer-wait time.
+          const outcome = await modelWorkCoordinator.withModelLoadInstrumented(
+            runResolve,
+            undefined,
+            abortController.signal,
+          );
+          serverLoadOwner = outcome.owner;
+          serverLoadWaitMs = outcome.waitMs;
+          serverModelResolveMs = outcome.ownMs;
+        } else {
+          await runResolve();
+          serverModelResolveMs = Date.now() - resolveStartedAt;
+        }
+      } catch (err) {
+        if (err instanceof ModelLoadCancelledError || isTransportDisconnected()) {
+          return;
+        }
+        sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
+        return;
+      }
+      if (isTransportDisconnected()) {
+        abortController.abort();
+        return;
+      }
+    }
+    // NOTE: the permit is NOT released here. The request must stay counted
+    // through the remaining pre-lock work until `withExclusive` consumes
+    // the permit at placement. Only bail-out exits release.
+
+    const model = registry.get(body.model);
+    if (!model) {
+      sendAnthropicNotFound(res, `Model "${body.model}" not found`);
+      return;
+    }
+
+    // The lease keeps the binding's FIFO `execLock` chain alive across every
+    // await — a concurrent `unregister()` + `register(sameModel)` would otherwise
+    // tear down the old `SessionRegistry` and race two independent mutex chains
+    // against one shared native model. Must be released in the `finally` below.
+    const lease = registry.acquireDispatchLease(body.model);
+    if (!lease) {
+      sendAnthropicInternalError(res, 'session registry missing for registered model');
+      return;
+    }
+    const leaseModel = lease.model;
+    acquiredLeaseModel = leaseModel;
+    if (modelLoadAdmission) {
+      try {
+        preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
+      } catch (err) {
+        if (err instanceof QueueFullError) {
+          sendAnthropicRateLimit(res, `${err.message}. Retry after 1s.`);
+          return;
+        }
+        throw err;
+      }
+    }
 
     // "Could not process image" with a 400 is what makes the agent strip the request's images and retry.
     const hasImages = mappedMessages.some((message) => (message.images?.length ?? 0) > 0);
@@ -2125,16 +2158,21 @@ export async function handleCreateMessage(
       if (abortSocket != null) {
         abortSocket.removeListener('close', onAbortClose);
       }
-      if (httpReq) {
-        httpReq.removeListener('close', onAbortClose);
-        httpReq.removeListener('error', onAbortError);
+      if (abortReq) {
+        abortReq.removeListener('aborted', onAbortClose);
+        abortReq.removeListener('close', onAbortReqClose);
+        abortReq.removeListener('error', onAbortError);
       }
+      abortListenersAttached = false;
     }
     // Release against the ORIGINAL lease model — re-reading `body.model`
     // would resolve to a possibly hot-swapped binding. A concurrent
     // `unregister()` held against this lease finalises its teardown here
     // when the in-flight counter drops to zero.
-    registry.releaseDispatchLease(leaseModel);
+    if (acquiredLeaseModel !== undefined && !leaseReleased) {
+      leaseReleased = true;
+      registry.releaseDispatchLease(acquiredLeaseModel);
+    }
     // Belt-and-suspenders: call `finalize()` unconditionally here.
     // The eagerly-attached `finish`/`close`/`error` listeners almost
     // always win the race, but we still fire here to cover

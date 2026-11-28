@@ -55,6 +55,7 @@ import {
 } from '../mappers/response.js';
 import {
   type ModelLoadAdmission,
+  ModelLoadCancelledError,
   ModelLoadQueueFullError,
   type ModelWorkCoordinator,
 } from '../model-work-coordinator.js';
@@ -1622,110 +1623,56 @@ export async function handleCreateResponse(
     }
   }
 
-  // Lazy load, exactly as the Anthropic endpoints do, only when the requested
-  // name has no resident registry. Nothing is resident at boot —
-  // `createInferenceHost` only discovers — so without this the very
-  // first `/v1/responses` 404s against a `/v1/models` list that advertises the
-  // model, and a client id that exists only as an alias 404s forever.
-  //
-  // Placement is pinned on both sides. AFTER the pure validation above, so a
-  // 400 cannot burn a 30 s load or evict the resident model. BEFORE
-  // `registry.get` below, and therefore before the dispatch lease, which needs
-  // a registered name.
-  let serverLoadWaitMs: number | undefined;
-  let serverModelResolveMs: number | undefined;
-  if (resolveModel && !preDispatchRegistry) {
-    // Errors serialize through the OpenAI envelope here. Letting them reach
-    // the outer `createHandler` catch would be right for this endpoint by
-    // accident and wrong for the Anthropic one — `messages.ts` has the mirror
-    // of this note for the opposite reason.
-    try {
-      // Suspension OUTSIDE the writer lock, per `load-model.ts`: a load that
-      // parks in `acquireWrite()` must already be covered, or the drain timer
-      // armed by the previous request fires mid-materialization. `messages.ts`
-      // nests these the other way round, which is safe only because
-      // `withSuspendedDrains` is a counter rather than a mutex.
-      const load = async (): Promise<void> => {
-        if (modelWorkCoordinator) {
-          const outcome = await modelWorkCoordinator.withModelLoadInstrumented(
-            () => resolveModel(body.model),
-            'responses',
-          );
-          serverLoadWaitMs = outcome.waitMs;
-          serverModelResolveMs = outcome.ownMs;
-        } else {
-          const resolveStartedAt = Date.now();
-          await resolveModel(body.model);
-          serverModelResolveMs = Date.now() - resolveStartedAt;
-        }
-      };
-      await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
-    } catch (err) {
-      preDispatchAdmission?.release();
-      modelLoadAdmission?.release();
-      sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
-      return;
-    }
-  }
-  // NOTE: the permit is NOT released here. Pre-lock work continues below
-  // (`store.getChain` on continuations can block indefinitely on a slow
-  // store) and the request must stay counted until `withExclusive`
-  // consumes the permit at placement. Only bail-out exits release.
-
-  // Look up model
-  const model = registry.get(body.model);
-  if (!model) {
-    preDispatchAdmission?.release();
-    modelLoadAdmission?.release();
-    sendNotFound(
-      res,
-      `Model "${body.model}" not found. Available models: ${registry
-        .list()
-        .map((m) => m.id)
-        .join(', ')}`,
-    );
-    return;
-  }
-
-  // Dispatch lease keeps the binding (and its FIFO `execLock` chain)
-  // alive across every await in this handler — required because a
-  // concurrent `unregister()` + `register(sameModel)` would otherwise
-  // allocate a fresh `SessionRegistry` and race two independent mutex
-  // chains against one native model. Released in `finally` below.
-  const lease = registry.acquireDispatchLease(body.model);
-  if (!lease) {
-    preDispatchAdmission?.release();
-    modelLoadAdmission?.release();
-    sendInternalError(res, 'session registry missing for registered model');
-    return;
-  }
-  const leaseModel = lease.model;
-  if (modelLoadAdmission) {
-    try {
-      preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
-    } catch (err) {
-      registry.releaseDispatchLease(leaseModel);
-      modelLoadAdmission.release();
-      if (err instanceof QueueFullError) {
-        sendRateLimit(res, `${err.message}. Retry after 1s.`);
-        return;
-      }
-      throw err;
-    }
-  }
   // AbortController wired to disconnect events, declared at handler
   // scope so the outer `finally` can always detach even on early
-  // return. Listeners attach only after the pre-lock validation gates
-  // pass; `abortListenersAttached` guards the detach.
+  // return (including disconnects while parked behind another model
+  // load). `abortListenersAttached` guards the detach.
   const abortController = new AbortController();
-  const abortSocket = res.socket;
+  const abortReq = httpReq ?? (res as { req?: IncomingMessage }).req;
+  const abortSocket = res.socket ?? abortReq?.socket ?? null;
   const onAbortClose = (): void => {
     abortController.abort();
+  };
+  const onAbortReqClose = (): void => {
+    if (abortReq?.complete !== true) {
+      abortController.abort();
+    }
   };
   const onAbortError = (_err: unknown): void => {
     abortController.abort();
   };
+  const isTransportDisconnected = (): boolean =>
+    abortController.signal.aborted ||
+    res.destroyed ||
+    res.writableEnded ||
+    abortSocket?.destroyed === true ||
+    abortReq?.aborted === true;
   let abortListenersAttached = false;
+  const armAbortListeners = (): void => {
+    if (abortListenersAttached) return;
+    res.once('close', onAbortClose);
+    res.once('error', onAbortError);
+    if (abortSocket != null) {
+      abortSocket.once('close', onAbortClose);
+    }
+    if (abortReq) {
+      abortReq.once('aborted', onAbortClose);
+      abortReq.once('close', onAbortReqClose);
+      abortReq.once('error', onAbortError);
+    }
+    // Catch-up abort: a response torn down BEFORE the attach above has
+    // already emitted its terminal event, so the `once('close')`
+    // listeners will never fire. Consult the response-side socket state
+    // directly (a fully consumed IncomingMessage auto-destroys after 'end'
+    // on every normal request, so `abortReq.destroyed` is not a disconnect
+    // signal — only `abortReq.aborted` is). This makes `streamSignal.aborted`
+    // authoritative for pre-load and pre-dispatch disconnect checks.
+    if (isTransportDisconnected()) {
+      abortController.abort();
+    }
+    abortListenersAttached = true;
+  };
+  let acquiredLeaseModel: SessionCapableModel | undefined;
   // `runPostDispatchCleanup` runs eagerly after `withExclusive` returns
   // (so a wedged post-commit persist does not pin abort listeners or
   // the lease) and also idempotently from the outer `finally` for the
@@ -1763,7 +1710,113 @@ export async function handleCreateResponse(
   const onFinalizeEvent = (): void => {
     finalizeIdleRequest();
   };
+
   try {
+    // Lazy load, exactly as the Anthropic endpoints do, only when the requested
+    // name has no resident registry. Nothing is resident at boot —
+    // `createInferenceHost` only discovers — so without this the very
+    // first `/v1/responses` 404s against a `/v1/models` list that advertises the
+    // model, and a client id that exists only as an alias 404s forever.
+    //
+    // Placement is pinned on both sides. AFTER the pure validation above, so a
+    // 400 cannot burn a 30 s load or evict the resident model. BEFORE
+    // `registry.get` below, and therefore before the dispatch lease, which needs
+    // a registered name.
+    let serverLoadWaitMs: number | undefined;
+    let serverModelResolveMs: number | undefined;
+    if (resolveModel && !preDispatchRegistry) {
+      armAbortListeners();
+      if (isTransportDisconnected()) {
+        abortController.abort();
+        return;
+      }
+      // Errors serialize through the OpenAI envelope here. Letting them reach
+      // the outer `createHandler` catch would be right for this endpoint by
+      // accident and wrong for the Anthropic one — `messages.ts` has the mirror
+      // of this note for the opposite reason.
+      try {
+        // Suspension OUTSIDE the writer lock, per `load-model.ts`: a load that
+        // parks in `acquireWrite()` must already be covered, or the drain timer
+        // armed by the previous request fires mid-materialization. `messages.ts`
+        // nests these the other way round, which is safe only because
+        // `withSuspendedDrains` is a counter rather than a mutex.
+        const load = async (): Promise<void> => {
+          const runResolve = () => {
+            if (isTransportDisconnected()) {
+              abortController.abort();
+              throw new ModelLoadCancelledError();
+            }
+            return resolveModel(body.model);
+          };
+          if (modelWorkCoordinator) {
+            const outcome = await modelWorkCoordinator.withModelLoadInstrumented(
+              runResolve,
+              'responses',
+              abortController.signal,
+            );
+            serverLoadWaitMs = outcome.waitMs;
+            serverModelResolveMs = outcome.ownMs;
+          } else {
+            const resolveStartedAt = Date.now();
+            await runResolve();
+            serverModelResolveMs = Date.now() - resolveStartedAt;
+          }
+        };
+        await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
+      } catch (err) {
+        if (err instanceof ModelLoadCancelledError || isTransportDisconnected()) {
+          return;
+        }
+        sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
+        return;
+      }
+      if (isTransportDisconnected()) {
+        abortController.abort();
+        return;
+      }
+    }
+    // NOTE: the permit is NOT released here. Pre-lock work continues below
+    // (`store.getChain` on continuations can block indefinitely on a slow
+    // store) and the request must stay counted until `withExclusive`
+    // consumes the permit at placement. Only bail-out exits release.
+
+    // Look up model
+    const model = registry.get(body.model);
+    if (!model) {
+      sendNotFound(
+        res,
+        `Model "${body.model}" not found. Available models: ${registry
+          .list()
+          .map((m) => m.id)
+          .join(', ')}`,
+      );
+      return;
+    }
+
+    // Dispatch lease keeps the binding (and its FIFO `execLock` chain)
+    // alive across every await in this handler — required because a
+    // concurrent `unregister()` + `register(sameModel)` would otherwise
+    // allocate a fresh `SessionRegistry` and race two independent mutex
+    // chains against one native model. Released in `finally` below.
+    const lease = registry.acquireDispatchLease(body.model);
+    if (!lease) {
+      sendInternalError(res, 'session registry missing for registered model');
+      return;
+    }
+    const leaseModel = lease.model;
+    acquiredLeaseModel = leaseModel;
+    if (modelLoadAdmission) {
+      try {
+        preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
+      } catch (err) {
+        if (err instanceof QueueFullError) {
+          sendRateLimit(res, `${err.message}. Retry after 1s.`);
+          return;
+        }
+        throw err;
+      }
+    }
+
     // Initial snapshot of the live binding. On a continuation we
     // re-read after `await store.getChain()` and reject if the
     // binding moved (hot-swap race guard below). Stateless requests
@@ -2228,30 +2281,6 @@ export async function handleCreateResponse(
     // reconstructed from `priorMessages` (stored `ResponseStore` history) were
     // already validated when originally accepted — re-decoding them on every
     // text-only `previous_response_id` follow-up wastes CPU and stalls latency.
-    const armAbortListeners = (): void => {
-      if (abortListenersAttached) return;
-      res.once('close', onAbortClose);
-      res.once('error', onAbortError);
-      if (abortSocket != null) {
-        abortSocket.once('close', onAbortClose);
-      }
-      if (httpReq) {
-        httpReq.once('close', onAbortClose);
-        httpReq.once('error', onAbortError);
-      }
-      // Catch-up abort: a response torn down BEFORE the attach above has
-      // already emitted its terminal event, so the `once('close')`
-      // listeners will never fire. Consult the response-side socket state
-      // directly (the REQUEST side is deliberately excluded — a fully
-      // consumed IncomingMessage auto-destroys after 'end' on every normal
-      // request, so `httpReq.destroyed` is not a disconnect signal). This
-      // makes `streamSignal.aborted` authoritative for the H2 pre-dispatch
-      // disconnect check inside the mutex callback.
-      if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
-        abortController.abort();
-      }
-      abortListenersAttached = true;
-    };
     const hasNewImages = newInputMessages.some((message) => (message.images?.length ?? 0) > 0);
     if (hasNewImages) {
       armAbortListeners();
@@ -3704,9 +3733,10 @@ export async function handleCreateResponse(
       if (abortSocket != null) {
         abortSocket.removeListener('close', onAbortClose);
       }
-      if (httpReq) {
-        httpReq.removeListener('close', onAbortClose);
-        httpReq.removeListener('error', onAbortError);
+      if (abortReq) {
+        abortReq.removeListener('aborted', onAbortClose);
+        abortReq.removeListener('close', onAbortReqClose);
+        abortReq.removeListener('error', onAbortError);
       }
       abortListenersAttached = false;
     }
@@ -3741,9 +3771,9 @@ export async function handleCreateResponse(
     // `retainBinding` counter so the binding's `modelInstanceId`
     // survives until the pending write has stamped its row
     // durably — see `initiatePersist`.
-    if (!leaseReleased) {
+    if (!leaseReleased && acquiredLeaseModel !== undefined) {
       leaseReleased = true;
-      registry.releaseDispatchLease(leaseModel);
+      registry.releaseDispatchLease(acquiredLeaseModel);
     }
     return true;
   }

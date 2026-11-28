@@ -27,6 +27,20 @@ function describeLoadFailure(error: unknown): string {
 }
 
 /**
+ * Sentinel error thrown by a load wrapper before starting the actual model load
+ * when the client transport is already gone (e.g. `socket.destroyed` flipped
+ * synchronously before the `'close'` event ran). `ModelWorkCoordinator` skips
+ * recording `lastLoad` for this sentinel so a cancelled handoff neither clears
+ * a prior error nor flips `/health` into `'error'`.
+ */
+export class ModelLoadCancelledError extends Error {
+  constructor(message = 'Model load cancelled before start') {
+    super(message);
+    this.name = 'ModelLoadCancelledError';
+  }
+}
+
+/**
  * Result of a `withModelLoad` call that surfaces who actually drove the load
  * vs. who merely parked behind one that was already in flight. Callers use
  * this to split observability between the request that triggered a cold
@@ -106,8 +120,8 @@ export class ModelWorkCoordinator {
   private activeReaders = 0;
   private writerHeld = false;
   private queuedWriters = 0;
-  private readonly readerWaiters: Array<() => void> = [];
-  private readonly writerWaiters: Array<() => void> = [];
+  private readonly readerWaiters: Array<() => boolean> = [];
+  private readonly writerWaiters: Array<() => boolean> = [];
   private requestLoadAdmissions = 0;
   /** Outstanding permits grouped by the requested model name. */
   private readonly requestLoadAdmissionsByModel = new Map<string, Set<ModelLoadAdmissionState>>();
@@ -304,6 +318,10 @@ export class ModelWorkCoordinator {
    */
   async withModelLoad<T>(fn: () => Promise<T> | T, label?: string, signal?: AbortSignal): Promise<T> {
     await this.acquireWrite(signal);
+    if (signal?.aborted) {
+      this.releaseWrite();
+      signal.throwIfAborted();
+    }
     // Measured from lock acquisition, not from arrival: `startedAt` is meant
     // to answer "how long has the actual materialization been running",
     // which is what a supervisor deciding whether to wait needs.
@@ -318,7 +336,9 @@ export class ModelWorkCoordinator {
       failure = err;
       throw err;
     } finally {
-      this.recordLoad(label, startedAt, failure, ok);
+      if (!(failure instanceof ModelLoadCancelledError)) {
+        this.recordLoad(label, startedAt, failure, ok);
+      }
       this.releaseWrite();
     }
   }
@@ -350,6 +370,10 @@ export class ModelWorkCoordinator {
     const owner = !this.writerHeld && this.queuedWriters === 0;
     const arrivedAt = Date.now();
     await this.acquireWrite(signal);
+    if (signal?.aborted) {
+      this.releaseWrite();
+      signal.throwIfAborted();
+    }
     const lockAcquiredAt = Date.now();
     let ok = false;
     let failure: unknown;
@@ -364,7 +388,9 @@ export class ModelWorkCoordinator {
       failure = err;
       throw err;
     } finally {
-      this.recordLoad(label, lockAcquiredAt, failure, ok);
+      if (!(failure instanceof ModelLoadCancelledError)) {
+        this.recordLoad(label, lockAcquiredAt, failure, ok);
+      }
       this.releaseWrite();
     }
   }
@@ -384,6 +410,10 @@ export class ModelWorkCoordinator {
 
   async withInference<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
     await this.acquireRead(signal);
+    if (signal?.aborted) {
+      this.releaseRead();
+      signal.throwIfAborted();
+    }
     try {
       return await fn();
     } finally {
@@ -429,26 +459,33 @@ export class ModelWorkCoordinator {
 
   /**
    * Queue `grant` on `queue`, rejecting on `signal` abort. An aborted waiter
-   * is removed from the queue — via `onDequeue` bookkeeping — so it neither
+   * is removed from the queue — via `onCancel` bookkeeping — so it neither
    * holds a slot nor wakes up dead.
    */
   private parkWaiter(
-    queue: Array<() => void>,
+    queue: Array<() => boolean>,
     grant: () => void,
     signal?: AbortSignal,
-    onDequeue?: () => void,
+    onCancel?: () => void,
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const entry = () => {
+      const entry = (): boolean => {
         signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) {
+          onCancel?.();
+          reject(signal.reason ?? new Error('Request aborted'));
+          return false;
+        }
         grant();
         resolve();
+        return true;
       };
       const onAbort = () => {
         const index = queue.indexOf(entry);
         if (index >= 0) {
           queue.splice(index, 1);
-          onDequeue?.();
+          onCancel?.();
+          this.drain();
         }
         reject(signal?.reason ?? new Error('Request aborted'));
       };
@@ -470,13 +507,13 @@ export class ModelWorkCoordinator {
 
   private drain(): void {
     if (this.writerHeld) return;
-    if (this.activeReaders === 0 && this.writerWaiters.length > 0) {
-      this.writerWaiters.shift()?.();
-      return;
+    while (this.activeReaders === 0 && this.writerWaiters.length > 0) {
+      const nextWriter = this.writerWaiters.shift();
+      if (nextWriter?.()) return;
     }
     if (this.queuedWriters === 0 && this.readerWaiters.length > 0) {
       const readers = this.readerWaiters.splice(0);
-      for (const resolve of readers) resolve();
+      for (const entry of readers) entry();
     }
   }
 }
