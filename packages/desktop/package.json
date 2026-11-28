@@ -30,11 +30,11 @@
     "electron-updater": "6.8.11"
   },
   "devDependencies": {
-    "@electron/packager": "20.3.0",
+    "@electron/packager": "20.3.1",
     "@napi-rs/image": "1.16.0",
     "@types/node": "catalog:",
     "app-builder-lib": "26.18.0",
-    "electron": "45.2.3",
+    "electron": "45.5.0",
     "vite-plus": "catalog:"
   },
   "engines": {
