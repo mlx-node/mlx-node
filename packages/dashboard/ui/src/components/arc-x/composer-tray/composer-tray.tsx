@@ -22,22 +22,24 @@ export function ComposerTray({ children, tray, label }: ComposerTrayProps): Reac
   return (
     <div className={styles.root}>
       <div className={styles.card}>{children}</div>
-      <AnimatePresence initial={false}>
-        {tray !== null ? (
-          <motion.div
-            key="tray"
-            className={styles.clip}
-            initial={staticMotion ? { opacity: 0 } : { height: 0 }}
-            animate={staticMotion ? { opacity: 1 } : { height: 'auto' }}
-            exit={staticMotion ? { opacity: 0 } : { height: 0 }}
-            transition={staticMotion ? INSTANT : motionTokens.spring.smooth}
-          >
-            <div className={styles.tray} role="group" aria-label={label}>
-              {tray}
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+      <div className={styles.pocket}>
+        <AnimatePresence initial={false}>
+          {tray !== null ? (
+            <motion.div
+              key="tray"
+              className={styles.clip}
+              initial={staticMotion ? { opacity: 0 } : { height: 0 }}
+              animate={staticMotion ? { opacity: 1 } : { height: 'auto' }}
+              exit={staticMotion ? { opacity: 0 } : { height: 0 }}
+              transition={staticMotion ? INSTANT : motionTokens.spring.smooth}
+            >
+              <div className={styles.tray} role="group" aria-label={label}>
+                {tray}
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }

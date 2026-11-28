@@ -169,6 +169,7 @@ describe('sticky page header', () => {
       'components/arc/select/select.module.css .content',
       'components/arc/tooltip/tooltip.module.css .tooltip',
       'components/arc-x/confirm-popover/confirm-popover.module.css .content',
+      'components/arc-x/model-picker/model-picker.module.css .menu',
     ]);
     const isolatedBy = new Map([
       ['components/arc-x/kpi-drilldown/kpi-drilldown.module.css .veil', '.stage'],

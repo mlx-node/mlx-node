@@ -50,6 +50,9 @@ export const CHAT = {
   modelQuant: 'Quantization',
   modelQuantList: 'Quantization, {base}',
   modelQuantCount: '{n} quantizations',
+  modelMore: 'More models',
+  modelMoreList: 'More models',
+  modelOtherProvider: 'Other',
   modelContext: '{n}K context',
   modelContextUpTo: 'up to {n}K context',
   modelFooterIdle: 'A model loads on your next message.',
@@ -1004,10 +1007,19 @@ export const CHAT = {
   thinkingLevel: {
     /** The model menu's third column. */
     column: 'Thinking effort',
+    effort: 'Effort',
+    defaultTag: 'Default',
     list: 'Thinking effort, {model}',
     /** The row above the levels when they replace the quantizations (a narrow window). */
     back: 'Back to {quant}',
     levels: { none: 'Off', low: 'Low', medium: 'Medium', high: 'High', max: 'Max' },
+    levelNotes: {
+      none: 'Answers at once',
+      low: 'Quickest answers',
+      medium: 'Balanced speed and depth',
+      high: 'Thinks longer',
+      max: 'Deepest thinking, slowest',
+    },
     about: 'Less thinking is faster. Off answers at once.',
     aboutNoOff: 'Less thinking is faster.',
     /** The chip's title: the model id, which ends in its quantization, and the level. */

@@ -77,11 +77,12 @@
   height: calc(100vh - var(--shell-titlebar-height) - var(--chat-bar-height));
   min-width: 0;
   border-right: 1px solid var(--border);
-  overscroll-behavior: contain;
 }
 
 .listScroll {
   height: 100%;
+  overflow: hidden;
+  overscroll-behavior: contain;
 }
 
 .drawer {
@@ -102,6 +103,13 @@
 .railScroll {
   width: var(--chat-rail-width);
   height: 100%;
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Applied to the docked panes' ScrollArea viewport (the actual scroll container) so vertical overscroll stays contained. */
+.paneViewport {
+  overscroll-behavior: contain;
 }
 
 .view {

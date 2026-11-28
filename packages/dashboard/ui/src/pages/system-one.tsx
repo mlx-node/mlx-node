@@ -358,9 +358,10 @@ export default function SystemOne(): ReactElement {
 
   const isRunning = activeJob?.status === 'running' || submitting || batchRunning;
 
+  const catalogItems = catalogQuery.data?.items;
   const modelBases = useMemo(
-    () => systemOneModelBases(installedModels, pickerDisplayModel?.id ?? null, isRunning),
-    [installedModels, pickerDisplayModel?.id, isRunning],
+    () => systemOneModelBases(installedModels, pickerDisplayModel?.id ?? null, isRunning, catalogItems),
+    [installedModels, pickerDisplayModel?.id, isRunning, catalogItems],
   );
 
   // Computed structured payload from visual editors
@@ -1517,6 +1518,8 @@ export default function SystemOne(): ReactElement {
             <ModelPicker
               value={pickerDisplayModel?.id ?? null}
               bases={modelBases}
+              side="bottom"
+              align="end"
               onValueChange={(id) => {
                 setSelectedModelId(id);
                 const picked = installedModels.find((m) => m.id === id);

@@ -13,6 +13,7 @@ import {
 } from '../ui/src/components/arc-x/conversation-list/conversation-list.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { groupByDay } from '../ui/src/lib/conversations.js';
+import { cssRules, cssValue } from './helpers/css-rules.js';
 import { mount, rerender, unmountAll } from './helpers/mount.js';
 import { allByRole, byRole } from './render.js';
 
@@ -143,6 +144,17 @@ describe('ConversationList', () => {
     rerender(list({ groups: [], empty: createElement('p', null, 'No chats yet') }));
     expect(container.textContent).toContain('No chats yet');
     expect(allByRole(container, 'link')).toHaveLength(0);
+  });
+
+  it('leaves list swap motion to SwapCell with no unconditional mount animation on .root', () => {
+    const rules = cssRules('components/arc-x/conversation-list/conversation-list.module.css');
+    expect(cssValue(rules, '.root', 'animation')).toBeUndefined();
+    expect(cssValue(rules, '.root', 'animation-name')).toBeUndefined();
+    expect(cssValue(rules, '.root', 'animation', 'reduce')).toBeUndefined();
+    expect(cssValue(rules, '.row[data-enter]', 'animation')).toBe(
+      'row-enter var(--duration-standard) var(--ease-enter) both',
+    );
+    expect(cssValue(rules, '.row[data-enter]', 'animation', 'reduce')).toBe('none');
   });
 });
 

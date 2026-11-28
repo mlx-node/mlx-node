@@ -4,6 +4,7 @@ import {
   type ReactElement,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -11,7 +12,15 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { useLocation, useNavigate, useNavigationType, useOutlet } from 'react-router-dom';
+import {
+  type Navigator,
+  UNSAFE_LocationContext,
+  UNSAFE_NavigationContext,
+  useLocation,
+  useNavigate,
+  useNavigationType,
+  useOutlet,
+} from 'react-router-dom';
 
 import { motionX } from '../components/arc-x/motion/motion';
 import { useStaticMotion } from '../components/arc-x/motion/use-static-motion';
@@ -31,6 +40,7 @@ import { globalCommands } from './commands';
 import { ConnectionBanner } from './connection-banner';
 import { routeCrumbs, useCurrentCrumbs } from './crumbs';
 import { type Hotkey, focusPageSearch, useHotkeys } from './hotkeys';
+import { type LiveLocation, readLiveLocation } from './live-location';
 import { NAV_ROUTES } from './routes';
 import { ScrollRootContext, useScrollMemory } from './scroll-root';
 import { resetColorsWithToast } from './settings-popover';
@@ -98,6 +108,119 @@ function isNarrow(): boolean {
   return window.innerWidth < NARROW_BELOW_PX;
 }
 
+interface LiveNavigator extends Navigator {
+  readonly location?: unknown;
+}
+
+function sameLiveLocation(a: LiveLocation, b: LiveLocation): boolean {
+  if (a.pathname !== b.pathname || a.search !== b.search || a.hash !== b.hash) return false;
+  if (a.key !== undefined && b.key !== undefined && a.key !== b.key) return false;
+  return true;
+}
+
+/**
+ * Keeps an exiting page on its own location during the exit animation so search-param readers do not flip mid-fade,
+ * and drops `replace` calls from an exiting, unmounted, or pre-commit stale subtree so late responses cannot overwrite
+ * the destination route.
+ */
+function FrozenLocation({ pathname, children }: { pathname: string; children: ReactNode }): ReactElement {
+  const current = useContext(UNSAFE_LocationContext);
+  const navigation = useContext(UNSAFE_NavigationContext);
+  const [held, setHeld] = useState(current);
+  const active = current.location.pathname === pathname;
+  if (active && held !== current) {
+    setHeld(current);
+  }
+  const mountedRef = useRef(true);
+  const activeRef = useRef(active);
+  const basenameRef = useRef(navigation.basename);
+  const committedLocRef = useRef<LiveLocation>({
+    pathname: current.location.pathname,
+    search: current.location.search,
+    hash: current.location.hash,
+    key: current.location.key,
+  });
+  const acceptedReplaceRef = useRef<{ from: LiveLocation; location: LiveLocation } | null>(null);
+  useLayoutEffect(() => {
+    activeRef.current = active;
+    basenameRef.current = navigation.basename;
+    if (active) {
+      const nextCommitted: LiveLocation = {
+        pathname: current.location.pathname,
+        search: current.location.search,
+        hash: current.location.hash,
+        key: current.location.key,
+      };
+      if (!sameLiveLocation(committedLocRef.current, nextCommitted)) {
+        committedLocRef.current = nextCommitted;
+        acceptedReplaceRef.current = null;
+      }
+    } else {
+      acceptedReplaceRef.current = null;
+    }
+  }, [
+    active,
+    navigation.basename,
+    current.location.pathname,
+    current.location.search,
+    current.location.hash,
+    current.location.key,
+  ]);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const baseNavigator = navigation.navigator;
+  const guardedNavigator = useMemo<LiveNavigator>(
+    () => ({
+      get location() {
+        return (baseNavigator as { location?: unknown }).location;
+      },
+      createHref: (to) => baseNavigator.createHref(to),
+      ...(baseNavigator.createURL !== undefined ? { createURL: (to) => baseNavigator.createURL!(to) } : {}),
+      ...(baseNavigator.encodeLocation !== undefined
+        ? { encodeLocation: (to) => baseNavigator.encodeLocation!(to) }
+        : {}),
+      go: (delta) => baseNavigator.go(delta),
+      push: (to, state, opts) => baseNavigator.push(to, state, opts),
+      replace: (to, state, opts) => {
+        if (!mountedRef.current || !activeRef.current) return;
+        const live = readLiveLocation(baseNavigator, basenameRef.current);
+        if (live !== null) {
+          const accepted = acceptedReplaceRef.current;
+          const expected =
+            accepted !== null && sameLiveLocation(accepted.from, committedLocRef.current)
+              ? accepted.location
+              : committedLocRef.current;
+          if (!sameLiveLocation(live, expected)) return;
+        }
+        baseNavigator.replace(to, state, opts);
+        const after = readLiveLocation(baseNavigator, basenameRef.current);
+        if (after !== null && after.pathname === pathname) {
+          acceptedReplaceRef.current = { from: committedLocRef.current, location: after };
+        } else {
+          acceptedReplaceRef.current = null;
+        }
+      },
+    }),
+    [baseNavigator, pathname],
+  );
+  const guardedNavigation = useMemo(
+    () => ({ ...navigation, navigator: guardedNavigator }),
+    [navigation, guardedNavigator],
+  );
+
+  const value = active ? current : held;
+  return (
+    <UNSAFE_NavigationContext.Provider value={guardedNavigation}>
+      <UNSAFE_LocationContext.Provider value={value}>{children}</UNSAFE_LocationContext.Provider>
+    </UNSAFE_NavigationContext.Provider>
+  );
+}
+
 /** The route element, swapped with the `page` motion: the old page leaves, then the new one mounts and enters. */
 function PageFrame({ pathname, onSwap }: { pathname: string; onSwap: () => void }): ReactElement {
   const outlet = useOutlet();
@@ -105,7 +228,7 @@ function PageFrame({ pathname, onSwap }: { pathname: string; onSwap: () => void 
   if (still) {
     return (
       <div key={pathname} className={styles.pageFrame}>
-        {outlet}
+        <FrozenLocation pathname={pathname}>{outlet}</FrozenLocation>
       </div>
     );
   }
@@ -125,7 +248,7 @@ function PageFrame({ pathname, onSwap }: { pathname: string; onSwap: () => void 
         }}
         transition={{ duration: enter.duration, ease: [...enter.ease] }}
       >
-        {outlet}
+        <FrozenLocation pathname={pathname}>{outlet}</FrozenLocation>
       </motion.div>
     </AnimatePresence>
   );

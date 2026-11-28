@@ -10,16 +10,26 @@
   min-width: 0;
 }
 
-/* Clips the strip's bottom while its height changes, and leaves room above for the part under the corners. */
-.clip {
+/* Clips the strip's bottom (paint and scrollable overflow) while leaving room above for the part under the corners. */
+.pocket {
   min-width: 0;
-  clip-path: inset(calc(-1 * var(--radius-surface)) -1px 0 -1px);
+  margin-top: calc(-1 * var(--radius-surface));
+  padding-top: var(--radius-surface);
+  overflow: clip;
+  pointer-events: none;
+}
+
+.clip {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
 }
 
 .tray {
   position: relative;
   box-sizing: border-box;
   display: flex;
+  width: 100%;
   min-width: 0;
   align-items: center;
   gap: var(--space-1);
@@ -28,6 +38,7 @@
   border-radius: 0 0 var(--radius-surface) var(--radius-surface);
   padding: var(--space-1-5) var(--space-2) var(--space-2);
   background: var(--surface-muted);
+  pointer-events: auto;
 }
 
 .tray::before {

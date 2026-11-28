@@ -1,6 +1,6 @@
 import type { ModelBaseOption, ModelVariantOption } from '../../components/arc-x/model-picker/model-picker';
 import { type ClairicImageRotation, isPlainObject, type MediaAttachment, nextDraftId } from '../../lib/system-one';
-import type { SystemOneModelInfo } from '../../lib/types';
+import type { CatalogItem, SystemOneModelInfo } from '../../lib/types';
 
 type PickerState = ModelBaseOption['state'];
 
@@ -12,6 +12,72 @@ const FAMILY_ORDER: Readonly<Record<string, number>> = {
   'CLEF Flash': 2,
   CLEF: 3,
 };
+
+/** Strip a trailing parenthetical size tag such as `" (9B)"` from a catalog label, without regex. */
+function stripParentheticalSuffix(label: string): string {
+  const trimmed = label.trim();
+  if (!trimmed.endsWith(')')) return trimmed;
+  const open = trimmed.lastIndexOf('(');
+  if (open <= 0) return trimmed;
+  return trimmed.slice(0, open).trim();
+}
+
+function splitPathSegments(rawPath: string): string[] {
+  const segments: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= rawPath.length; i += 1) {
+    if (i === rawPath.length || rawPath[i] === '/' || rawPath[i] === '\\') {
+      if (i > start) {
+        const part = rawPath.slice(start, i).trim();
+        if (part !== '' && part !== '.' && part !== '..') segments.push(part);
+      }
+      start = i + 1;
+    }
+  }
+  return segments;
+}
+
+function pathSlugCandidates(modelPath: string): string[] {
+  const segments = splitPathSegments(modelPath);
+  if (segments.length === 0) return [];
+  const candidates: string[] = [segments[segments.length - 1]!];
+  if (segments.length >= 2) candidates.push(segments[segments.length - 2]!);
+  if (segments.length >= 3) candidates.push(segments[segments.length - 3]!);
+  return candidates;
+}
+
+function matchCatalogByMember(
+  bySlug: ReadonlyMap<string, CatalogItem>,
+  model: SystemOneModelInfo,
+): CatalogItem | undefined {
+  const direct = bySlug.get(model.id.trim().toLowerCase()) ?? bySlug.get(model.name.trim().toLowerCase());
+  if (direct !== undefined) return direct;
+  for (const candidate of pathSlugCandidates(model.path)) {
+    const hit = bySlug.get(candidate.toLowerCase());
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
+}
+
+function systemOneCatalogIndex(catalog: readonly CatalogItem[]): {
+  byLabel: ReadonlyMap<string, CatalogItem>;
+  bySlug: ReadonlyMap<string, CatalogItem>;
+} {
+  const byLabel = new Map<string, CatalogItem>();
+  const bySlug = new Map<string, CatalogItem>();
+  for (const item of catalog) {
+    if (item.category !== 'systemone' || item.hidden === true) continue;
+    const stripped = stripParentheticalSuffix(item.label).toLowerCase();
+    if (stripped !== '' && !byLabel.has(stripped)) byLabel.set(stripped, item);
+    const exact = item.label.trim().toLowerCase();
+    if (exact !== '' && !byLabel.has(exact)) byLabel.set(exact, item);
+    for (const build of item.builds) {
+      const slug = build.slug.trim().toLowerCase();
+      if (slug !== '' && !bySlug.has(slug)) bySlug.set(slug, item);
+    }
+  }
+  return { byLabel, bySlug };
+}
 
 function stripLeadingSeparators(text: string): string {
   let i = 0;
@@ -78,7 +144,9 @@ export function systemOneModelBases(
   models: readonly SystemOneModelInfo[],
   selectedId: string | null,
   running: boolean,
+  catalog?: readonly CatalogItem[],
 ): ModelBaseOption[] {
+  const catalogIndex = catalog === undefined ? null : systemOneCatalogIndex(catalog);
   const stateOf = (model: SystemOneModelInfo): PickerState => {
     if (model.resident) return 'loaded';
     if (running && selectedId !== null && model.id === selectedId) return 'loading';
@@ -146,6 +214,20 @@ export function systemOneModelBases(
       variants,
       preselect,
     };
+    const catalogEntry =
+      catalogIndex === null
+        ? undefined
+        : (catalogIndex.byLabel.get(base.toLowerCase()) ??
+          members.reduce<CatalogItem | undefined>(
+            (found, item) => found ?? matchCatalogByMember(catalogIndex.bySlug, item.model),
+            undefined,
+          ));
+    if (catalogEntry !== undefined) {
+      option.recommended = true;
+      if (catalogEntry.description.trim() !== '') option.note = catalogEntry.description;
+    } else if (catalogIndex === null && Object.hasOwn(FAMILY_ORDER, base)) {
+      option.recommended = true;
+    }
     if (stateVariant !== undefined && variants.length > 1) {
       option.stateVariant = stateVariant.label;
     }

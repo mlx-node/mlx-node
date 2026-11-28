@@ -48,6 +48,7 @@ export interface FailedSend {
 
 const failures = new Map<string, FailedSend>();
 const listeners = new Set<() => void>();
+const draftTextListeners = new Set<() => void>();
 
 /**
  * Work: the "Plan first" value the user set for a place, kept beside its draft. `seen`: the key of the conversation's
@@ -70,8 +71,20 @@ export function subscribeDrafts(listener: () => void): () => void {
   };
 }
 
+/** Called after every change of any place's draft text, whichever page or toast made it. */
+export function subscribeDraftText(listener: () => void): () => void {
+  draftTextListeners.add(listener);
+  return () => {
+    draftTextListeners.delete(listener);
+  };
+}
+
 function changed(): void {
   for (const listener of listeners) listener();
+}
+
+function draftTextChanged(): void {
+  for (const listener of draftTextListeners) listener();
 }
 
 /** One queue for every read of files into this store, whichever Chat mount started it. */
@@ -82,8 +95,10 @@ export function readDraft(place: string): string {
 }
 
 export function writeDraft(place: string, text: string): void {
+  if ((drafts.get(place) ?? '') === text) return;
   if (text === '') drafts.delete(place);
   else drafts.set(place, text);
+  draftTextChanged();
 }
 
 export function readAttachments(place: string): readonly DraftAttachment[] {
@@ -194,7 +209,7 @@ export function rememberPlace(mode: ChatMode, id: string): void {
 export function forgetPlace(id: string): void {
   if (lastPlace.chat === id) lastPlace.chat = null;
   if (lastPlace.work === id) lastPlace.work = null;
-  drafts.delete(id);
+  const hadDraft = drafts.delete(id);
   attachments.delete(id);
   for (const item of readPending(id)) item.stop.abort();
   pending.delete(id);
@@ -202,6 +217,7 @@ export function forgetPlace(id: string): void {
   plans.delete(id);
   planNoticed.delete(id);
   forgets.set(id, placeEpoch(id) + 1);
+  if (hadDraft) draftTextChanged();
   changed();
 }
 

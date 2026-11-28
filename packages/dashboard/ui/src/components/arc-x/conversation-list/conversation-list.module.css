@@ -3,7 +3,6 @@
   min-width: 0;
   align-content: start;
   padding: 0 0 var(--space-3);
-  animation: list-swap var(--duration-fast) var(--ease-enter) both;
 }
 
 .loading {
@@ -382,19 +381,7 @@
   }
 }
 
-@keyframes list-swap {
-  from {
-    opacity: 0;
-    transform: translateY(2px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .root,
   .row[data-enter] {
     animation: none;
   }
