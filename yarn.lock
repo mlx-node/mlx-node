@@ -2856,10 +2856,24 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@oxc-project/runtime@npm:=0.159.0":
+  version: 0.159.0
+  resolution: "@oxc-project/runtime@npm:0.159.0"
+  checksum: 10c0/6b520d670b9581f11ee35863f42c5d90d5b808c04d40672f4998bd6b953c98c5eff2eb247859d710bf077a01cbbf3525ac637d6eab5c21ee286034bc11481a16
+  languageName: node
+  linkType: hard
+
 "@oxc-project/types@npm:=0.157.0, @oxc-project/types@npm:^0.157.0":
   version: 0.157.0
   resolution: "@oxc-project/types@npm:0.157.0"
   checksum: 10c0/779771acd7679def85bee728dc5439d3c219c6789c6060cd6858e1212f991bf59760b7fc4a74bab629e7b74222ea82a1891acd7a86ac83e69e2233cb85f9f4c0
+  languageName: node
+  linkType: hard
+
+"@oxc-project/types@npm:=0.159.0":
+  version: 0.159.0
+  resolution: "@oxc-project/types@npm:0.159.0"
+  checksum: 10c0/5f32b97ccdb8fdb169ed68bd71c95d3f78088ed81f1abb770ea71b6cc29ef7fce74e064b360ce29337a317ab3bba8f0ddc0cc3cd96544b8d0795d6481b0ce898
   languageName: node
   linkType: hard
 
@@ -4608,9 +4622,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@voidzero-dev/vite-plus-darwin-arm64@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-darwin-arm64@npm:1.8.0"
+  conditions: os=darwin & cpu=arm64
+  languageName: node
+  linkType: hard
+
 "@voidzero-dev/vite-plus-darwin-x64@npm:1.5.0":
   version: 1.5.0
   resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:1.5.0"
+  conditions: os=darwin & cpu=x64
+  languageName: node
+  linkType: hard
+
+"@voidzero-dev/vite-plus-darwin-x64@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-darwin-x64@npm:1.8.0"
   conditions: os=darwin & cpu=x64
   languageName: node
   linkType: hard
@@ -4622,9 +4650,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-gnu@npm:1.8.0"
+  conditions: os=linux & cpu=arm64 & libc=glibc
+  languageName: node
+  linkType: hard
+
 "@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.5.0":
   version: 1.5.0
   resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.5.0"
+  conditions: os=linux & cpu=arm64 & libc=musl
+  languageName: node
+  linkType: hard
+
+"@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-linux-arm64-musl@npm:1.8.0"
   conditions: os=linux & cpu=arm64 & libc=musl
   languageName: node
   linkType: hard
@@ -4636,9 +4678,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-linux-x64-gnu@npm:1.8.0"
+  conditions: os=linux & cpu=x64 & libc=glibc
+  languageName: node
+  linkType: hard
+
 "@voidzero-dev/vite-plus-linux-x64-musl@npm:1.5.0":
   version: 1.5.0
   resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:1.5.0"
+  conditions: os=linux & cpu=x64 & libc=musl
+  languageName: node
+  linkType: hard
+
+"@voidzero-dev/vite-plus-linux-x64-musl@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-linux-x64-musl@npm:1.8.0"
   conditions: os=linux & cpu=x64 & libc=musl
   languageName: node
   linkType: hard
@@ -4650,9 +4706,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-win32-arm64-msvc@npm:1.8.0"
+  conditions: os=win32 & cpu=arm64
+  languageName: node
+  linkType: hard
+
 "@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.5.0":
   version: 1.5.0
   resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.5.0"
+  conditions: os=win32 & cpu=x64
+  languageName: node
+  linkType: hard
+
+"@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.8.0":
+  version: 1.8.0
+  resolution: "@voidzero-dev/vite-plus-win32-x64-msvc@npm:1.8.0"
   conditions: os=win32 & cpu=x64
   languageName: node
   linkType: hard
@@ -7978,14 +8048,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"postcss@npm:^8.5.30":
-  version: 8.5.32
-  resolution: "postcss@npm:8.5.32"
+"postcss@npm:^8.5.32":
+  version: 8.5.34
+  resolution: "postcss@npm:8.5.34"
   dependencies:
     nanoid: "npm:^3.3.20"
     picocolors: "npm:^1.1.1"
-    source-map-js: "npm:^1.2.2"
-  checksum: 10c0/5fa6cad84e277c2ced965dc7e8e7c0b8d7e5b76a6835591b57a43fde46e671d0c8428d365e9141c080abaae5441d495ed77ffd7472c5bd41d6c2154bd03c01d7
+    source-map-js: "npm:^1.2.4"
+  checksum: 10c0/8345019777ceeda8c4a9b8c3155840b591ebb63e1b659762f9ea88f897b3d29dd1d0915fca9359704a515b6d49c3a0761ec77a13d469090979c3b405699960d0
   languageName: node
   linkType: hard
 
@@ -8461,10 +8531,17 @@ __metadata:
   languageName: node
   linkType: hard
 
-"source-map-js@npm:^1.2.1, source-map-js@npm:^1.2.2":
+"source-map-js@npm:^1.2.1":
   version: 1.2.2
   resolution: "source-map-js@npm:1.2.2"
   checksum: 10c0/d5d6dec62266834f83dd4f8a2606a196fb1a006ca5d53b0ef80ee513b7eba2f4e2ae241f4bc129ae7e9b80dea24f6e3d92b446b7e6e96be7653cab8888168a94
+  languageName: node
+  linkType: hard
+
+"source-map-js@npm:^1.2.4":
+  version: 1.2.4
+  resolution: "source-map-js@npm:1.2.4"
+  checksum: 10c0/b0fb346b142e89a19fa3299a259d8c0dc66626321634c30df260b2e8a1d4c1e219a6a28e8d10617cc54e7816d94eff5c4edd96e208172e93efc2c6fd75b111c6
   languageName: node
   linkType: hard
 
@@ -9118,23 +9195,23 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite@npm:@voidzero-dev/vite-plus-core@1.5.0":
-  version: 1.5.0
-  resolution: "@voidzero-dev/vite-plus-core@npm:1.5.0"
+"vite@npm:@voidzero-dev/vite-plus-core@8.3.8001":
+  version: 8.3.8001
+  resolution: "@voidzero-dev/vite-plus-core@npm:8.3.8001"
   dependencies:
-    "@oxc-project/runtime": "npm:=0.157.0"
-    "@oxc-project/types": "npm:=0.157.0"
-    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.5.0"
-    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.5.0"
+    "@oxc-project/runtime": "npm:=0.159.0"
+    "@oxc-project/types": "npm:=0.159.0"
+    "@voidzero-dev/vite-plus-darwin-arm64": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-darwin-x64": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-linux-arm64-gnu": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-linux-arm64-musl": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-linux-x64-gnu": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-linux-x64-musl": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-win32-arm64-msvc": "npm:1.8.0"
+    "@voidzero-dev/vite-plus-win32-x64-msvc": "npm:1.8.0"
     fsevents: "npm:~2.3.3"
     lightningcss: "npm:^1.33.0"
-    postcss: "npm:^8.5.30"
+    postcss: "npm:^8.5.32"
     yuku-parser: "npm:0.19.0"
   peerDependencies:
     "@arethetypeswrong/core": ^0.18.1
@@ -9220,7 +9297,7 @@ __metadata:
       optional: true
     yaml:
       optional: true
-  checksum: 10c0/09de79f9a0839b79743930bd49fc94a91b61d66c4f60eec4dfc2afcdf367b2df9bf6e4c5ce7314990d27d4ca30c0fd57f374267e1084208abcfdc05b83e68d78
+  checksum: 10c0/b73ecbc1e0e33fe0d3976b003f9d179e44bec8e71dac335639267986e6c33588772b568fd9933883a2aa63cdd39d028df7b246e16b7751da6c22f62ed9130f11
   languageName: node
   linkType: hard
 
