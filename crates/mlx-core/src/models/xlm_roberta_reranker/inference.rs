@@ -511,7 +511,7 @@ mod tests {
 mod golden_tests {
     use super::*;
     #[test]
-    #[ignore = "requires pinned BGE checkpoint and independent reference artifacts; see scripts/rerank/bge/README.md"]
+    #[ignore = "requires pinned BGE checkpoint and independent reference artifacts; set MLX_BGE_GOLDEN_MODEL and MLX_BGE_GOLDEN_REFERENCE"]
     fn golden_checkpoint_logits() {
         let path = std::env::var("MLX_BGE_GOLDEN_MODEL").expect("model path");
         let reference = std::env::var("MLX_BGE_GOLDEN_REFERENCE").expect("reference JSON");

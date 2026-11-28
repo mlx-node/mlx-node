@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { packager } from '@electron/packager';
 
 import { APP_NAME } from '../src/app-name.js';
+import { APP_ID } from '../src/app-name.js';
 import { maxOsVersion, parseMinOs } from './min-os.js';
 import {
   assertDarwinAppRuntimeAssets,
@@ -48,11 +49,11 @@ const STAGE_APP = join(STAGE, 'app');
 
 /**
  * What the three entries actually import at runtime. Deliberately a hand-kept
- * list rather than `packages/desktop/package.json` dependencies: that manifest
- * also carries `@mlx-node/lm` for the Phase 0 spike, which MAIN must never load.
+ * list rather than `packages/desktop/package.json` dependencies so MAIN never
+ * pulls in heavy inference-only roots directly.
  */
 const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', '@mlx-node/cli', 'electron-updater'];
-const BUNDLE_ID = 'ai.mlxnode.desktop';
+const BUNDLE_ID = APP_ID;
 const RESULT_FILE = join(OUT, 'package-result.json');
 
 const sign = process.argv.includes('--sign');

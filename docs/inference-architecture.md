@@ -259,11 +259,3 @@ The architecture was checked against freshly fetched remote branches on
 The design intentionally does not copy vLLM's CUDA-oriented execution engine or
 MTPLX's family-specific conditional dispatch. The reusable part is the
 separation of declarations, planning, state ownership, and execution.
-
-## Control-flow reference
-
-The [inference research reference](research/inference-2026-09-05/README.md)
-records the shared command/default-trait design, scheduled DSpark/DFlash/MTP
-transactions, GPU sampling, and bounded SSD transfers. It includes upstream
-source revisions, cache ownership rules, measured results, rejected candidates
-and regression gates.

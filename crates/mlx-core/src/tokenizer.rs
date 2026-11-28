@@ -9974,9 +9974,9 @@ mod tests {
         eprintln!("loaded {seen} tokenizers, sanitizer enabled for {enabled:?}");
     }
 
-    /// Pin the constant against an independent literal transcription of the spec's
-    /// "Non-reserved special tokens — exactly 15" table in
-    /// `docs/superpowers/specs/2026-08-10-muse-glimmer-30b-design.md`.
+    /// Pin the constant against an independent literal transcription of the
+    /// Muse-Glimmer 30B design spec's "Non-reserved special tokens — exactly 15"
+    /// table.
     ///
     /// Written out here rather than derived from the constant: that is the whole
     /// point. A test that iterates the constant to check the constant agrees with

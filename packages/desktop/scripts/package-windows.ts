@@ -1,48 +1,47 @@
 /**
- * Build a portable Windows ARM64 ZIP (and, for stable versions, an unsigned
- * Microsoft Store ARM64 MSIX) in packages/desktop/out.
+ * Build a Windows ARM64 NSIS setup installer (and, for stable versions, an
+ * unsigned Microsoft Store ARM64 MSIX) in packages/desktop/out.
  *
- *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21
- *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21 --skip-msix
+ *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.25
+ *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.25 --skip-msix
  *
- * The ZIP contains Portato-win32-arm64/mlx-node.exe, the staged JS closure,
- * the addon, every CUDA/cuDNN/OpenBLAS runtime DLL, and the NVRTC headers.
+ * The installer installs Portato.exe, the staged JS closure, the native addon,
+ * every CUDA/cuDNN/OpenBLAS runtime DLL, and the NVRTC headers to
+ * `%LOCALAPPDATA%\Programs\Portato`.
  *
- * Authenticode signing happens between two phases, so the binaries are signed
- * before they are archived (desktop-release.yml signs with SSL.com eSigner):
+ * Authenticode signing happens between two phases so every app PE binary AND
+ * `Uninstall.exe` are signed before the final setup `.exe` is compiled (and the
+ * setup `.exe` itself is then signed in Pass 2 by `desktop-release.yml`):
  *
- *   package:windows --app-version 0.0.21 --app-only
- *       stage + package the app directory, verify its native runtime, write
- *       out/windows-app-result.json, and stop before the ZIP/MSIX
- *   (sign the PE files inside appPath)
- *   package:windows --app-version 0.0.21 --from-app <appPath> [--signed]
- *       re-verify the (now signed) native runtime, then build the ZIP/MSIX
- *       from that directory without re-packaging it
+ *   package:windows --app-version 0.0.25 --app-only
+ *       stage + package the app directory, verify its native runtime, build
+ *       out/.nsis-uninst/Uninstall.exe outside appPath, write
+ *       out/windows-app-result.json, and stop before building setup.exe / MSIX
+ *   (sign the PE files inside appPath + Uninstall.exe)
+ *   package:windows --app-version 0.0.25 --from-app <appPath> [--signed --uninstaller <Uninstall.exe>]
+ *       re-verify the (now signed) native runtime, compile the NSIS setup.exe
+ *       embedding the signed Uninstall.exe, and build/verify the Store MSIX
  *
  * Without either flag the script runs both phases back to back (unsigned).
  * Automatic updates are not part of this path, and Partner Center still signs
  * the MSIX itself during Microsoft Store ingestion.
  */
 
-import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { packager } from '@electron/packager';
 
+import { APP_NAME, APP_PUBLISHER } from '../src/app-name.js';
 import { PayloadError } from './payload.js';
-import { assertSemver, ReleaseVersionError, windowsMsixFileName, windowsZipFileName } from './release-version.js';
+import { assertSemver, ReleaseVersionError, windowsInstallerFileName, windowsMsixFileName } from './release-version.js';
 import { stageApp } from './stage-app.js';
 import { verifyPackagedNativeRuntime } from './verify-cli.js';
 import { buildWindowsMsix, type BuildWindowsMsixResult, verifyWindowsMsix } from './windows-msix.js';
-import {
-  assertWindowsAppRuntimeAssets,
-  missingWindowsZipEntries,
-  readPackagedWindowsApp,
-  resolveWindowsPayload,
-} from './windows-payload.js';
+import { buildWindowsInstaller, buildWindowsUninstaller, WINDOWS_EXECUTABLE_NAME } from './windows-nsis.js';
+import { assertWindowsAppRuntimeAssets, readPackagedWindowsApp, resolveWindowsPayload } from './windows-payload.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = resolve(HERE, '..');
@@ -50,8 +49,8 @@ const REPO_ROOT = resolve(APP_DIR, '..', '..');
 const OUT = join(APP_DIR, 'out');
 const STAGE = join(OUT, '.windows-stage');
 const STAGE_APP = join(STAGE, 'app');
-const WINDOWS_EXECUTABLE = 'mlx-node';
-const TAR = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
+const UNINSTALLER_DIR = join(OUT, '.nsis-uninst');
+const WINDOWS_EXECUTABLE = APP_NAME;
 const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', '@mlx-node/cli', 'electron-updater'];
 
 export interface PackageWindowsArgs {
@@ -59,11 +58,12 @@ export interface PackageWindowsArgs {
   appOnly: boolean;
   signed: boolean;
   fromApp: string | null;
+  uninstaller: string | null;
   appVersion: string;
 }
 
 const SUPPORTED_FLAGS_REMEDY =
-  'supported flags: --app-version <ver>, --skip-msix, --app-only, --from-app <dir>, --signed';
+  'supported flags: --app-version <ver>, --skip-msix, --app-only, --from-app <dir>, --uninstaller <file>, --signed';
 
 /** Parse and validate CLI arguments for `package-windows.ts`. */
 export function parsePackageWindowsArgs(argv: readonly string[], manifestVersion: string): PackageWindowsArgs {
@@ -71,6 +71,7 @@ export function parsePackageWindowsArgs(argv: readonly string[], manifestVersion
   let appOnly = false;
   let signed = false;
   let fromApp: string | null = null;
+  let uninstaller: string | null = null;
   let explicitAppVersion: string | null = null;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -87,6 +88,15 @@ export function parsePackageWindowsArgs(argv: readonly string[], manifestVersion
         throw new PayloadError('--from-app needs the packaged app directory', 'pass --from-app <appPath>');
       }
       fromApp = value;
+    } else if (arg === '--uninstaller' || arg.startsWith('--uninstaller=')) {
+      const value = arg === '--uninstaller' ? argv[++i] : arg.slice('--uninstaller='.length);
+      if (value === undefined || value.trim() === '' || value.startsWith('--')) {
+        throw new PayloadError(
+          '--uninstaller needs the signed Uninstall.exe path',
+          'pass --uninstaller <Uninstall.exe>',
+        );
+      }
+      uninstaller = value;
     } else if (arg === '--app-version' || arg.startsWith('--app-version=')) {
       const value = arg === '--app-version' ? argv[++i] : arg.slice('--app-version='.length);
       if (value === undefined || value === '' || value.startsWith('--')) {
@@ -104,10 +114,22 @@ export function parsePackageWindowsArgs(argv: readonly string[], manifestVersion
       'pass either --app-only or --from-app <appPath>',
     );
   }
+  if (uninstaller !== null && fromApp === null) {
+    throw new PayloadError(
+      '--uninstaller only applies to --from-app',
+      'pass --from-app <appPath> together with --uninstaller <Uninstall.exe>',
+    );
+  }
   if (signed && fromApp === null) {
     throw new PayloadError(
       '--signed only applies to --from-app (the app directory signed between the two phases)',
-      'pass --from-app <appPath> together with --signed',
+      'pass --from-app <appPath> together with --signed --uninstaller <Uninstall.exe>',
+    );
+  }
+  if (signed && uninstaller === null) {
+    throw new PayloadError(
+      '--signed requires --uninstaller so the NSIS installer embeds a signed Uninstall.exe',
+      'sign the Uninstall.exe from --app-only and pass --uninstaller <Uninstall.exe>',
     );
   }
 
@@ -116,18 +138,15 @@ export function parsePackageWindowsArgs(argv: readonly string[], manifestVersion
     explicitAppVersion ?? manifestVersion,
   );
 
-  return { skipMsix, appOnly, signed, fromApp, appVersion };
+  return { skipMsix, appOnly, signed, fromApp, uninstaller, appVersion };
 }
 
-async function packageApp(appVersion: string): Promise<string> {
-  const iconPath = join(APP_DIR, 'build', 'icon.ico');
-  if (!existsSync(iconPath) || statSync(iconPath).size === 0) {
-    console.error(
-      `\nMissing or empty Windows app icon: ${iconPath}\n\n  run: yarn workspace @mlx-node/desktop icons\n`,
-    );
-    process.exit(1);
-  }
+function isPathInsideDir(candidatePath: string, dirPath: string): boolean {
+  const rel = relative(resolve(dirPath), resolve(candidatePath));
+  return rel === '' || (!rel.startsWith('..') && !rel.includes(':'));
+}
 
+async function packageApp(appVersion: string, iconPath: string): Promise<string> {
   const payload = (() => {
     try {
       return resolveWindowsPayload(REPO_ROOT);
@@ -187,6 +206,13 @@ async function packageApp(appVersion: string): Promise<string> {
     asar: false,
     extraResource: [stagedNative, payload.wwwRoot],
     prune: false,
+    win32metadata: {
+      CompanyName: APP_PUBLISHER,
+      FileDescription: APP_NAME,
+      ProductName: APP_NAME,
+      OriginalFilename: WINDOWS_EXECUTABLE_NAME,
+      InternalName: APP_NAME,
+    },
   });
   if (!packagedPath) throw new Error('Electron Packager returned no Windows app directory');
 
@@ -215,11 +241,18 @@ async function main(): Promise<void> {
     throw error;
   }
 
-  const { skipMsix, appOnly, signed, fromApp, appVersion } = parsedArgs;
+  const { skipMsix, appOnly, signed, fromApp, uninstaller, appVersion } = parsedArgs;
+  const iconPath = join(APP_DIR, 'build', 'icon.ico');
+  if (!existsSync(iconPath) || statSync(iconPath).size === 0) {
+    console.error(
+      `\nMissing or empty Windows app icon: ${iconPath}\n\n  run: yarn workspace @mlx-node/desktop icons\n`,
+    );
+    process.exit(1);
+  }
 
   let appPath: string;
   if (fromApp === null) {
-    appPath = await packageApp(appVersion);
+    appPath = await packageApp(appVersion, iconPath);
   } else {
     const resolvedFromApp = resolve(fromApp);
     if (!existsSync(resolvedFromApp) || !statSync(resolvedFromApp).isDirectory()) {
@@ -227,6 +260,13 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     appPath = resolvedFromApp;
+  }
+
+  if (uninstaller !== null && isPathInsideDir(uninstaller, appPath)) {
+    console.error(
+      `\n--uninstaller must live outside ${appPath} so Microsoft Store MSIX packaging never includes Uninstall.exe\n`,
+    );
+    process.exit(1);
   }
 
   let packaged: ReturnType<typeof readPackagedWindowsApp>;
@@ -246,7 +286,7 @@ async function main(): Promise<void> {
   const tempHome = mkdtempSync(join(tmpdir(), 'mlx-windows-runtime-check-'));
   try {
     verifyPackagedNativeRuntime({
-      executable: join(appPath, `${WINDOWS_EXECUTABLE}.exe`),
+      executable: join(appPath, WINDOWS_EXECUTABLE_NAME),
       appDir: join(appPath, 'resources', 'app'),
       home: tempHome,
       platform: 'win32',
@@ -257,34 +297,63 @@ async function main(): Promise<void> {
   }
 
   if (appOnly) {
+    console.log('building Windows NSIS uninstaller (Pass 1)…');
+    let uninstallerPath: string;
+    try {
+      ({ uninstallerPath } = buildWindowsUninstaller({
+        appPath,
+        iconPath,
+        uninstallerPath: join(UNINSTALLER_DIR, 'Uninstall.exe'),
+        version: appVersion,
+      }));
+    } catch (error) {
+      if (error instanceof PayloadError || error instanceof ReleaseVersionError) {
+        console.error(`\n${error.message}\n\n  ${error.remedy}\n`);
+        process.exit(1);
+      }
+      throw error;
+    }
+
     rmSync(STAGE, { recursive: true, force: true });
     mkdirSync(OUT, { recursive: true });
     const appResultPath = join(OUT, 'windows-app-result.json');
     writeFileSync(
       appResultPath,
       `${JSON.stringify(
-        { appPath, version: appVersion, platform: 'win32', arch: 'arm64', runtimeFiles: packaged.runtimeFiles },
+        {
+          appPath,
+          uninstallerPath,
+          version: appVersion,
+          platform: 'win32',
+          arch: 'arm64',
+          runtimeFiles: packaged.runtimeFiles,
+        },
         null,
         2,
       )}\n`,
     );
-    console.log(`\n${appPath}\n\n  result: ${appResultPath}\n`);
+    console.log(`\n${appPath}\n${uninstallerPath}\n\n  result: ${appResultPath}\n`);
     return;
   }
 
   mkdirSync(OUT, { recursive: true });
-  const zipPath = join(OUT, windowsZipFileName(appVersion));
-  rmSync(zipPath, { force: true });
-  const appDirectoryName = basename(appPath);
-  execFileSync(TAR, ['-a', '-cf', zipPath, '-C', dirname(appPath), appDirectoryName], { stdio: 'inherit' });
-  const entries = execFileSync(TAR, ['-tf', zipPath], {
-    encoding: 'utf8',
-    maxBuffer: 32 * 1024 * 1024,
-  })
-    .split(/\r?\n/)
-    .filter(Boolean);
-  const missing = missingWindowsZipEntries(entries, appDirectoryName, packaged.runtimeFiles);
-  if (missing.length > 0) throw new Error(`Windows ZIP is missing required entries:\n${missing.join('\n')}`);
+  console.log('packaging Windows ARM64 NSIS installer…');
+  let installerPath: string;
+  try {
+    ({ installerPath } = buildWindowsInstaller({
+      appPath,
+      iconPath,
+      installerPath: join(OUT, windowsInstallerFileName(appVersion)),
+      version: appVersion,
+      signedUninstallerPath: uninstaller,
+    }));
+  } catch (error) {
+    if (error instanceof PayloadError || error instanceof ReleaseVersionError) {
+      console.error(`\n${error.message}\n\n  ${error.remedy}\n`);
+      process.exit(1);
+    }
+    throw error;
+  }
 
   rmSync(STAGE, { recursive: true, force: true });
 
@@ -326,7 +395,7 @@ async function main(): Promise<void> {
     `${JSON.stringify(
       {
         appPath,
-        zipPath,
+        installerPath,
         msixPath: msixResult?.msixPath ?? null,
         msixVersion: msixResult?.msixVersion ?? null,
         msixIdentityName: msixResult?.identity.identityName ?? null,
@@ -342,7 +411,7 @@ async function main(): Promise<void> {
     )}\n`,
   );
 
-  console.log(`\n${zipPath}`);
+  console.log(`\n${installerPath}`);
   if (msixResult !== null) console.log(msixResult.msixPath);
   console.log(`\n  result: ${resultPath}\n`);
 }

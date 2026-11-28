@@ -4,9 +4,9 @@ import { join } from 'node:path';
 import { ChatSession, MuseGlimmerModel, type ChatMessage, type ToolDefinition } from '@mlx-node/lm';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-// Opt in with an original GGUF file and its config/tokenizer assets. Restore
-// the real review fixture with `oxnode scripts/benchmark-fixture.ts fetch`.
-// Historical tool results are replayed as messages; no tools are executed.
+// Opt in with an original GGUF file, its config/tokenizer assets, and a cached
+// review fixture at `fixturePath`. Historical tool results are replayed as
+// messages; no tools are executed.
 const modelPath = process.env.MUSE_GLIMMER_GGUF_MODEL_PATH;
 const fixturePath = '.cache/benchmarks/gemma4-agent-2026-09-10/inputs.json';
 

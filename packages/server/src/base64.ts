@@ -37,7 +37,7 @@ function resolveNativeDecode(): NativeDecodeBase64Strict | null {
     return cachedNativeDecode;
   }
   try {
-    // Named `require` (not an alias) so `scripts/test-lanes.ts` sees the lazy
+    // Named `require` (not an alias) so the lane tracer in vite.config.ts sees the lazy
     // `@mlx-node/core` edge and assigns tests calling `decodeBase64Strict` to
     // the `addon` lane, while keeping module import itself addon-free.
     const require = createRequire(import.meta.url);

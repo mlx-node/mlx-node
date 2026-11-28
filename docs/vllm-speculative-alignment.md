@@ -79,8 +79,7 @@ The X8-relevant part: V2 gave up V1's exact post-rejection compaction and accept
 writes at rolled-back slots, in exchange for CPU-sync freedom — an exactness trade our strict
 byte-parity oracle (X8) deliberately does not make. Unified memory avoids a discrete-device transfer, but the model thread only knows
 an acceptance count after the relevant GPU work completes. Grouping independent acceptance
-calculations can reduce those waits without weakening the exact-prefix contract. See the
-[inference research reference](research/inference-2026-09-05/README.md).
+calculations can reduce those waits without weakening the exact-prefix contract.
 
 ---
 

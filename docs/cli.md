@@ -515,12 +515,11 @@ attached, and downloaded files are not modified. Muse's runtime currently
 supports text input, and neither draft files nor `mmproj` projectors appear as
 models.
 
-To rerun the optional inference regression against a downloaded checkpoint:
+To rerun the optional inference regression against a downloaded checkpoint (with the cached review fixture at `.cache/benchmarks/gemma4-agent-2026-09-10/inputs.json`):
 
 ```bash
-oxnode scripts/benchmark-fixture.ts fetch
 MUSE_GLIMMER_GGUF_MODEL_PATH=/path/to/model.gguf \
-  yarn exec vp test run __test__/models/muse-glimmer-native-gguf-e2e.test.ts
+  vp test run __test__/models/muse-glimmer-native-gguf-e2e.test.ts
 ```
 
 This replays the pinned review conversation through ordinary decoding and,

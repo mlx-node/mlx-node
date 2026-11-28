@@ -1,5 +1,4 @@
-//! Research-only teacher forcing for the DSpark/DFlash2 loop
-//! (`docs/research/splash-qwen38.md` §6).
+//! Research-only teacher forcing for the DSpark/DFlash2 loop.
 //!
 //! `MLX_DFLASH2_TF_RECORD=<dir>`: a normal turn writes its generated ids to
 //! `<dir>/ref-<prompt key>.json` (kept when an existing file is longer).

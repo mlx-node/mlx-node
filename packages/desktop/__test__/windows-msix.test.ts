@@ -110,8 +110,8 @@ describe('AppxManifest rendering and parsing', () => {
     );
     expect(xml).toContain('Name="Microsoft.VCLibs.140.00.UWPDesktop"');
     expect(xml).toContain('<rescap:Capability Name="runFullTrust" />');
-    expect(xml).toContain('Executable="app\\mlx-node.exe"');
-    expect(xml).toContain('<uap5:ExecutionAlias Alias="mlx-node.exe" />');
+    expect(xml).toContain('Executable="app\\Portato.exe"');
+    expect(xml).toContain('<uap5:ExecutionAlias Alias="Portato.exe" />');
 
     expect(parseAppxManifest(xml)).toEqual({
       identityName: DEFAULT_MSIX_IDENTITY.identityName,
@@ -199,7 +199,7 @@ describe('MSIX entry verification', () => {
     'Assets/Wide310x150Logo.png',
     'Assets/Square310x310Logo.png',
     'Assets/SplashScreen.png',
-    'app/mlx-node.exe',
+    'app/Portato.exe',
     'app/resources/app/package.json',
     ...WINDOWS_APP_RUNTIME_FILES.map((file) => `app/resources/app/${file}`),
     ...pdfjsSampleFiles.map((file) => `app/resources/app/${file}`),
@@ -225,11 +225,11 @@ describe('MSIX entry verification', () => {
       WINDOWS_APP_RUNTIME_FILES.filter((file) => file.includes('@')).map((file) => `app/resources/app/${file}`),
     );
 
-    const noncanonical = completeEntries.map((entry) => (entry === 'app/mlx-node.exe' ? 'app/mlx-node%2Eexe' : entry));
-    expect(missingWindowsMsixEntries(noncanonical, runtimeFiles)).toEqual(['app/mlx-node.exe']);
+    const noncanonical = completeEntries.map((entry) => (entry === 'app/Portato.exe' ? 'app/Portato%2Eexe' : entry));
+    expect(missingWindowsMsixEntries(noncanonical, runtimeFiles)).toEqual(['app/Portato.exe']);
 
-    const spoofed = completeEntries.map((entry) => (entry === 'app/mlx-node.exe' ? 'app%2Fmlx-node.exe' : entry));
-    expect(missingWindowsMsixEntries(spoofed, runtimeFiles)).toEqual(['app/mlx-node.exe']);
+    const spoofed = completeEntries.map((entry) => (entry === 'app/Portato.exe' ? 'app%2FPortato.exe' : entry));
+    expect(missingWindowsMsixEntries(spoofed, runtimeFiles)).toEqual(['app/Portato.exe']);
 
     const plusDll = 'nvrtc-builtins64_130+0.dll';
     const literalPercentDll = 'nvrtc-builtins64_130%2B0.dll';
@@ -376,11 +376,11 @@ describe('MSIX visual asset size validation', () => {
   it('rejects any MSIX PNG asset >= MAX_MSIX_ASSET_BYTES (204,800 bytes) with filename and byte size', () => {
     expect(MAX_MSIX_ASSET_BYTES).toBe(204_800);
 
-    const appDir = join(root, 'mlx-node-win32-arm64');
+    const appDir = join(root, 'Portato-win32-arm64');
     const assetsDir = join(root, 'msix-assets');
-    const msixPath = join(root, 'out', 'mlx-node-0.0.21-win32-arm64.msix');
+    const msixPath = join(root, 'out', 'Portato-0.0.21-win32-arm64.msix');
 
-    writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
+    writeFixture('Portato-win32-arm64/Portato.exe', Buffer.from([0x4d, 0x5a]));
     for (const asset of REQUIRED_MSIX_ASSETS) {
       writeFixture(`msix-assets/${asset}`, TINY_PNG);
     }
@@ -468,23 +468,23 @@ describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK
   }
 
   it('builds a real MSIX with MakePri + MakeAppx and verifies its archive contents and AppxManifest', () => {
-    const appDir = join(root, 'mlx-node-win32-arm64');
+    const appDir = join(root, 'Portato-win32-arm64');
     const assetsDir = join(root, 'msix-assets');
     const outDir = join(root, 'out');
-    const msixPath = join(outDir, 'mlx-node-0.0.21-win32-arm64.msix');
+    const msixPath = join(outDir, 'Portato-0.0.21-win32-arm64.msix');
 
-    writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
-    writeFixture('mlx-node-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
+    writeFixture('Portato-win32-arm64/Portato.exe', Buffer.from([0x4d, 0x5a]));
+    writeFixture('Portato-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
     for (const file of WINDOWS_APP_RUNTIME_FILES) {
-      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/app/${file}`, file);
     }
     for (const file of pdfjsSampleFiles) {
-      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/app/${file}`, file);
     }
-    writeFixture('mlx-node-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
-    writeFixture('mlx-node-win32-arm64/resources/www/index.html', '<!doctype html>');
+    writeFixture('Portato-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
+    writeFixture('Portato-win32-arm64/resources/www/index.html', '<!doctype html>');
     for (const file of runtimeFiles) {
-      writeFixture(`mlx-node-win32-arm64/resources/native/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/native/${file}`, file);
     }
     for (const asset of REQUIRED_MSIX_ASSETS) {
       writeFixture(`msix-assets/${asset}`, TINY_PNG);
@@ -523,22 +523,22 @@ describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK
   });
 
   it('builds and verifies a real MSIX against the actual committed packages/desktop/build/msix/ assets', () => {
-    const appDir = join(root, 'mlx-node-win32-arm64');
+    const appDir = join(root, 'Portato-win32-arm64');
     const outDir = join(root, 'out');
-    const msixPath = join(outDir, 'mlx-node-0.0.21-win32-arm64-real-assets.msix');
+    const msixPath = join(outDir, 'Portato-0.0.21-win32-arm64-real-assets.msix');
 
-    writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
-    writeFixture('mlx-node-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
+    writeFixture('Portato-win32-arm64/Portato.exe', Buffer.from([0x4d, 0x5a]));
+    writeFixture('Portato-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
     for (const file of WINDOWS_APP_RUNTIME_FILES) {
-      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/app/${file}`, file);
     }
     for (const file of pdfjsSampleFiles) {
-      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/app/${file}`, file);
     }
-    writeFixture('mlx-node-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
-    writeFixture('mlx-node-win32-arm64/resources/www/index.html', '<!doctype html>');
+    writeFixture('Portato-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
+    writeFixture('Portato-win32-arm64/resources/www/index.html', '<!doctype html>');
     for (const file of runtimeFiles) {
-      writeFixture(`mlx-node-win32-arm64/resources/native/${file}`, file);
+      writeFixture(`Portato-win32-arm64/resources/native/${file}`, file);
     }
 
     const built = buildWindowsMsix({

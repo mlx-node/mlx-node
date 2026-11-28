@@ -2,16 +2,16 @@
  * The release gate for versions. Run from `.github/workflows/desktop-release.yml`.
  *
  *   check-release.ts resolve --tag <tag> --manifest <package.json>
- *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>]
- *   check-release.ts verify-windows --tag <tag> --manifest <package.json> --app <packaged-dir> --zip <zip> [--msix <msix>]
+ *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>] [--windows-installer <exe>]
+ *   check-release.ts verify-windows --tag <tag> --manifest <package.json> --app <packaged-dir> --installer <exe> [--msix <msix>]
  *
  * `resolve` runs BEFORE the ~16-minute build so a stale manifest costs a minute
  * instead of a full release cycle, and emits `version`, `dmg_name`, `zip_name`,
- * `windows_zip_name`, and `windows_msix_name` to `$GITHUB_OUTPUT` so every later
- * step reads one value rather than re-deriving it.
+ * `windows_installer_name`, and `windows_msix_name` to `$GITHUB_OUTPUT` so every
+ * later step reads one value rather than re-deriving it.
  *
  * `verify` runs after the artifacts exist and re-checks the same thing against
- * what was actually produced — the plist inside the `.app` and the archive filenames.
+ * what was actually produced — the plist inside the `.app` and the artifact filenames.
  * Two checks, because `resolve` only proves the inputs agreed.
  *
  * `--tag` may be empty (`workflow_dispatch` has no tag); the manifest is then the
@@ -20,7 +20,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { basename, join, resolve as resolvePath } from 'node:path';
+import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { PayloadError } from './payload.js';
@@ -28,17 +28,18 @@ import {
   assertVersionsAgree,
   dmgFileName,
   ReleaseVersionError,
+  updateZipFileName,
   versionFromDmgPath,
   versionFromTag,
-  updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsInstallerPath,
   versionFromWindowsMsixPath,
-  versionFromWindowsZipPath,
+  windowsInstallerFileName,
   windowsMsixFileName,
-  windowsZipFileName,
 } from './release-version.js';
 import { verifyWindowsMsix } from './windows-msix.js';
-import { missingWindowsZipEntries, readPackagedWindowsApp } from './windows-payload.js';
+import { verifyWindowsInstaller } from './windows-nsis.js';
+import { readPackagedWindowsApp } from './windows-payload.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -48,7 +49,8 @@ const { positionals, values } = parseArgs({
     app: { type: 'string' },
     dmg: { type: 'string', default: '' },
     zip: { type: 'string', default: '' },
-    'windows-zip': { type: 'string', default: '' },
+    installer: { type: 'string', default: '' },
+    'windows-installer': { type: 'string', default: '' },
     msix: { type: 'string', default: '' },
   },
 });
@@ -56,7 +58,7 @@ const { positionals, values } = parseArgs({
 const command = positionals[0];
 if (command !== 'resolve' && command !== 'verify' && command !== 'verify-windows') {
   console.error(
-    'usage: check-release.ts <resolve|verify|verify-windows> --tag <tag> --manifest <package.json> [--app <path>] [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>] [--msix <msix>]',
+    'usage: check-release.ts <resolve|verify|verify-windows> --tag <tag> --manifest <package.json> [--app <path>] [--dmg <dmg>] [--zip <zip>] [--installer <exe>] [--windows-installer <exe>] [--msix <msix>]',
   );
   process.exit(2);
 }
@@ -106,7 +108,7 @@ function resolve(): string {
   if (output !== undefined && output !== '') {
     appendFileSync(
       output,
-      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\nwindows_zip_name=${windowsZipFileName(version)}\nwindows_msix_name=${windowsMsixFileName(version)}\n`,
+      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\nwindows_installer_name=${windowsInstallerFileName(version)}\nwindows_msix_name=${windowsMsixFileName(version)}\n`,
     );
   }
   return version;
@@ -131,12 +133,17 @@ function verify(): string {
 
   const zip = values.zip.trim();
   if (zip !== '' && (versionFromUpdateZipPath(zip) === null || !existsSync(zip))) {
-    console.error(`::error::update ZIP ${zip} must exist and be named mlx-node-<version>-darwin-arm64.zip`);
+    console.error(`::error::update ZIP ${zip} must exist and be named Portato-<version>-darwin-arm64.zip`);
     process.exit(1);
   }
-  const windowsZip = values['windows-zip'].trim();
-  if (windowsZip !== '' && (versionFromWindowsZipPath(windowsZip) === null || !existsSync(windowsZip))) {
-    console.error(`::error::Windows ZIP ${windowsZip} must exist and be named Portato-<version>-win32-arm64.zip`);
+  const windowsInstaller = values['windows-installer'].trim();
+  if (
+    windowsInstaller !== '' &&
+    (versionFromWindowsInstallerPath(windowsInstaller) === null || !existsSync(windowsInstaller))
+  ) {
+    console.error(
+      `::error::Windows installer ${windowsInstaller} must exist and be named Portato-<version>-win32-arm64-setup.exe`,
+    );
     process.exit(1);
   }
 
@@ -147,7 +154,7 @@ function verify(): string {
     bundleVersion: plistString(plist, 'CFBundleVersion'),
     dmg: dmg === '' ? null : versionFromDmgPath(dmg),
     zip: zip === '' ? null : versionFromUpdateZipPath(zip),
-    windowsZip: windowsZip === '' ? null : versionFromWindowsZipPath(windowsZip),
+    windowsInstaller: windowsInstaller === '' ? null : versionFromWindowsInstallerPath(windowsInstaller),
   });
 }
 
@@ -156,9 +163,11 @@ function verifyWindows(): string {
     console.error('verify-windows needs --app');
     process.exit(2);
   }
-  const zip = values.zip.trim();
-  if (zip === '' || versionFromWindowsZipPath(zip) === null || !existsSync(zip)) {
-    console.error(`::error::Windows ZIP ${zip} must exist and be named Portato-<version>-win32-arm64.zip`);
+  const installer = values.installer.trim();
+  if (installer === '' || versionFromWindowsInstallerPath(installer) === null || !existsSync(installer)) {
+    console.error(
+      `::error::Windows installer ${installer} must exist and be named Portato-<version>-win32-arm64-setup.exe`,
+    );
     process.exit(1);
   }
   const msix = values.msix.trim();
@@ -174,24 +183,10 @@ function verifyWindows(): string {
     bundleVersion: app.version,
     dmg: null,
     zip: null,
-    windowsZip: versionFromWindowsZipPath(zip),
+    windowsInstaller: versionFromWindowsInstallerPath(installer),
     windowsMsix: msix === '' ? null : versionFromWindowsMsixPath(msix),
   });
-  const tar =
-    process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
-  const zipEntries = execFileSync(tar, ['-tf', zip], {
-    encoding: 'utf8',
-    maxBuffer: 32 * 1024 * 1024,
-  })
-    .split(/\r?\n/)
-    .filter(Boolean);
-  const missingZip = missingWindowsZipEntries(zipEntries, basename(resolvePath(values.app)), app.runtimeFiles);
-  if (missingZip.length > 0) {
-    throw new PayloadError(
-      `Windows ZIP is missing required entries:\n${missingZip.join('\n')}`,
-      'repackage the Windows ZIP',
-    );
-  }
+  verifyWindowsInstaller({ installerPath: installer, expectedVersion: version });
   if (msix !== '') {
     verifyWindowsMsix({
       msixPath: msix,

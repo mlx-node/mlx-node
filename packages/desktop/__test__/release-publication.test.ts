@@ -10,10 +10,10 @@ const tag = 'v0.0.14';
 const commit = 'a'.repeat(40);
 const names = [
   'Portato-0.0.14-arm64.dmg',
-  'mlx-node-0.0.14-darwin-arm64.zip',
-  'mlx-node-0.0.14-darwin-arm64.zip.blockmap',
+  'Portato-0.0.14-darwin-arm64.zip',
+  'Portato-0.0.14-darwin-arm64.zip.blockmap',
   'latest-mac.yml',
-  'Portato-0.0.14-win32-arm64.zip',
+  'Portato-0.0.14-win32-arm64-setup.exe',
 ];
 let root: string;
 let files: string[];

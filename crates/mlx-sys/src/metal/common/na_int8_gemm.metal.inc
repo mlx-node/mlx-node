@@ -1,7 +1,7 @@
 // NA (Neural Accelerator) int8 GEMM body for fast::metal_kernel JIT.
 //
-// Promoted verbatim from the proven Stage-0 probe (mlx_na_int8_probe.cpp) and
-// experiments/flashqla/na_int8/gemm.metal:gemm_body2<int8_t,int32_t,false>.
+// Promoted verbatim from the Stage-0 NA int8 GEMM probe
+// (`gemm_body2<int8_t,int32_t,false>`).
 //
 // fast::metal_kernel auto-generates the [[kernel]] signature; the bound device
 // pointers are named A, B, C and the scalar int32 inputs M, N, K bind as

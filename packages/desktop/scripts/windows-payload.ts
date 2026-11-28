@@ -192,7 +192,7 @@ export function resolveWindowsPayload(repoRoot: string, env: NodeJS.ProcessEnv =
 /** Read back the version and native payload from the directory produced by Electron Packager. */
 export function readPackagedWindowsApp(appPath: string): { version: string; runtimeFiles: string[] } {
   const manifestPath = join(appPath, 'resources', 'app', 'package.json');
-  if (!existsSync(join(appPath, 'mlx-node.exe')) || !existsSync(manifestPath)) {
+  if (!existsSync(join(appPath, 'Portato.exe')) || !existsSync(manifestPath)) {
     throw new PayloadError(
       `${appPath} is not a packaged Portato Windows app`,
       'run package-windows.ts and pass its appPath output',
@@ -224,33 +224,4 @@ export function readPackagedWindowsApp(appPath: string): { version: string; runt
   }
   assertWindowsAppRuntimeAssets(join(appPath, 'resources', 'app'));
   return { version, runtimeFiles };
-}
-
-/** Check the archive member list without extracting several GB of native runtime. */
-export function missingWindowsZipEntries(
-  entries: readonly string[],
-  appDirectoryName: string,
-  runtimeFiles: readonly string[],
-): string[] {
-  const normalizedList = entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, ''));
-  const normalized = new Set(normalizedList);
-  const required = [
-    'mlx-node.exe',
-    'resources/app/package.json',
-    ...WINDOWS_APP_RUNTIME_FILES.map((file) => `resources/app/${file}`),
-    ...runtimeFiles.map((file) => `resources/native/${file}`),
-    'resources/native/include/cuda_runtime.h',
-    'resources/www/index.html',
-  ];
-  const missing = required.filter((file) => !normalized.has(`${appDirectoryName}/${file}`));
-  for (const dir of WINDOWS_APP_RUNTIME_DIRS) {
-    const prefix = `${appDirectoryName}/resources/app/${dir}/`;
-    const hasFile = normalizedList.some(
-      (entry) => entry.startsWith(prefix) && entry.length > prefix.length && !entry.endsWith('/'),
-    );
-    if (!hasFile) {
-      missing.push(`resources/app/${dir}`);
-    }
-  }
-  return missing;
 }

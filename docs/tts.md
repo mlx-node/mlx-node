@@ -151,10 +151,6 @@ embeddings remain dense. Quantized quality and speed require separate measuremen
 
 ## Validation and benchmark
 
-See [the pure MLX memory investigation](tts-memory.md) for production benchmark
-commands, physical footprint versus RSS, cache-budget experiments and retained
-playback failures.
-
 `TTS_MLX_CACHE_LIMIT=2` sets an optional MLX free-buffer cache ceiling, in GiB,
 for the loaded TTS model's lifetime. Fractional values are supported; unset or
 `0` uses the normal cache policy. This is a shared process pool, not a TTS-private
@@ -193,45 +189,42 @@ definition. `qwen3_tts_encoder_reference_parity` accepts standalone CPU encoder
 fixtures (`wave`, `encoded`, `long_wave`, `long_encoded`); expected IDs have shape
 `[1, frames, codebooks]`. This check is independent of decoder and tokenizer fixtures.
 
-`scripts/tts/lifecycle.ts --model <custom-voice>` tests a full native queue,
-cancellation, reuse, disposal during paused input and seeded waveform invariance
-under different PCM chunk sizes. For Base, pass `--reference <wav>` and
-`--transcript-file <txt>` together; this also checks voice release during an
-active generation, idempotent and use-after-release rejection, replacement
-preparation and cancellation during preparation.
-`scripts/tts/quality.ts --custom <path> --base
-<path> --output <directory>` writes multilingual preset and cloned samples.
-ASR content agreement does not establish timbre similarity or naturalness;
-listen to the WAVs. Speaker embedding similarity is a diagnostic, not a
-universal quality threshold.
+The initial release validation also ran standalone lifecycle, quality, and
+sustained benchmark harnesses (since removed from `scripts/tts/` during repo
+cleanup; see git history at tag `v0.0.24` for the original harness sources).
+Current automated checks live in `packages/tts/__test__` and the Rust unit
+tests in `crates/mlx-core`; interactive smoke tests can be run directly with
+`mlx tts` and `examples/tts/`.
 
-`scripts/tts/benchmark.ts` records load and preparation times, first materialized
-PCM, block intervals, RTF, resident-memory samples and optional playback underruns.
-`firstPlaybackFromSubmissionMs` brackets the native player clock's origin within
-the JS open call, giving lower/upper bounds from text submission. `peakRssBytes`
-uses the process-wide OS high-water mark through Node's `resourceUsage().maxRSS`;
-`memory` contains steady-state samples and MLX active/peak/allocator-cache bytes.
-Use `--seconds 600 --play` for the ten-minute test. The benchmark's
-`--prebuffer-seconds` default is one second; the SDK and CLI playback default is
-0.32 seconds. RTF is synthesis time / audio duration; native queue backpressure is excluded
-from synthesis time. Report cold and warm runs separately. A passing short smoke
-test does not establish the ten-minute realtime or perceptual-quality acceptance.
-`passedTenMinutePlayback` covers the continuous playback subtest, including EOS;
-review the memory trajectory and quality checks separately for full acceptance.
-Use `--note` to record competing workloads or other measurement conditions.
-`passedAudioContent` requires finite, non-silent processed PCM (RMS above
-`1e-4`, roughly -80 dBFS — a sanity floor far below measured quiet speech, not
-a speech-level threshold); it rejects a silent or corrupt stream but does not
-verify speech content, which needs the external ASR oracle. `passedPcmHash`
-enforces any digests supplied as `--expect-raw-pcm-sha256` or
-`--expect-processed-pcm-sha256` and is `null` when none are given. Only
-`passedAudioContent` is folded into the paced and ten-minute playback verdicts;
-`passedPcmHash` is a standalone report field, so a hash mismatch does not fail
-those verdicts.
+Historical harness metrics referenced in the benchmark tables below:
 
-For a finite, paced text response, add `--once --text-file story.txt
---graphemes-per-second 20 --chunk-graphemes 2 --first-chunk-ms 500`. The clock
-simulates text availability independently of consumer pulls. When TTS backpressure
+- **Lifecycle checks**: full native queue, cancellation, reuse, disposal during
+  paused input, seeded waveform invariance under different PCM chunk sizes, and
+  Base voice release/replacement/cancellation during preparation.
+- **Quality checks**: multilingual preset and cloned samples. ASR content
+  agreement does not establish timbre similarity or naturalness; listen to the
+  WAVs. Speaker embedding similarity is a diagnostic, not a universal quality
+  threshold.
+- **Sustained benchmark metrics**: load and preparation times, first
+  materialized PCM, block intervals, RTF, resident-memory samples, and optional
+  playback underruns. `firstPlaybackFromSubmissionMs` brackets the native player
+  clock's origin within the JS open call, giving lower/upper bounds from text
+  submission. `peakRssBytes` uses the process-wide OS high-water mark through
+  Node's `resourceUsage().maxRSS`; `memory` contains steady-state samples and
+  MLX active/peak/allocator-cache bytes. The SDK and CLI playback prebuffer
+  default is 0.32 seconds (the ten-minute benchmark used a 1.0-second
+  prebuffer). RTF is synthesis time / audio duration; native queue backpressure
+  is excluded from synthesis time. Report cold and warm runs separately. A
+  passing short smoke test does not establish the ten-minute realtime or
+  perceptual-quality acceptance. `passedAudioContent` requires finite,
+  non-silent processed PCM (RMS above `1e-4`, roughly -80 dBFS — a sanity floor
+  far below measured quiet speech, not a speech-level threshold); it rejects a
+  silent or corrupt stream but does not verify speech content, which needs an
+  external ASR oracle.
+
+For finite, paced text-stream measurements, the benchmark simulated text
+availability at 20 graphemes/second (two graphemes per chunk, 500 ms first
+chunk) independently of consumer pulls. When TTS backpressure
 delays a pull, already available text can be delivered immediately. This is a
 buffered LLM-response simulation; it does not run an LLM or measure tokenizer
 tokens per second. Graphemes include punctuation and whitespace.
@@ -379,14 +372,15 @@ Uncommitted local reports (under the gitignored `.cache/`):
 - Base reference: `quality-8bit/zh-vivian.wav`, generated by `quality.ts`, transcript
   `你好，欢迎使用语音合成。我们正在验证实时播放和声音质量。`.
 
-To reproduce the selected precision and sustained test:
+To convert the checkpoint to the selected 8-bit precision and smoke-test
+playback via the CLI (the original `scripts/tts/benchmark.ts` harness was
+removed during repo cleanup; see tag `v0.0.24` for that script):
 
 ```sh
 mlx convert -i ./Base -o ./Base-8bit -m qwen3_tts -q \
   --q-bits 8 --q-group-size 64 --dtype bfloat16
-vp exec oxnode scripts/tts/benchmark.ts --model ./Base-8bit \
-  --reference reference.wav --transcript 'Exact reference words.' \
-  --seconds 600 --play --report base-report.json
+mlx tts -m ./Base-8bit --reference-audio reference.wav \
+  --reference-text 'Exact reference words.' --text 'Hello world.' --play
 ```
 
 Verification on the final native build:
@@ -419,9 +413,8 @@ Verification on the final native build:
   static blockers. Naturalness, timbre and audible joins still require human
   listening; no perceptual-quality pass is claimed from ASR or embedding scores.
 
-> PCM/hash staleness: the PCM16 comparisons above and the
-> `rawPcmSha256`/`processedPcmSha256` digests recorded in the `docs/research`
-> benchmark reports predate the sampler parity fixes (64-token repetition
+> PCM/hash staleness: the PCM16 comparisons above and earlier recorded
+> `rawPcmSha256`/`processedPcmSha256` digests predate the sampler parity fixes (64-token repetition
 > window, ICL 1.5 penalty floor, temperature-first filter ordering, EOS
 > filtering, shared predictor sampling). The 64-token window changes generated
 > PCM beyond 64 frames and the ICL floor changes every clone run, so those
@@ -485,14 +478,15 @@ character-specific pronunciation rule. No universal content/quality pass is infe
 from the ASR count. Detailed comparisons are in
 `.cache/tts/fairy/wsola-1.15-evaluation/content-comparison.json`.
 
+To stream the same sample narrative at 1.15× speed via the CLI (the historical
+`scripts/tts/benchmark.ts` virtual-clock harness was removed after tag `v0.0.24`):
+
 ```sh
-vp exec oxnode scripts/tts/benchmark.ts --model .cache/tts/models/Base-8bit \
-  --reference .cache/tts/fairy/reference.wav \
-  --transcript-file .cache/tts/fairy/reference.txt \
-  --text-file examples/tts/new-eridu-night.txt --once \
-  --graphemes-per-second 20 --chunk-graphemes 2 --first-chunk-ms 500 \
-  --speed 1.15 --playback-buffer-seconds 3 --prebuffer-seconds 1 --play \
-  --output fairy.wav --report fairy.json
+mlx tts -m .cache/tts/models/Base-8bit \
+  --reference-audio .cache/tts/fairy/reference.wav \
+  --reference-text-file .cache/tts/fairy/reference.txt \
+  --file examples/tts/new-eridu-night.txt \
+  --speed 1.15 --play -o fairy.wav
 ```
 
 ## Instruction control and VoiceDesign
@@ -588,13 +582,11 @@ budget on cache hits as well as misses.
 
 ### Development validation
 
-`instruct-quality.ts` produces native Chinese/English listening samples;
-`--cache` compares fully consumed PCM cold/hot prefix timings. The benchmark
-accepts `--instruct`, `--voice-description`, `--instruction-cache`, and
-`--instructions-file` (a JSON array of strings/null). In paced mode it changes
-instructions at paragraph boundaries without changing text or its virtual LLM
-clock; repeated-input mode changes them between repetitions. Existing timing,
-backpressure, playback and memory measurements apply unchanged.
+Use `examples/tts/instruct.ts`, `mlx tts --instruct ...`, and the test suites
+under `packages/tts/__test__` to validate instruction control and VoiceDesign
+conditioning. (The historical `scripts/tts/instruct-quality.ts` and
+`scripts/tts/benchmark.ts` harnesses used for the initial prefix-cache A/B were
+removed after tag `v0.0.24`.)
 
 Reference-conditioned instruction experiments are not a supported feature merely
 because a prefix can be assembled. Content, reference identity, delivery control,

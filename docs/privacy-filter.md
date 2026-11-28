@@ -225,4 +225,4 @@ Quality on long-form text was validated only on a 5-fixture short-input parity s
 
 ## Internals
 
-The architecture, kernel design, Viterbi decoder, and tokenizer integration are documented in the design spec at [`docs/superpowers/specs/2026-05-13-privacy-filter-design.md`](superpowers/specs/2026-05-13-privacy-filter-design.md). The Rust implementation lives at [`crates/mlx-core/src/models/privacy_filter/`](../crates/mlx-core/src/models/privacy_filter/).
+The Rust implementation (architecture, kernel design, Viterbi decoder, and tokenizer integration) lives at [`crates/mlx-core/src/models/privacy_filter/`](../crates/mlx-core/src/models/privacy_filter/).

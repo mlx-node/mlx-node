@@ -400,8 +400,7 @@ precision. Q4 was measured against BF16 and Q8 on the same transcripts:
 acceptance stayed within noise and time per committed token was lowest (78.23
 ms versus 80.97 ms for BF16, summed over short / 6K / 32K). Raw end-to-end
 tokens/s changes sign by fixture (Q4 versus BF16: +22.9% / -24.0% / +9.3%)
-because each precision decodes a different transcript; see the
-[draft precision study](research/splash-qwen38.md#2-current-state-pr-171-base-04ce9b2b).
+because each precision decodes a different transcript.
 There is no precision switch. The implementation follows the [official DFlash repository](https://github.com/z-lab/dflash)
 and [DFlash2 architecture description](https://inco.ai/blog/dflash2/).
 
@@ -498,8 +497,7 @@ the K/V memory (Qwen3.8-27B at 32K: ~1.0 GB saved) and the verify's K/V read
 bandwidth; the quality cost is int8 rounding. Teacher-forced vs a bf16-KV
 teacher at 8 x 8,192 tokens (tail = positions past the first 2,048-token
 chunk, the ones that read int8): Qwen3.6-35B-A3B tail KL 0.0062, top-1
-0.9699 (raw 0.0047 / 0.9775); Qwen3.8-27B not measured (details in
-[docs/research/splash-qwen35-moe.md](research/splash-qwen35-moe.md#int8-kv-default)).
+0.9699 (raw 0.0047 / 0.9775); Qwen3.8-27B not measured.
 DFlash2 acceptance on 35B is not measured. Qwen3.6-122B (32 x 2 heads) defaults
 to int8 pages like the 27B and 35B (its teacher-forced numbers are not measured
 yet). Geometries the int8 kernels do not serve default to `bf16`: an f16-compute checkpoint

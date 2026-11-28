@@ -262,7 +262,7 @@ export function renderAppxManifest(config: AppxManifestConfig): string {
       '  <Applications>',
       '    <Application',
       '      Id="Portato"',
-      '      Executable="app\\mlx-node.exe"',
+      '      Executable="app\\Portato.exe"',
       '      EntryPoint="Windows.FullTrustApplication">',
       '      <uap:VisualElements',
       `        DisplayName="${escapeXml(identity.displayName)}"`,
@@ -279,10 +279,10 @@ export function renderAppxManifest(config: AppxManifestConfig): string {
       '      <Extensions>',
       '        <uap5:Extension',
       '          Category="windows.appExecutionAlias"',
-      '          Executable="app\\mlx-node.exe"',
+      '          Executable="app\\Portato.exe"',
       '          EntryPoint="Windows.FullTrustApplication">',
       '          <uap5:AppExecutionAlias>',
-      '            <uap5:ExecutionAlias Alias="mlx-node.exe" />',
+      '            <uap5:ExecutionAlias Alias="Portato.exe" />',
       '          </uap5:AppExecutionAlias>',
       '        </uap5:Extension>',
       '      </Extensions>',
@@ -530,7 +530,7 @@ export function buildWindowsMsix(options: BuildWindowsMsixOptions): BuildWindows
   const pngAssets = listRegularPngFiles(options.assetsDir);
   assertValidMsixPngAssets(options.assetsDir, pngAssets);
 
-  if (!isExistingFile(join(options.appPath, 'mlx-node.exe'))) {
+  if (!isExistingFile(join(options.appPath, 'Portato.exe'))) {
     throw new PayloadError(
       `Packaged Windows app executable not found in ${options.appPath}`,
       'run package-windows.ts before building the MSIX',
@@ -721,7 +721,7 @@ export function missingWindowsMsixEntries(entries: readonly string[], runtimeFil
     'AppxManifest.xml',
     'resources.pri',
     ...MANIFEST_BASE_ASSETS.map((asset) => `Assets/${asset}`),
-    'app/mlx-node.exe',
+    'app/Portato.exe',
     'app/resources/app/package.json',
     ...WINDOWS_APP_RUNTIME_FILES.map((file) => `app/resources/app/${file}`),
     ...runtimeFiles.map((file) => `app/resources/native/${file}`),

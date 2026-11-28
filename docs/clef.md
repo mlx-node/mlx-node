@@ -51,8 +51,7 @@ which the rotation below keeps inside the acceptance gate.
 
 End to end on the published GGUFs (`ggml-org/Clef-GGUF` and
 `Clef-Flash-GGUF`, Q8_0, the six acceptance inputs, M5 Max, one process per
-run), against the bf16 real-weight results in
-[validation](validation/clef-real-weights.md):
+run), against the bf16 real-weight reference results:
 
 | Checkpoint    | Residency | Sum of 6 decides | Resident MLX memory | Max abs probability diff |
 | ------------- | --------- | ---------------: | ------------------: | -----------------------: |
@@ -184,9 +183,7 @@ their provenance and Apache-2.0 license are in `__test__/fixtures/clef`. Encoder
 tests compare exact token IDs and spans. Head tests compare probabilities against
 the PyTorch reference, allowing `1e-4` absolute error for Metal arithmetic.
 
-The TypeScript verification scripts in `scripts/clef` exercise native inference,
-repeated calls, cancellation, conversion, and the real TypeSafe SDK. Reference
-fixtures were generated outside this repository using Transformers and
+Reference fixtures were generated outside this repository using Transformers and
 Cloudflare's reference implementation.
 These checks validate implementation behavior, not trained-model quality.
 
@@ -197,9 +194,7 @@ a schema that cannot fit is rejected. Images and video are rejected. Prefix
 caching, cross-request batching, and packed output heads are unsupported.
 
 Both released BF16 checkpoints passed real-weight acceptance against the Python
-reference, including HTTP and TypeSafe SDK requests. See the
-[real-weight validation report](validation/clef-real-weights.md) for exact revisions,
-probability differences, memory measurements, timings, and coverage. This does
+reference, including HTTP and TypeSafe SDK requests. This does
 not establish broad model quality or real-checkpoint quantization quality.
 Structured numeric values use the native JSON number representation;
 arbitrary-precision integers beyond 64 bits are not a supported parity case.

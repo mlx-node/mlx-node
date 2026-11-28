@@ -36,7 +36,7 @@ import {
 } from 'electron';
 import electronUpdater from 'electron-updater';
 
-import { DATA_DIR_NAME } from '../app-name.js';
+import { APP_ID, DATA_DIR_NAME } from '../app-name.js';
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createPanelLedger, ledgerFileName, sweepLedger, type PanelLedger } from '../panel-ledger.js';
@@ -123,6 +123,11 @@ let preflightScanPending = false;
 const userDataDir = join(app.getPath('appData'), DATA_DIR_NAME);
 mkdirSync(userDataDir, { recursive: true });
 app.setPath('userData', userDataDir);
+if (process.platform === 'win32' && !isWindowsStoreRuntime()) {
+  // Match the AUMID registered by the NSIS installer so taskbar grouping and notifications use Portato.
+  // Skip inside the Microsoft Store MSIX container so Windows' package AUMID stays intact.
+  app.setAppUserModelId(APP_ID);
+}
 
 /**
  * MUST run before `app.whenReady()`. Chromium reads the privileged-scheme table

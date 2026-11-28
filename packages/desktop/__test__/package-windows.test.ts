@@ -11,6 +11,7 @@ describe('parsePackageWindowsArgs', () => {
       appOnly: false,
       signed: false,
       fromApp: null,
+      uninstaller: null,
       appVersion: '0.0.21',
     });
   });
@@ -21,6 +22,7 @@ describe('parsePackageWindowsArgs', () => {
       appOnly: true,
       signed: false,
       fromApp: null,
+      uninstaller: null,
       appVersion: '0.0.22',
     });
 
@@ -29,29 +31,59 @@ describe('parsePackageWindowsArgs', () => {
       appOnly: true,
       signed: false,
       fromApp: null,
+      uninstaller: null,
       appVersion: '0.0.22-rc.1',
     });
   });
 
-  it('parses --from-app with --signed and --skip-msix', () => {
+  it('parses --from-app with --signed, --uninstaller, and --skip-msix', () => {
     expect(
       parsePackageWindowsArgs(
-        ['--app-version', '0.0.22', '--from-app', 'out/mlx-node-win32-arm64', '--signed', '--skip-msix'],
+        [
+          '--app-version',
+          '0.0.22',
+          '--from-app',
+          'out/Portato-win32-arm64',
+          '--uninstaller',
+          'out/.nsis-uninst/Uninstall.exe',
+          '--signed',
+          '--skip-msix',
+        ],
         '0.0.21',
       ),
     ).toEqual({
       skipMsix: true,
       appOnly: false,
       signed: true,
-      fromApp: 'out/mlx-node-win32-arm64',
+      fromApp: 'out/Portato-win32-arm64',
+      uninstaller: 'out/.nsis-uninst/Uninstall.exe',
       appVersion: '0.0.22',
     });
 
-    expect(parsePackageWindowsArgs(['--from-app=C:\\build\\mlx-node-win32-arm64', '--signed'], '0.0.21')).toEqual({
+    expect(
+      parsePackageWindowsArgs(
+        [
+          '--from-app=C:\\build\\Portato-win32-arm64',
+          '--uninstaller=C:\\build\\.nsis-uninst\\Uninstall.exe',
+          '--signed',
+        ],
+        '0.0.21',
+      ),
+    ).toEqual({
       skipMsix: false,
       appOnly: false,
       signed: true,
-      fromApp: 'C:\\build\\mlx-node-win32-arm64',
+      fromApp: 'C:\\build\\Portato-win32-arm64',
+      uninstaller: 'C:\\build\\.nsis-uninst\\Uninstall.exe',
+      appVersion: '0.0.21',
+    });
+
+    expect(parsePackageWindowsArgs(['--from-app', 'out/Portato-win32-arm64'], '0.0.21')).toEqual({
+      skipMsix: false,
+      appOnly: false,
+      signed: false,
+      fromApp: 'out/Portato-win32-arm64',
+      uninstaller: null,
       appVersion: '0.0.21',
     });
   });
@@ -61,18 +93,35 @@ describe('parsePackageWindowsArgs', () => {
     expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--app-only'], '0.0.21')).toThrow(PayloadError);
   });
 
-  it('rejects --signed without --from-app', () => {
+  it('rejects --signed without --from-app or --uninstaller, and --uninstaller without --from-app', () => {
     expect(() => parsePackageWindowsArgs(['--signed'], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--app-only', '--signed'], '0.0.21')).toThrow(PayloadError);
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--signed'], '0.0.21')).toThrow(PayloadError);
+    expect(() => parsePackageWindowsArgs(['--uninstaller', 'out/Uninstall.exe'], '0.0.21')).toThrow(PayloadError);
   });
 
-  it('rejects missing, blank, or flag-like values for --from-app', () => {
+  it('rejects missing, blank, or flag-like values for --from-app and --uninstaller', () => {
     expect(() => parsePackageWindowsArgs(['--from-app'], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--from-app', ''], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--from-app', '   '], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--from-app', '--signed'], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--from-app='], '0.0.21')).toThrow(PayloadError);
     expect(() => parsePackageWindowsArgs(['--from-app=--signed'], '0.0.21')).toThrow(PayloadError);
+
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller'], '0.0.21')).toThrow(PayloadError);
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller', ''], '0.0.21')).toThrow(
+      PayloadError,
+    );
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller', '   '], '0.0.21')).toThrow(
+      PayloadError,
+    );
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller', '--signed'], '0.0.21')).toThrow(
+      PayloadError,
+    );
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller='], '0.0.21')).toThrow(PayloadError);
+    expect(() => parsePackageWindowsArgs(['--from-app', 'out/app', '--uninstaller=--signed'], '0.0.21')).toThrow(
+      PayloadError,
+    );
   });
 
   it('rejects missing, empty, or flag-like values for --app-version', () => {

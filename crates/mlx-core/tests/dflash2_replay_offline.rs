@@ -2,8 +2,7 @@
 //! tokenizer and classifies every request with the DFlash2 turn ledger under
 //! today's flat rule. No weights are loaded.
 //!
-//! `scripts/dflash2-agent-replay.ts --offline` writes the request list, runs
-//! this test, and checks its result:
+//! Run with a recorded request list JSON, tokenizer JSON, and output path:
 //!
 //! ```shell
 //! MLX_DFLASH2_REPLAY_REQUESTS=/path/to/requests.json \
@@ -25,7 +24,7 @@ fn env_path(name: &str) -> String {
 }
 
 #[test]
-#[ignore = "driven by scripts/dflash2-agent-replay.ts --offline"]
+#[ignore = "requires MLX_DFLASH2_REPLAY_REQUESTS, MLX_DFLASH2_REPLAY_TOKENIZER, and MLX_DFLASH2_REPLAY_RESULT"]
 fn dflash2_replay_offline() {
     let requests_path = env_path("MLX_DFLASH2_REPLAY_REQUESTS");
     let tokenizer_path = env_path("MLX_DFLASH2_REPLAY_TOKENIZER");

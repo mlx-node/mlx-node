@@ -150,9 +150,8 @@ async function copyNativeAddon(outputs: Awaited<typeof task>): Promise<string> {
   }
 
   const npmPlatformDir = join(__dirname, 'npm', triple);
-  // Published platform dirs (darwin-arm64, linux-arm64-gnu) are committed,
-  // whereas desktop-only targets (win32-arm64-msvc) are not. Create the dir
-  // on demand so from-source builds on unpublished targets still have
+  // Published platform dirs are committed, while unpublished targets may not be.
+  // Create the dir on demand so from-source builds on any target still have
   // somewhere to land their .node (no-op when it already exists).
   await mkdir(npmPlatformDir, { recursive: true });
   const dst = join(npmPlatformDir, expectedName);

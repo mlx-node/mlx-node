@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
       - uses: actions/download-artifact@v8
         with:
           name: mlx-core-lib-test
@@ -60,4 +65,4 @@ jobs:
             exit 1
           fi
           chmod +x "$bundle/mlx_core_test"
-          python3 scripts/run-rust-lib-shard.py "$bundle/mlx_core_test" "$SHARD" "$SHARD_COUNT"
+          node .github/scripts/run-rust-lib-shard.ts "$bundle/mlx_core_test" "$SHARD" "$SHARD_COUNT"

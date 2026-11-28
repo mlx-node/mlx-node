@@ -195,7 +195,8 @@ test-integration-output
 /packages/core/*.dll
 /packages/core/include/
 /packages/core/npm/linux-arm64-gnu/include/
-/packages/core/npm/win32-arm64-msvc/
+/packages/core/npm/win32-arm64-msvc/*.dll
+/packages/core/npm/win32-arm64-msvc/include/
 # Prebuilt MLX tarball cache (crates/mlx-sys/build.rs; CI points
 # MLX_PREBUILT_CACHE_DIR here so rust-cache's target/ cleanup can't touch it).
 /.mlx-prebuilt/
@@ -229,3 +230,5 @@ __pycache__/
 /Model-Optimizer
 /grok-build
 .vitest/
+/.home/
+/.playwright-mcp/

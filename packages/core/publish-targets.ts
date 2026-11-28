@@ -6,9 +6,10 @@ import { parseTriple } from '@napi-rs/cli';
 // Which platform targets the publish job may collect `.node` artifacts for.
 //
 // `napi.targets` in packages/core/package.json means what napi documents it to
-// mean — "all targets the crate will be compiled for". That list includes
-// desktop-only targets such as `aarch64-pc-windows-msvc`, which are never
-// published to npm. CI publishes `darwin-arm64` and `linux-arm64-gnu`.
+// mean — "all targets the crate will be compiled for". Today CI publishes
+// `darwin-arm64`, `linux-arm64-gnu`, and `win32-arm64-msvc`, while any future
+// target kept private or without a `packages/core/npm/<abi>/package.json` is
+// excluded automatically.
 //
 // @napi-rs/cli 3.8 made `napi artifacts` throw when a configured target has no
 // `.node` in the artifacts dir, so the publish step can no longer be handed the

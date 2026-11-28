@@ -38,14 +38,14 @@ yarn build:ts                                    # tsc -b across packages
 yarn typecheck                                   # TS type-check only
 
 # Test
-yarn vite run test                               # all TS tests
-yarn vitest __test__/path/to.test.ts             # single TS test
+vp test                                          # all TS tests
+vp test __test__/path/to.test.ts                 # single TS test
 cargo test -p mlx-core                           # Rust unit tests
 cargo test -p mlx-paged-attn                     # paged-attention tests
 
 # Lint & format
-yarn vite fmt                                    # Oxfmt via Vite+
-yarn vite lint --type-aware --type-check         # Oxlint with type checking
+vp fmt                                           # Oxfmt via Vite+
+vp lint --type-aware --type-check                # Oxlint with type checking
 cargo clippy --all --fix --allow-dirty --allow-staged
 cargo fmt
 

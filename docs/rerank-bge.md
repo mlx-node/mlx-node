@@ -9,8 +9,7 @@ select the backend. Ordinary XLM-R embedding models are not rerankers.
 
 This branch has passed numerical and lifecycle checks but has **not passed all
 acceptance gates**. The M4 batching throughput target failed, and an initial Jina
-latency regression did not reproduce consistently. See the [acceptance report](validation/bge-rerank.md)
-for evidence and remaining limits before considering a merge or release.
+latency regression did not reproduce consistently.
 
 BGE returns **sigmoid scores between 0 and 1**. Sigmoid runs once in the native
 backend. SDK, HTTP and CLI share those scores; there is no raw-logit option.
@@ -150,8 +149,7 @@ can also load. Affine `.biases` and additive linear `.bias` are distinct.
 
 These columns describe individual checks. Overall acceptance remains blocked by
 the failed batching target and unresolved initial Jina performance regression;
-the full performance matrix is incomplete. Exact quality changes, including MRR
-decreases, are recorded in the [acceptance report](validation/bge-rerank.md).
+the full performance matrix is incomplete.
 
 Dense modules use one compute dtype. Packed embedding rows convert to that dtype;
 affine projections restore it at each projection boundary even when sidecars
@@ -164,6 +162,3 @@ attribution. It records the profile, compute dtype, quantization metadata and
 source revision when known. Unknown source revision remains null. The pinned BGE
 model card declares Apache-2.0; the runtime's project license does not replace
 checkpoint licenses.
-
-See [validation commands](../scripts/rerank/bge/README.md) and the
-[acceptance report](validation/bge-rerank.md) for tested formats and actual gates.

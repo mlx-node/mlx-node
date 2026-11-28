@@ -8654,8 +8654,7 @@ fn row_batched_decode_kernels_match_single_row_calls_bit_for_bit() {
 /// `QWEN4_EXP_REAL_CASES` case with direct GGUF residency. Each argmax must
 /// equal `QWEN4_EXP_REAL_EXPECTED` (the `QWEN4_EXP_REAL_OUT` of an earlier
 /// run); this run writes its own `QWEN4_EXP_REAL_OUT`. `QWEN4_EXP_REAL_INPUTS`
-/// is `{name, tokenIds}` cases from `oxnode scripts/benchmark-fixture.ts
-/// fetch --fixture qwen38 --output inputs.json`.
+/// points to a JSON list of `{name, tokenIds}` prompt cases.
 #[test]
 #[ignore = "real checkpoint: QWEN4_EXP_REAL_MODEL, QWEN4_EXP_REAL_INPUTS; --test-threads=1"]
 fn real_model_greedy_argmax_matches_expected() {

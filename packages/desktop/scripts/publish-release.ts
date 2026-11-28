@@ -13,7 +13,7 @@ const { positionals, values } = parseArgs({
     zip: { type: 'string' },
     blockmap: { type: 'string' },
     manifest: { type: 'string' },
-    'windows-zip': { type: 'string' },
+    'windows-installer': { type: 'string' },
   },
 });
 const tag = values.tag;
@@ -36,16 +36,16 @@ if (positionals[0] === 'prepare') {
   values.zip &&
   values.blockmap &&
   values.manifest &&
-  values['windows-zip']
+  values['windows-installer']
 ) {
   await publishDesktopRelease(
     tag,
     commit,
-    [values.dmg, values.zip, values.blockmap, values.manifest, values['windows-zip']],
+    [values.dmg, values.zip, values.blockmap, values.manifest, values['windows-installer']],
     github,
   );
 } else {
   throw new Error(
-    'usage: publish-release.ts <prepare|publish> --tag <tag> [--dmg <dmg> --zip <zip> --blockmap <blockmap> --manifest <manifest> --windows-zip <zip>]',
+    'usage: publish-release.ts <prepare|publish> --tag <tag> [--dmg <dmg> --zip <zip> --blockmap <blockmap> --manifest <manifest> --windows-installer <exe>]',
   );
 }
