@@ -467,7 +467,7 @@ jobs:
         with:
           distribution: temurin
           # Temurin publishes no Windows ARM64 build of JDK 25; setup-java fails with "No matching version".
-          java-version: '21'
+          java-version: '25'
           architecture: aarch64
 
       # Credential-free pinned download (matching Komac in jobs.winget).
