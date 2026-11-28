@@ -13,7 +13,7 @@ import {
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { residentSessionRegistry } from '../inference-admission.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
-import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
+import { ModelLoadCancelledError, type ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
 import { stringifyStrictJson } from '../strict-json.js';
 import type { AnthropicCountTokensRequest, AnthropicCountTokensResponse } from '../types-anthropic.js';
@@ -62,36 +62,9 @@ export async function handleCountMessageTokens(
     return;
   }
 
-  // The writer bracket waits for every running answer; a resident name must not take it, as in `/v1/messages`.
-  const residentRegistry = residentSessionRegistry(registry, body.model, bindLoadedModel, modelWorkCoordinator);
-  if (resolveModel && !residentRegistry) {
-    try {
-      const runResolve = () =>
-        idleSweeper ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model)) : resolveModel(body.model);
-      if (modelWorkCoordinator) await modelWorkCoordinator.withModelLoad(runResolve);
-      else await runResolve();
-    } catch (err) {
-      sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
-      return;
-    }
-  }
-
-  const lease = registry.acquireDispatchLease(body.model);
-  if (!lease) {
-    if (registry.get(body.model) != null) {
-      sendAnthropicInternalError(res, 'session registry missing for registered model');
-      return;
-    }
-    sendAnthropicNotFound(res, `Model "${body.model}" not found`);
-    return;
-  }
-  const leaseModel = lease.model;
-  const sessionReg = lease.registry;
-  const preLockInstanceId = lease.instanceId;
-
   const abortController = new AbortController();
-  const abortSocket = res.socket;
   const abortReq = (res as { req?: IncomingMessage }).req;
+  const abortSocket = res.socket ?? abortReq?.socket ?? null;
   const onAbortClose = (): void => {
     abortController.abort();
   };
@@ -103,6 +76,12 @@ export async function handleCountMessageTokens(
   const onAbortError = (_err: unknown): void => {
     abortController.abort();
   };
+  const isTransportDisconnected = (): boolean =>
+    abortController.signal.aborted ||
+    res.destroyed ||
+    res.writableEnded ||
+    abortSocket?.destroyed === true ||
+    abortReq?.aborted === true;
   let abortListenersAttached = false;
   const armAbortListeners = (): void => {
     if (abortListenersAttached) return;
@@ -112,16 +91,69 @@ export async function handleCountMessageTokens(
       abortSocket.once('close', onAbortClose);
     }
     if (abortReq) {
+      abortReq.once('aborted', onAbortClose);
       abortReq.once('close', onAbortReqClose);
       abortReq.once('error', onAbortError);
     }
-    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+    if (isTransportDisconnected()) {
       abortController.abort();
     }
     abortListenersAttached = true;
   };
 
+  let acquiredLeaseModel: NonNullable<ReturnType<ModelRegistry['acquireDispatchLease']>>['model'] | undefined;
+
   try {
+    // The writer bracket waits for every running answer; a resident name must not take it, as in `/v1/messages`.
+    const residentRegistry = residentSessionRegistry(registry, body.model, bindLoadedModel, modelWorkCoordinator);
+    if (resolveModel && !residentRegistry) {
+      armAbortListeners();
+      if (isTransportDisconnected()) {
+        abortController.abort();
+        return;
+      }
+      try {
+        const runResolve = () => {
+          if (isTransportDisconnected()) {
+            abortController.abort();
+            throw new ModelLoadCancelledError();
+          }
+          return idleSweeper
+            ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model))
+            : resolveModel(body.model);
+        };
+        if (modelWorkCoordinator) {
+          await modelWorkCoordinator.withModelLoad(runResolve, undefined, abortController.signal);
+        } else {
+          await runResolve();
+        }
+      } catch (err) {
+        if (err instanceof ModelLoadCancelledError || isTransportDisconnected()) {
+          return;
+        }
+        sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
+        return;
+      }
+      if (isTransportDisconnected()) {
+        abortController.abort();
+        return;
+      }
+    }
+
+    const lease = registry.acquireDispatchLease(body.model);
+    if (!lease) {
+      if (registry.get(body.model) != null) {
+        sendAnthropicInternalError(res, 'session registry missing for registered model');
+        return;
+      }
+      sendAnthropicNotFound(res, `Model "${body.model}" not found`);
+      return;
+    }
+    const leaseModel = lease.model;
+    acquiredLeaseModel = leaseModel;
+    const sessionReg = lease.registry;
+    const preLockInstanceId = lease.instanceId;
+
     const hasImages = mapped.messages.some((message) => (message.images?.length ?? 0) > 0);
     if (hasImages && leaseModel.supportsImages?.() !== true) {
       sendAnthropicBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`);
@@ -238,10 +270,14 @@ export async function handleCountMessageTokens(
         abortSocket.removeListener('close', onAbortClose);
       }
       if (abortReq) {
+        abortReq.removeListener('aborted', onAbortClose);
         abortReq.removeListener('close', onAbortReqClose);
         abortReq.removeListener('error', onAbortError);
       }
+      abortListenersAttached = false;
     }
-    registry.releaseDispatchLease(leaseModel);
+    if (acquiredLeaseModel !== undefined) {
+      registry.releaseDispatchLease(acquiredLeaseModel);
+    }
   }
 }
