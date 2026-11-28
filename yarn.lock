@@ -51,105 +51,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@ast-grep/napi-darwin-arm64@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-darwin-arm64@npm:0.51.1"
-  conditions: os=darwin & cpu=arm64
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-darwin-x64@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-darwin-x64@npm:0.51.1"
-  conditions: os=darwin & cpu=x64
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-linux-arm64-gnu@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-linux-arm64-gnu@npm:0.51.1"
-  conditions: os=linux & cpu=arm64 & libc=glibc
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-linux-arm64-musl@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-linux-arm64-musl@npm:0.51.1"
-  conditions: os=linux & cpu=arm64 & libc=musl
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-linux-x64-gnu@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-linux-x64-gnu@npm:0.51.1"
-  conditions: os=linux & cpu=x64 & libc=glibc
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-linux-x64-musl@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-linux-x64-musl@npm:0.51.1"
-  conditions: os=linux & cpu=x64 & libc=musl
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-win32-arm64-msvc@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-win32-arm64-msvc@npm:0.51.1"
-  conditions: os=win32 & cpu=arm64
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-win32-ia32-msvc@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-win32-ia32-msvc@npm:0.51.1"
-  conditions: os=win32 & cpu=ia32
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi-win32-x64-msvc@npm:0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi-win32-x64-msvc@npm:0.51.1"
-  conditions: os=win32 & cpu=x64
-  languageName: node
-  linkType: hard
-
-"@ast-grep/napi@npm:^0.51.1":
-  version: 0.51.1
-  resolution: "@ast-grep/napi@npm:0.51.1"
-  dependencies:
-    "@ast-grep/napi-darwin-arm64": "npm:0.51.1"
-    "@ast-grep/napi-darwin-x64": "npm:0.51.1"
-    "@ast-grep/napi-linux-arm64-gnu": "npm:0.51.1"
-    "@ast-grep/napi-linux-arm64-musl": "npm:0.51.1"
-    "@ast-grep/napi-linux-x64-gnu": "npm:0.51.1"
-    "@ast-grep/napi-linux-x64-musl": "npm:0.51.1"
-    "@ast-grep/napi-win32-arm64-msvc": "npm:0.51.1"
-    "@ast-grep/napi-win32-ia32-msvc": "npm:0.51.1"
-    "@ast-grep/napi-win32-x64-msvc": "npm:0.51.1"
-  dependenciesMeta:
-    "@ast-grep/napi-darwin-arm64":
-      optional: true
-    "@ast-grep/napi-darwin-x64":
-      optional: true
-    "@ast-grep/napi-linux-arm64-gnu":
-      optional: true
-    "@ast-grep/napi-linux-arm64-musl":
-      optional: true
-    "@ast-grep/napi-linux-x64-gnu":
-      optional: true
-    "@ast-grep/napi-linux-x64-musl":
-      optional: true
-    "@ast-grep/napi-win32-arm64-msvc":
-      optional: true
-    "@ast-grep/napi-win32-ia32-msvc":
-      optional: true
-    "@ast-grep/napi-win32-x64-msvc":
-      optional: true
-  checksum: 10c0/b32b6fbd6b3271e116f7b1367c00b57a9d5de6c22405f25bf95ee6380c1092a5e8b1557d37c56d3046867eb265b8e94ae876a76dfde19cdffa48c89c7585e5d5
-  languageName: node
-  linkType: hard
-
 "@babel/code-frame@npm:^7.10.4":
   version: 7.29.7
   resolution: "@babel/code-frame@npm:7.29.7"
@@ -278,7 +179,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@electron/notarize@npm:3.1.2, @electron/notarize@npm:^3.1.0":
+"@electron/notarize@npm:^3.1.0":
   version: 3.1.2
   resolution: "@electron/notarize@npm:3.1.2"
   dependencies:
@@ -305,7 +206,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@electron/osx-sign@npm:2.7.2, @electron/osx-sign@npm:^2.2.0":
+"@electron/osx-sign@npm:^2.2.0":
   version: 2.7.2
   resolution: "@electron/osx-sign@npm:2.7.2"
   dependencies:
@@ -930,7 +831,6 @@ __metadata:
     "@mlx-node/tts": "workspace:*"
     "@napi-rs/keyring": "npm:^2.1.2"
     "@types/node": "npm:^26.6.6"
-    semver: "npm:^7.8.6"
   bin:
     mlx: ./dist/cli.js
   languageName: unknown
@@ -942,9 +842,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@mlx-node/core-linux-arm64-gnu@workspace:packages/core/npm/linux-arm64-gnu":
+"@mlx-node/core-linux-arm64-gnu@workspace:*, @mlx-node/core-linux-arm64-gnu@workspace:packages/core/npm/linux-arm64-gnu":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core-linux-arm64-gnu@workspace:packages/core/npm/linux-arm64-gnu"
+  languageName: unknown
+  linkType: soft
+
+"@mlx-node/core-win32-arm64-msvc@workspace:*, @mlx-node/core-win32-arm64-msvc@workspace:packages/core/npm/win32-arm64-msvc":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/core-win32-arm64-msvc@workspace:packages/core/npm/win32-arm64-msvc"
   languageName: unknown
   linkType: soft
 
@@ -953,11 +859,17 @@ __metadata:
   resolution: "@mlx-node/core@workspace:packages/core"
   dependencies:
     "@mlx-node/core-darwin-arm64": "workspace:*"
+    "@mlx-node/core-linux-arm64-gnu": "workspace:*"
+    "@mlx-node/core-win32-arm64-msvc": "workspace:*"
     "@napi-rs/cli": "npm:~3.8.6"
     "@oxc-node/cli": "npm:^1.0.1"
     vite-plus: "catalog:"
   dependenciesMeta:
     "@mlx-node/core-darwin-arm64":
+      optional: true
+    "@mlx-node/core-linux-arm64-gnu":
+      optional: true
+    "@mlx-node/core-win32-arm64-msvc":
       optional: true
   languageName: unknown
   linkType: soft
@@ -1009,8 +921,6 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mlx-node/desktop@workspace:packages/desktop"
   dependencies:
-    "@electron/notarize": "npm:3.1.2"
-    "@electron/osx-sign": "npm:2.7.2"
     "@electron/packager": "npm:20.3.0"
     "@mlx-node/dashboard": "workspace:*"
     "@mlx-node/lm": "workspace:*"
@@ -1086,7 +996,6 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mlx-node/trl@workspace:packages/trl"
   dependencies:
-    "@huggingface/hub": "npm:^2.17.10"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@std/toml": "npm:@jsr/std__toml@^1.0.11"
@@ -7315,7 +7224,6 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "mlx-node@workspace:."
   dependencies:
-    "@ast-grep/napi": "npm:^0.51.1"
     "@mlx-node/asr": "workspace:*"
     "@mlx-node/cli": "workspace:*"
     "@mlx-node/internal-tools": "workspace:*"
@@ -7330,12 +7238,10 @@ __metadata:
     "@napi-rs/simple-git": "npm:^1.2.0"
     "@oxc-node/cli": "npm:^1.0.1"
     "@oxc-node/core": "npm:^1.0.1"
-    "@std/toml": "npm:@jsr/std__toml@^1.0.11"
     "@types/node": "npm:^26.6.6"
     octokit: "npm:^5.0.5"
     openai: "npm:7.53.0"
     oxc-parser: "npm:^0.157.0"
-    prettier: "npm:^3.9.10"
     typescript: "npm:^7.0.2"
     vite: "catalog:"
     vite-plus: "catalog:"
@@ -8029,15 +7935,6 @@ __metadata:
   bin:
     postject: dist/cli.js
   checksum: 10c0/7d5c5ffdb63190d48cc4b4b617ef2fa144f2bfd5f035231af08a8d7465298ed2a08ee4b354df198b4c96b32d3d873e562b6d23caacd80eb0ec722d81381e4a3e
-  languageName: node
-  linkType: hard
-
-"prettier@npm:^3.9.10":
-  version: 3.9.10
-  resolution: "prettier@npm:3.9.10"
-  bin:
-    prettier: bin/prettier.cjs
-  checksum: 10c0/0b3531593aa6fb36ac6baf629cb058bda472c59a6938774f931fe55283a07c62e6f56e621b043a82d8a3e21fc284c08c34f9e539fc70072635f79b7bae1a1067
   languageName: node
   linkType: hard
 

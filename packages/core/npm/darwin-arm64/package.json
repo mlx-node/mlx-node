@@ -2,6 +2,10 @@
   "name": "@mlx-node/core-darwin-arm64",
   "version": "0.0.24",
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "homepage": "https://github.com/mlx-node/mlx-node",
+  "bugs": {
+    "url": "https://github.com/mlx-node/mlx-node/issues"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",

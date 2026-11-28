@@ -28,7 +28,7 @@ name: Desktop Release
 #   ES_PASSWORD                  SSL.com account password     } signing via pinned
 #   CREDENTIAL_ID                eSigner credential ID        } SSL.com CodeSignTool
 #   ES_TOTP_SECRET               eSigner TOTP secret          } v1.3.2 (eSigner).
-#                                All four, or none: without them the Windows ZIP
+#                                All four, or none: without them the Windows installer
 #                                ships unsigned, with a warning, exactly as before.
 #
 # Notarization authenticates with an App Store Connect API key rather than
@@ -92,8 +92,8 @@ jobs:
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
-      windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
-      windows_zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
+      windows_installer_name: ${{ steps.version.outputs.windows_installer_name }}
+      windows_installer_sha256: ${{ steps.installer_hash.outputs.sha256 }}
     permissions:
       contents: read
     env:
@@ -275,6 +275,21 @@ jobs:
               "signtool=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             }
           }
+          $makensis = $null
+          foreach ($candidate in @(
+            'C:\Program Files (x86)\NSIS\makensis.exe',
+            'C:\Program Files\NSIS\makensis.exe'
+          )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $makensis = $candidate; break }
+          }
+          if (-not $makensis) {
+            $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $makensis = $cmd.Source }
+          }
+          if (-not $makensis) { throw 'NSIS compiler makensis.exe was not found' }
+          $nsisVer = (& $makensis /VERSION | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Failed to query makensis.exe version at $makensis" }
+          Write-Host "Found makensis.exe ($nsisVer): $makensis"
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize
 
       - name: Install dependencies
@@ -326,9 +341,9 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
-      # Packaging is split in two so the PE files are Authenticode-signed inside
-      # the app directory BEFORE the ZIP/MSIX are built from it (the ZIP hash
-      # feeds the release notes and the WinGet manifest, so it must be final).
+      # Packaging is split in two so the app PE files AND Pass 1 Uninstall.exe are
+      # Authenticode-signed BEFORE the final NSIS setup.exe / Store MSIX are built,
+      # and then setup.exe itself is signed in Pass 2 before its SHA-256 is computed.
       - name: Package the Windows ARM64 app
         id: app
         shell: pwsh
@@ -342,9 +357,16 @@ jobs:
           if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
           $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
           if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
+          if (-not (Test-Path -LiteralPath $result.uninstallerPath -PathType Leaf)) { throw "Missing NSIS uninstaller: $($result.uninstallerPath)" }
+          $resolvedApp = (Resolve-Path -LiteralPath $result.appPath).Path.TrimEnd('\')
+          $resolvedUninst = (Resolve-Path -LiteralPath $result.uninstallerPath).Path
+          if ($resolvedUninst.StartsWith("$resolvedApp\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "NSIS uninstaller ($resolvedUninst) must live outside appPath ($resolvedApp) so MSIX never bundles it"
+          }
           "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "uninstaller=$($result.uninstallerPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      # All four eSigner secrets, or the ZIP ships unsigned exactly as before.
+      # All four eSigner secrets, or the installer ships unsigned with a warning.
       # Forks and repositories without the secrets keep a green release run.
       - name: Check the Windows signing secrets
         id: signing
@@ -365,10 +387,10 @@ jobs:
           $missing = @($secretNames |
             Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
           if ($env:SIGN_REQUESTED -ne 'true') {
-            Write-Host '::notice title=Windows signing skipped::sign_windows is off for this dry run; the Windows ZIP is unsigned.'
+            Write-Host '::notice title=Windows signing skipped::sign_windows is off for this dry run; the Windows installer is unsigned.'
             $enabled = 'false'
           } elseif ($missing.Count -eq $secretNames.Count) {
-            Write-Host "::warning title=Windows signing skipped::None of $($secretNames -join ', ') are set. The Windows ZIP is unsigned."
+            Write-Host "::warning title=Windows signing skipped::None of $($secretNames -join ', ') are set. The Windows installer is unsigned."
             $enabled = 'false'
           } elseif ($missing.Count -gt 0) {
             throw "Partial Windows eSigner secret configuration; missing: $($missing -join ', '). Set all four secrets or remove all of them."
@@ -382,19 +404,22 @@ jobs:
       # addon is an ordinary PE DLL. Use `signtool verify /pa /tw /v` (no `/a`) so
       # only embedded, timestamped Authenticode signatures count — never runner-local
       # Windows catalogs (which also mask Electron's already-embedded d3dcompiler_47.dll
-      # under Get-AuthenticodeSignature). Copy everything else into a flat directory
-      # under neutral names, giving `.node` files a `.dll` name, and keep a map back.
+      # under Get-AuthenticodeSignature). Copy everything else (plus Pass 1 Uninstall.exe
+      # kept outside appPath) into a flat directory under neutral names, giving `.node`
+      # files a `.dll` name, and keep a map back.
       - name: Collect the Windows binaries to sign
         id: collect
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           APP: ${{ steps.app.outputs.app }}
+          UNINSTALLER: ${{ steps.app.outputs.uninstaller }}
           SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
           if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          if (-not (Test-Path -LiteralPath $env:UNINSTALLER -PathType Leaf)) { throw "NSIS uninstaller not found: $env:UNINSTALLER" }
           $root = Join-Path $env:RUNNER_TEMP 'esigner'
           $inDir = Join-Path $root 'in'
           $outDir = Join-Path $root 'out'
@@ -403,6 +428,7 @@ jobs:
           $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File |
             Where-Object { $_.Extension -in '.exe', '.dll', '.node' } |
             Sort-Object FullName)
+          $pe += Get-Item -LiteralPath $env:UNINSTALLER
           $map = @()
           $index = 0
           foreach ($file in $pe) {
@@ -427,7 +453,7 @@ jobs:
           if ($map.Count -gt 100) { throw "eSigner batch_sign takes at most 100 files; found $($map.Count)" }
           $map | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $root 'map.json') -Encoding utf8
           $map | Format-Table name, status, path -AutoSize | Out-String -Width 400 | Write-Host
-          Write-Host "Signing $($map.Count) of $($pe.Count) PE files"
+          Write-Host "Signing $($map.Count) of $($pe.Count) PE files (including Uninstall.exe)"
           "in=$inDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "out=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "map=$(Join-Path $root 'map.json')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -477,10 +503,11 @@ jobs:
 
       # Invoke CodeSignTool directly through java.exe (no cmd.exe wrapper).
       # $CODE_SIGN_TOOL_PATH tells CodeSignTool where conf/code_sign_tool.properties
-      # lives, -Xmx4G prevents heap OOM on 200+ MB PE files like mlx-node.exe, and
+      # lives, -Xmx4G prevents heap OOM on 200+ MB PE files like Portato.exe, and
       # CodeSignTool can exit 0 on error so we also fail closed if any expected
       # output file is missing or empty in $env:OUT_DIR.
       - name: Sign the Windows binaries (SSL.com eSigner)
+        id: sign_app
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
@@ -512,6 +539,17 @@ jobs:
             $output = $lines -join "`n"
             if ($output.Length -gt 0) { Write-Host $output }
             return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+          }
+          function Wait-NextTotpSlice([long] $lastSlice) {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $curSlice = [math]::Floor($now / 30)
+            if ($curSlice -le $lastSlice) {
+              $waitSec = (($lastSlice + 1) * 30) - $now + 2
+              if ($waitSec -gt 0) {
+                Write-Host "Waiting ${waitSec}s for next 30s TOTP slice before retrying signing..."
+                Start-Sleep -Seconds $waitSec
+              }
+            }
           }
           try {
             # Query eSigner's scan policy first. When malware blocker is enabled
@@ -556,35 +594,53 @@ jobs:
                 }
               }
             }
-            $batch = Invoke-CodeSignTool (@('batch_sign') + $authArgs + @(
-              "-totp_secret=$env:ES_TOTP_SECRET",
-              "-input_dir_path=$env:IN_DIR",
-              "-output_dir_path=$env:OUT_DIR"
-            ))
-            if ($batch.ExitCode -ne 0) { throw "CodeSignTool batch_sign failed with exit code $($batch.ExitCode)" }
-            if ($batch.Output -match '(?m)^\s*(Error|Exception)\b') {
+            $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
+            $batchOk = $false
+            $totpSlice = 0L
+            for ($attempt = 1; $attempt -le 2; $attempt += 1) {
+              Get-ChildItem -LiteralPath $env:OUT_DIR -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+              $batch = Invoke-CodeSignTool (@('batch_sign') + $authArgs + @(
+                "-totp_secret=$env:ES_TOTP_SECRET",
+                "-input_dir_path=$env:IN_DIR",
+                "-output_dir_path=$env:OUT_DIR"
+              ))
+              $totpSlice = [math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30)
+              $missing = @()
+              if ($batch.ExitCode -eq 0 -and $batch.Output -notmatch '(?m)^\s*(Error|Exception)\b') {
+                foreach ($entry in $map) {
+                  $signedCopy = Join-Path $env:OUT_DIR $entry.name
+                  if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf) -or (Get-Item -LiteralPath $signedCopy).Length -eq 0) {
+                    $missing += "$($entry.name) ($($entry.path))"
+                  }
+                }
+                if ($missing.Count -eq 0) {
+                  $batchOk = $true
+                  break
+                }
+              }
+              if ($attempt -lt 2 -and ($batch.Output -match 'OTP|totp|expired|already used' -or $missing.Count -gt 0)) {
+                Write-Warning "CodeSignTool batch_sign did not complete cleanly (attempt $attempt/2); waiting for next 30s slice..."
+                Wait-NextTotpSlice $totpSlice
+                continue
+              }
+              if ($missing.Count -gt 0) {
+                throw "CodeSignTool left missing or empty signed outputs in $($env:OUT_DIR):`n$($missing -join "`n")"
+              }
+              if ($batch.ExitCode -ne 0) { throw "CodeSignTool batch_sign failed with exit code $($batch.ExitCode)" }
               throw 'CodeSignTool batch_sign reported an error (see above)'
             }
-            $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
-            $missing = @()
-            foreach ($entry in $map) {
-              $signedCopy = Join-Path $env:OUT_DIR $entry.name
-              if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf) -or (Get-Item -LiteralPath $signedCopy).Length -eq 0) {
-                $missing += "$($entry.name) ($($entry.path))"
-              }
-            }
-            if ($missing.Count -gt 0) {
-              throw "CodeSignTool left missing or empty signed outputs in $($env:OUT_DIR):`n$($missing -join "`n")"
-            }
+            if (-not $batchOk) { throw 'CodeSignTool batch_sign did not complete' }
+            "scan_required=$($scanRequired.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "totp_slice=$totpSlice" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } finally {
             if (-not [string]::IsNullOrWhiteSpace($env:CODE_SIGN_TOOL_PATH)) {
               Remove-Item -LiteralPath (Join-Path $env:CODE_SIGN_TOOL_PATH 'logs') -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
 
-      # Put every signed copy back under its real name and check with signtool
-      # (/pa /tw /v, no /a) that every PE file carries a valid, embedded,
-      # timestamped Authenticode signature (never relying on runner catalogs).
+      # Put every signed copy back under its real name (including Uninstall.exe)
+      # and check with signtool (/pa /tw /v, no /a) that every PE file carries a
+      # valid, embedded, timestamped Authenticode signature.
       - name: Install and verify the signed Windows binaries
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
@@ -592,6 +648,7 @@ jobs:
           OUT_DIR: ${{ steps.collect.outputs.out }}
           MAP: ${{ steps.collect.outputs.map }}
           APP: ${{ steps.app.outputs.app }}
+          UNINSTALLER: ${{ steps.app.outputs.uninstaller }}
           SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -606,6 +663,7 @@ jobs:
           $bad = @()
           $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll', '.node' })
           if ($pe.Count -eq 0) { throw "Found no PE files under $env:APP" }
+          $pe += Get-Item -LiteralPath $env:UNINSTALLER
           foreach ($file in $pe) {
             $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $file.FullName 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
             $verifyExit = $LASTEXITCODE
@@ -618,14 +676,170 @@ jobs:
             }
           }
           if ($bad.Count -gt 0) { throw "Windows binaries without a valid, embedded, timestamped signature:`n$($bad -join "`n")" }
-          $exePath = Join-Path $env:APP 'mlx-node.exe'
+          $exePath = Join-Path $env:APP 'Portato.exe'
           if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing signed executable: $exePath" }
           $exe = Get-AuthenticodeSignature -LiteralPath $exePath
           if ($null -eq $exe.SignerCertificate -or [string]::IsNullOrWhiteSpace($exe.SignerCertificate.Subject)) {
-            throw 'mlx-node.exe is missing a signer certificate subject'
+            throw 'Portato.exe is missing a signer certificate subject'
           }
-          Write-Host "mlx-node.exe signed by: $($exe.SignerCertificate.Subject)"
-          Write-Host "All $($pe.Count) PE files carry a valid, embedded, timestamped signature"
+          Write-Host "Portato.exe signed by: $($exe.SignerCertificate.Subject)"
+          Write-Host "All $($pe.Count) PE files (including Uninstall.exe) carry a valid, embedded, timestamped signature"
+
+      - name: Package Windows ARM64 (NSIS installer + MSIX)
+        id: package
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.app.outputs.app }}
+          UNINSTALLER: ${{ steps.app.outputs.uninstaller }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'oxnode', 'packages/desktop/scripts/package-windows.ts',
+            '--app-version', $env:APP_VERSION,
+            '--from-app', $env:APP
+          )
+          if ($env:SIGNED -eq 'true') {
+            $argsList += @('--signed', '--uninstaller', $env:UNINSTALLER)
+          }
+          & yarn @argsList
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed.' }
+          $resultPath = 'packages/desktop/out/windows-package-result.json'
+          if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
+          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if ($env:SIGNED -eq 'true' -and $result.signed -ne $true) {
+            throw 'Expected signed Windows package result, got signed=false'
+          }
+          if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
+          if (-not (Test-Path -LiteralPath $result.installerPath -PathType Leaf)) { throw "Missing Windows installer: $($result.installerPath)" }
+          "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "installer=$($result.installerPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (($env:APP_VERSION -notmatch '[-+]') -and [string]::IsNullOrWhiteSpace($result.msixPath)) {
+            throw "Stable build $env:APP_VERSION produced no Windows MSIX"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($result.msixPath)) {
+            if (-not (Test-Path -LiteralPath $result.msixPath -PathType Leaf)) { throw "Missing Windows MSIX: $($result.msixPath)" }
+            "msix=$($result.msixPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      # Pass 2 signing: sign the compiled ~1 GB NSIS setup executable directly via
+      # `CodeSignTool sign` (avoiding an extra 1 GB staging input copy) and verify
+      # with signtool BEFORE computing the final SHA-256 digest.
+      - name: Sign and verify the Windows installer (SSL.com eSigner)
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          CODE_SIGN_TOOL_PATH: ${{ steps.codesigntool.outputs.dir }}
+          CODESIGNTOOL_JAR: ${{ steps.codesigntool.outputs.jar }}
+          INSTALLER: ${{ steps.package.outputs.installer }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+          SCAN_REQUIRED: ${{ steps.sign_app.outputs.scan_required }}
+          LAST_TOTP_SLICE: ${{ steps.sign_app.outputs.totp_slice }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { throw 'JAVA_HOME is not set' }
+          $java = Join-Path $env:JAVA_HOME 'bin\java.exe'
+          if (-not (Test-Path -LiteralPath $java -PathType Leaf)) { throw "Java executable not found: $java" }
+          if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          if (-not (Test-Path -LiteralPath $env:INSTALLER -PathType Leaf)) { throw "Windows installer not found: $env:INSTALLER" }
+          $toolArgs = @('-Xmx6G', '-jar', $env:CODESIGNTOOL_JAR)
+          $authArgs = @(
+            "-username=$env:ES_USERNAME",
+            "-password=$env:ES_PASSWORD",
+            "-credential_id=$env:CREDENTIAL_ID"
+          )
+          function Invoke-CodeSignTool([string[]] $commandArgs) {
+            $lines = @(& $java @toolArgs @commandArgs 2>&1 | ForEach-Object { $_.ToString() })
+            $exitCode = $LASTEXITCODE
+            $output = $lines -join "`n"
+            if ($output.Length -gt 0) { Write-Host $output }
+            return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+          }
+          function Wait-NextTotpSlice([long] $previousSlice) {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $currentSlice = [math]::Floor($now / 30)
+            if ($currentSlice -le $previousSlice) {
+              $waitSeconds = (30 - ($now % 30)) + 2
+              Write-Host "Waiting ${waitSeconds}s for the next 30s eSigner TOTP window..."
+              Start-Sleep -Seconds $waitSeconds
+            }
+          }
+          $signOutDir = Join-Path $env:RUNNER_TEMP 'esigner\installer-out'
+          Remove-Item -LiteralPath $signOutDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $signOutDir | Out-Null
+          try {
+            if ($env:SCAN_REQUIRED -eq 'true') {
+              $scanned = $false
+              for ($attempt = 1; $attempt -le 3; $attempt += 1) {
+                Write-Host "Malware scan ($attempt/3): $(Split-Path -Leaf $env:INSTALLER)"
+                $res = Invoke-CodeSignTool (@('scan_code') + $authArgs + @("-input_file_path=$env:INSTALLER"))
+                if ($res.Output -match 'code object is a malware') {
+                  throw "eSigner malware scanner rejected $(Split-Path -Leaf $env:INSTALLER)"
+                }
+                if ($res.ExitCode -eq 0 -and $res.Output -match 'code object is not a malware\. You can proceed signing this code object') {
+                  $scanned = $true
+                  break
+                }
+                if ($attempt -lt 3) {
+                  Write-Warning "CodeSignTool scan_code for installer did not confirm a clean scan (attempt $attempt/3); retrying in 10s..."
+                  Start-Sleep -Seconds 10
+                }
+              }
+              if (-not $scanned) {
+                throw 'CodeSignTool scan_code failed for Windows installer after 3 attempts'
+              }
+            }
+            $lastSlice = if ([string]::IsNullOrWhiteSpace($env:LAST_TOTP_SLICE)) { 0L } else { [long]$env:LAST_TOTP_SLICE }
+            Wait-NextTotpSlice $lastSlice
+            $signedInstaller = Join-Path $signOutDir (Split-Path -Leaf $env:INSTALLER)
+            $signedOk = $false
+            for ($attempt = 1; $attempt -le 2; $attempt += 1) {
+              Remove-Item -LiteralPath $signedInstaller -Force -ErrorAction SilentlyContinue
+              $signRes = Invoke-CodeSignTool (@('sign') + $authArgs + @(
+                "-totp_secret=$env:ES_TOTP_SECRET",
+                "-input_file_path=$env:INSTALLER",
+                "-output_dir_path=$signOutDir"
+              ))
+              $signSlice = [math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30)
+              $hasOutput = (Test-Path -LiteralPath $signedInstaller -PathType Leaf) -and ((Get-Item -LiteralPath $signedInstaller).Length -gt 0)
+              if ($signRes.ExitCode -eq 0 -and $signRes.Output -notmatch '(?m)^\s*(Error|Exception)\b' -and $hasOutput) {
+                $signedOk = $true
+                break
+              }
+              if ($attempt -lt 2 -and ($signRes.Output -match 'OTP|totp|expired|already used' -or -not $hasOutput)) {
+                Write-Warning "CodeSignTool sign did not complete cleanly (attempt $attempt/2); waiting for next 30s slice..."
+                Wait-NextTotpSlice $signSlice
+                continue
+              }
+              if (-not $hasOutput) {
+                throw "CodeSignTool produced no signed installer at $signedInstaller"
+              }
+              throw "CodeSignTool sign failed for Windows installer (exit $($signRes.ExitCode))"
+            }
+            if (-not $signedOk) { throw 'CodeSignTool sign did not complete for Windows installer' }
+            Move-Item -LiteralPath $signedInstaller -Destination $env:INSTALLER -Force
+            $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $env:INSTALLER 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or $verifyOut -notmatch 'The signature is timestamped:') {
+              Write-Host $verifyOut
+              throw "Signed Windows installer failed signtool verification: $env:INSTALLER"
+            }
+            $sig = Get-AuthenticodeSignature -LiteralPath $env:INSTALLER
+            if ($null -eq $sig.SignerCertificate -or [string]::IsNullOrWhiteSpace($sig.SignerCertificate.Subject)) {
+              throw 'Windows installer is missing a signer certificate subject'
+            }
+            Write-Host "Windows installer signed by: $($sig.SignerCertificate.Subject)"
+          } finally {
+            if (-not [string]::IsNullOrWhiteSpace($env:CODE_SIGN_TOOL_PATH)) {
+              Remove-Item -LiteralPath (Join-Path $env:CODE_SIGN_TOOL_PATH 'logs') -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
 
       - name: Clean up temporary Windows signing files
         if: always() && steps.signing.outputs.enabled == 'true'
@@ -640,49 +854,25 @@ jobs:
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Package Windows ARM64 (ZIP + MSIX)
-        id: package
+      # Computed strictly after Pass 2 signing so the digest matches the uploaded file.
+      - name: Compute Windows installer SHA-256
+        id: installer_hash
         shell: pwsh
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
-          APP: ${{ steps.app.outputs.app }}
-          SIGNED: ${{ steps.signing.outputs.enabled }}
+          INSTALLER: ${{ steps.package.outputs.installer }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $argsList = @(
-            'oxnode', 'packages/desktop/scripts/package-windows.ts',
-            '--app-version', $env:APP_VERSION,
-            '--from-app', $env:APP
-          )
-          if ($env:SIGNED -eq 'true') { $argsList += '--signed' }
-          & yarn @argsList
-          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed.' }
-          $resultPath = 'packages/desktop/out/windows-package-result.json'
-          if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
-          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-          if ($env:SIGNED -eq 'true' -and $result.signed -ne $true) {
-            throw 'Expected signed Windows package result, got signed=false'
-          }
-          if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
-          if (-not (Test-Path -LiteralPath $result.zipPath -PathType Leaf)) { throw "Missing Windows ZIP: $($result.zipPath)" }
-          "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "zip=$($result.zipPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          $zipSha256 = (Get-FileHash -LiteralPath $result.zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
-          "zip_sha256=$zipSha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          if (($env:APP_VERSION -notmatch '[-+]') -and [string]::IsNullOrWhiteSpace($result.msixPath)) {
-            throw "Stable build $env:APP_VERSION produced no Windows MSIX"
-          }
-          if (-not [string]::IsNullOrWhiteSpace($result.msixPath)) {
-            if (-not (Test-Path -LiteralPath $result.msixPath -PathType Leaf)) { throw "Missing Windows MSIX: $($result.msixPath)" }
-            "msix=$($result.msixPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
+          if (-not (Test-Path -LiteralPath $env:INSTALLER -PathType Leaf)) { throw "Missing Windows installer: $env:INSTALLER" }
+          $sha256 = (Get-FileHash -LiteralPath $env:INSTALLER -Algorithm SHA256).Hash.ToUpperInvariant()
+          "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Windows installer SHA-256: $sha256"
 
       - name: Validate the Windows app and artifact versions
         shell: pwsh
         env:
           TAG: ${{ env.RELEASE_TAG }}
           APP: ${{ steps.package.outputs.app }}
-          ZIP: ${{ steps.package.outputs.zip }}
+          INSTALLER: ${{ steps.package.outputs.installer }}
           MSIX: ${{ steps.package.outputs.msix }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -691,7 +881,7 @@ jobs:
             '--tag', $env:TAG,
             '--manifest', 'packages/desktop/package.json',
             '--app', $env:APP,
-            '--zip', $env:ZIP
+            '--installer', $env:INSTALLER
           )
           if (-not [string]::IsNullOrWhiteSpace($env:MSIX)) {
             $argsList += @('--msix', $env:MSIX)
@@ -699,10 +889,116 @@ jobs:
           & yarn @argsList
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Exercise the real silent NSIS install + uninstall lifecycle on windows-11-arm
+      # (same flags WinGet uses), including verifying signed Uninstall.exe and registry cleanup.
+      - name: Smoke-test silent NSIS install and uninstall
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          INSTALLER: ${{ steps.package.outputs.installer }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $smokeDir = Join-Path $env:RUNNER_TEMP 'portato-nsis-smoke'
+          $nonEmptyDir = Join-Path $env:RUNNER_TEMP 'portato-nsis-nonempty'
+          $startMenuLink = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Portato.lnk'
+          $desktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Portato.lnk'
+          $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Portato'
+          $aumidKey = 'HKCU:\Software\Classes\AppUserModelId\ai.mlxnode.desktop'
+          $unrelatedFile = Join-Path $smokeDir 'user-notes.txt'
+          Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $nonEmptyDir -Recurse -Force -ErrorAction SilentlyContinue
+          try {
+            # Verify installing into a non-empty non-Portato directory fails cleanly without touching existing files.
+            New-Item -ItemType Directory -Path $nonEmptyDir -Force | Out-Null
+            $sentinel = Join-Path $nonEmptyDir 'existing.txt'
+            Set-Content -LiteralPath $sentinel -Value 'do-not-overwrite' -NoNewline
+            $rejectProc = Start-Process -FilePath $env:INSTALLER -ArgumentList "/S /D=$nonEmptyDir" -Wait -PassThru
+            if ($rejectProc.ExitCode -ne 3) { throw "Expected exit code 3 for non-empty target dir, got $($rejectProc.ExitCode)" }
+            if ((Get-Content -LiteralPath $sentinel -Raw) -ne 'do-not-overwrite' -or (Test-Path -LiteralPath (Join-Path $nonEmptyDir 'Portato.exe'))) {
+              throw 'Non-empty directory guard did not preserve target directory'
+            }
+
+            $installProc = Start-Process -FilePath $env:INSTALLER -ArgumentList "/S /D=$smokeDir" -Wait -PassThru
+            if ($installProc.ExitCode -ne 0) { throw "Silent NSIS install failed with exit code $($installProc.ExitCode)" }
+            foreach ($rel in @(
+              'Portato.exe',
+              'Uninstall.exe',
+              '.portato-manifest.txt',
+              'resources\app\package.json',
+              'resources\native\mlx-core.win32-arm64-msvc.node',
+              'resources\native\openblas.dll',
+              'resources\www\index.html'
+            )) {
+              $target = Join-Path $smokeDir $rel
+              if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Installed file missing after NSIS install: $target" }
+            }
+            if (-not (Test-Path -LiteralPath $startMenuLink -PathType Leaf)) { throw "Start Menu shortcut missing: $startMenuLink" }
+            if (-not (Test-Path -LiteralPath $desktopLink -PathType Leaf)) { throw "Desktop shortcut missing: $desktopLink" }
+            $shellApp = New-Object -ComObject Shell.Application
+            foreach ($lnk in @($startMenuLink, $desktopLink)) {
+              $folder = $shellApp.NameSpace((Split-Path -Parent $lnk))
+              $item = $folder.ParseName((Split-Path -Leaf $lnk))
+              $lnkAumid = $item.ExtendedProperty('System.AppUserModel.ID')
+              if ($lnkAumid -ne 'ai.mlxnode.desktop') {
+                throw "Shortcut $lnk has unexpected System.AppUserModel.ID: '$lnkAumid'"
+              }
+            }
+            $arp = Get-ItemProperty -LiteralPath $arpKey
+            if ($arp.DisplayName -ne 'Portato' -or $arp.DisplayVersion -ne $env:APP_VERSION -or $arp.InstallLocation -ne $smokeDir) {
+              throw "Unexpected ARP registry entry: DisplayName=$($arp.DisplayName) DisplayVersion=$($arp.DisplayVersion) InstallLocation=$($arp.InstallLocation)"
+            }
+            if (-not (Test-Path -LiteralPath $aumidKey)) { throw "AUMID registry key missing: $aumidKey" }
+            if ($env:SIGNED -eq 'true') {
+              foreach ($bin in @((Join-Path $smokeDir 'Portato.exe'), (Join-Path $smokeDir 'Uninstall.exe'))) {
+                $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $bin 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+                if ($LASTEXITCODE -ne 0 -or $verifyOut -notmatch 'The signature is timestamped:') {
+                  Write-Host $verifyOut
+                  throw "Installed binary failed signtool verification: $bin"
+                }
+              }
+            }
+            # Plant a user file inside the install dir after installation and run the real
+            # QuietUninstallString (/S without _?=) to test temp-copy bootstrap, self-removal,
+            # and preservation of non-manifested files.
+            Set-Content -LiteralPath $unrelatedFile -Value 'keep-me' -NoNewline
+            $uninstExe = Join-Path $smokeDir 'Uninstall.exe'
+            $uninstLauncher = Start-Process -FilePath $uninstExe -ArgumentList '/S' -PassThru
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline) {
+              if ($uninstLauncher.HasExited -and -not (Test-Path -LiteralPath $arpKey) -and -not (Test-Path -LiteralPath $uninstExe)) {
+                break
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $uninstLauncher.HasExited) {
+              Stop-Process -Id $uninstLauncher.Id -Force -ErrorAction SilentlyContinue
+              throw 'Silent NSIS uninstall launcher timed out after 60s'
+            }
+            if ($uninstLauncher.ExitCode -ne 0) { throw "Silent NSIS uninstall launcher failed with exit code $($uninstLauncher.ExitCode)" }
+            if (Test-Path -LiteralPath $uninstExe) { throw 'Uninstall.exe was not self-removed after silent uninstall' }
+            if (Test-Path -LiteralPath (Join-Path $smokeDir 'Portato.exe')) { throw 'Portato.exe still exists after uninstall' }
+            if (Test-Path -LiteralPath (Join-Path $smokeDir 'resources')) { throw 'resources directory still exists after uninstall' }
+            if (Test-Path -LiteralPath (Join-Path $smokeDir '.portato-manifest.txt')) { throw '.portato-manifest.txt still exists after uninstall' }
+            if (-not (Test-Path -LiteralPath $unrelatedFile -PathType Leaf) -or (Get-Content -LiteralPath $unrelatedFile -Raw) -ne 'keep-me') {
+              throw "Unrelated file was modified or removed during NSIS uninstall: $unrelatedFile"
+            }
+            if (Test-Path -LiteralPath $startMenuLink) { throw 'Start Menu shortcut still exists after uninstall' }
+            if (Test-Path -LiteralPath $desktopLink) { throw 'Desktop shortcut still exists after uninstall' }
+            if (Test-Path -LiteralPath $arpKey) { throw 'ARP registry key still exists after uninstall' }
+            if (Test-Path -LiteralPath $aumidKey) { throw 'AUMID registry key still exists after uninstall' }
+            Write-Host 'Silent NSIS install + uninstall smoke test passed.'
+          } finally {
+            Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $nonEmptyDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - uses: actions/upload-artifact@v7
         with:
           name: mlx-node-desktop-windows-arm64
-          path: ${{ steps.package.outputs.zip }}
+          path: ${{ steps.package.outputs.installer }}
           if-no-files-found: error
 
       # Kept as a separate workflow artifact (not a GitHub Release asset) because
@@ -722,7 +1018,7 @@ jobs:
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ env.RELEASE_TAG }}
-          ZIP: ${{ steps.package.outputs.zip }}
+          INSTALLER_SHA256: ${{ steps.installer_hash.outputs.sha256 }}
           WINGET_PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID }}
           REPO: ${{ github.repository }}
         run: |
@@ -730,7 +1026,7 @@ jobs:
           $argsList = @(
             'oxnode', 'packages/desktop/scripts/winget-manifest.ts',
             '--version', $env:APP_VERSION,
-            '--zip', $env:ZIP,
+            '--sha256', $env:INSTALLER_SHA256,
             '--out', 'packages/desktop/out/winget',
             '--repo', $env:REPO
           )
@@ -758,7 +1054,7 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       dmg_name: ${{ steps.version.outputs.dmg_name }}
       zip_name: ${{ steps.version.outputs.zip_name }}
-      windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
+      windows_installer_name: ${{ steps.version.outputs.windows_installer_name }}
       dmg_sha256: ${{ steps.hashes.outputs.dmg_sha256 }}
       zip_sha256: ${{ steps.hashes.outputs.zip_sha256 }}
       blockmap_sha256: ${{ steps.hashes.outputs.blockmap_sha256 }}
@@ -1047,7 +1343,7 @@ jobs:
           yarn oxnode packages/desktop/scripts/generate-update.ts --app "$APP" --zip "$ZIP" \
             --staging-percentage "$STAGING_PERCENTAGE"
 
-      # The filename is spelled once, by `scripts/release-version.ts`, and parsed
+      # The filename is spelled once, by `packages/desktop/scripts/release-version.ts`, and parsed
       # back out of it by the next step — so a DMG whose name disagrees with what
       # is inside it cannot reach a release.
       - name: Build DMG
@@ -1159,7 +1455,7 @@ jobs:
     outputs:
       version: ${{ steps.verify.outputs.version }}
       release_tag: ${{ steps.verify.outputs.release_tag }}
-      windows_zip_name: ${{ steps.verify.outputs.windows_zip_name }}
+      windows_installer_name: ${{ steps.verify.outputs.windows_installer_name }}
       published: ${{ steps.publish.outputs.published }}
     permissions:
       contents: write
@@ -1246,14 +1542,14 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
           WINDOWS_COMMIT: ${{ needs.windows.outputs.commit }}
           WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
-          WINDOWS_ZIP_NAME_IN: ${{ needs.windows.outputs.windows_zip_name }}
-          WINDOWS_ZIP_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          WINDOWS_INSTALLER_NAME_IN: ${{ needs.windows.outputs.windows_installer_name }}
+          WINDOWS_INSTALLER_SHA256: ${{ needs.windows.outputs.windows_installer_sha256 }}
           MACOS_COMMIT: ${{ needs.macos.outputs.commit }}
           MACOS_VERSION: ${{ needs.macos.outputs.version }}
           MACOS_RELEASE_TAG: ${{ needs.macos.outputs.release_tag }}
           MACOS_DMG_NAME: ${{ needs.macos.outputs.dmg_name }}
           MACOS_ZIP_NAME: ${{ needs.macos.outputs.zip_name }}
-          MACOS_WINDOWS_ZIP_NAME: ${{ needs.macos.outputs.windows_zip_name }}
+          MACOS_WINDOWS_INSTALLER_NAME: ${{ needs.macos.outputs.windows_installer_name }}
           MACOS_DMG_SHA256: ${{ needs.macos.outputs.dmg_sha256 }}
           MACOS_ZIP_SHA256: ${{ needs.macos.outputs.zip_sha256 }}
           MACOS_BLOCKMAP_SHA256: ${{ needs.macos.outputs.blockmap_sha256 }}
@@ -1277,16 +1573,16 @@ jobs:
           version=""
           dmg_name=""
           zip_name=""
-          windows_zip_name=""
+          windows_installer_name=""
           while IFS='=' read -r key val; do
             case "$key" in
               version) version="$val" ;;
               dmg_name) dmg_name="$val" ;;
               zip_name) zip_name="$val" ;;
-              windows_zip_name) windows_zip_name="$val" ;;
+              windows_installer_name) windows_installer_name="$val" ;;
             esac
           done < "$RESOLVED"
-          if [ -z "$version" ] || [ -z "$dmg_name" ] || [ -z "$zip_name" ] || [ -z "$windows_zip_name" ]; then
+          if [ -z "$version" ] || [ -z "$dmg_name" ] || [ -z "$zip_name" ] || [ -z "$windows_installer_name" ]; then
             echo "::error::check-release.ts resolve did not emit all expected outputs"
             exit 1
           fi
@@ -1295,8 +1591,8 @@ jobs:
             echo "::error::Cross-platform version mismatch: resolved=$version windows=$WINDOWS_VERSION macos=$MACOS_VERSION"
             exit 1
           fi
-          if [ "$WINDOWS_ZIP_NAME_IN" != "$windows_zip_name" ] || [ "$MACOS_WINDOWS_ZIP_NAME" != "$windows_zip_name" ]; then
-            echo "::error::Windows ZIP name mismatch: resolved=$windows_zip_name windows=$WINDOWS_ZIP_NAME_IN macos=$MACOS_WINDOWS_ZIP_NAME"
+          if [ "$WINDOWS_INSTALLER_NAME_IN" != "$windows_installer_name" ] || [ "$MACOS_WINDOWS_INSTALLER_NAME" != "$windows_installer_name" ]; then
+            echo "::error::Windows installer name mismatch: resolved=$windows_installer_name windows=$WINDOWS_INSTALLER_NAME_IN macos=$MACOS_WINDOWS_INSTALLER_NAME"
             exit 1
           fi
           if [ "$MACOS_DMG_NAME" != "$dmg_name" ] || [ "$MACOS_ZIP_NAME" != "$zip_name" ]; then
@@ -1312,7 +1608,7 @@ jobs:
           ZIP="packages/desktop/out/release-artifacts/update/$zip_name"
           BLOCKMAP="packages/desktop/out/release-artifacts/update/${zip_name}.blockmap"
           MANIFEST="packages/desktop/out/release-artifacts/update/latest-mac.yml"
-          WINDOWS_ZIP="packages/desktop/out/release-artifacts/windows/$windows_zip_name"
+          WINDOWS_INSTALLER="packages/desktop/out/release-artifacts/windows/$windows_installer_name"
 
           verify_artifact() {
             local label="$1"
@@ -1340,17 +1636,17 @@ jobs:
           verify_artifact "macOS update ZIP" "$ZIP" "$MACOS_ZIP_SHA256"
           verify_artifact "macOS blockmap" "$BLOCKMAP" "$MACOS_BLOCKMAP_SHA256"
           verify_artifact "macOS update manifest" "$MANIFEST" "$MACOS_MANIFEST_SHA256"
-          verify_artifact "Windows ZIP" "$WINDOWS_ZIP" "$WINDOWS_ZIP_SHA256"
+          verify_artifact "Windows installer" "$WINDOWS_INSTALLER" "$WINDOWS_INSTALLER_SHA256"
 
           {
             echo "version=$version"
             echo "release_tag=$TAG"
-            echo "windows_zip_name=$windows_zip_name"
+            echo "windows_installer_name=$windows_installer_name"
             echo "dmg=$DMG"
             echo "zip=$ZIP"
             echo "blockmap=$BLOCKMAP"
             echo "manifest=$MANIFEST"
-            echo "windows_zip=$WINDOWS_ZIP"
+            echo "windows_installer=$WINDOWS_INSTALLER"
             echo "dmg_sha256=${MACOS_DMG_SHA256,,}"
           } >> "$GITHUB_OUTPUT"
 
@@ -1372,12 +1668,12 @@ jobs:
           ZIP: ${{ steps.verify.outputs.zip }}
           BLOCKMAP: ${{ steps.verify.outputs.blockmap }}
           MANIFEST: ${{ steps.verify.outputs.manifest }}
-          WINDOWS_ZIP: ${{ steps.verify.outputs.windows_zip }}
+          WINDOWS_INSTALLER: ${{ steps.verify.outputs.windows_installer }}
         run: |
           set -euo pipefail
           yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
             --dmg "$DMG" --zip "$ZIP" --blockmap "$BLOCKMAP" --manifest "$MANIFEST" \
-            --windows-zip "$WINDOWS_ZIP"
+            --windows-installer "$WINDOWS_INSTALLER"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       # Scoped only to this step (not job-level env) so earlier steps never see
@@ -1442,23 +1738,23 @@ jobs:
           rm -f "$TARBALL"
 
       # Confirm the live GitHub Release asset URL and SHA-256 match the built
-      # Windows ZIP before invoking Komac with WINGET_TOKEN.
-      - name: Verify published Windows ZIP asset
+      # Windows installer before invoking Komac with WINGET_TOKEN.
+      - name: Verify published Windows installer asset
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.publish.outputs.version }}
           RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
-          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          WINDOWS_INSTALLER_NAME: ${{ needs.publish.outputs.windows_installer_name }}
+          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_installer_sha256 }}
         run: |
           set -euo pipefail
-          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_ZIP_NAME" ] || [ -z "$EXPECTED_SHA256" ]; then
-            echo "::error::Missing release outputs required to verify published Windows ZIP asset (version, release_tag, windows_zip_name, or windows_zip_sha256)."
+          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_INSTALLER_NAME" ] || [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::Missing release outputs required to verify published Windows installer asset (version, release_tag, windows_installer_name, or windows_installer_sha256)."
             exit 1
           fi
           EXPECTED_SHA256="${EXPECTED_SHA256^^}"
           if [[ ! "$EXPECTED_SHA256" =~ ^[0-9A-F]{64}$ ]]; then
-            echo "::error::Expected Windows ZIP SHA-256 is not a valid 64-character hex digest: $EXPECTED_SHA256"
+            echo "::error::Expected Windows installer SHA-256 is not a valid 64-character hex digest: $EXPECTED_SHA256"
             exit 1
           fi
           RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
@@ -1466,18 +1762,18 @@ jobs:
             echo "::error::Release $RELEASE_TAG is still a draft; refusing to submit WinGet update."
             exit 1
           fi
-          ASSET_JSON="$(jq -c --arg name "$WINDOWS_ZIP_NAME" '[.assets[] | select(.name == $name)]' <<< "$RELEASE_JSON")"
+          ASSET_JSON="$(jq -c --arg name "$WINDOWS_INSTALLER_NAME" '[.assets[] | select(.name == $name)]' <<< "$RELEASE_JSON")"
           ASSET_COUNT="$(jq 'length' <<< "$ASSET_JSON")"
           if [ "$ASSET_COUNT" -ne 1 ]; then
-            echo "::error::Expected exactly 1 published release asset named $WINDOWS_ZIP_NAME on tag $RELEASE_TAG (found $ASSET_COUNT)."
+            echo "::error::Expected exactly 1 published release asset named $WINDOWS_INSTALLER_NAME on tag $RELEASE_TAG (found $ASSET_COUNT)."
             exit 1
           fi
           ASSET_STATE="$(jq -r '.[0].state // empty' <<< "$ASSET_JSON")"
           if [ "$ASSET_STATE" != "uploaded" ]; then
-            echo "::error::Published release asset $WINDOWS_ZIP_NAME is not uploaded (state=$ASSET_STATE)."
+            echo "::error::Published release asset $WINDOWS_INSTALLER_NAME is not uploaded (state=$ASSET_STATE)."
             exit 1
           fi
-          EXPECTED_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          EXPECTED_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_INSTALLER_NAME"
           DOWNLOAD_URL="$(jq -r '.[0].browser_download_url // empty' <<< "$ASSET_JSON")"
           if [ "$DOWNLOAD_URL" != "$EXPECTED_URL" ]; then
             echo "::error::Published asset browser_download_url ($DOWNLOAD_URL) does not match expected URL ($EXPECTED_URL)."
@@ -1492,17 +1788,17 @@ jobs:
               exit 1
             fi
             if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-              echo "::error::Published asset digest ($ACTUAL_SHA256) does not match expected Windows ZIP SHA-256 ($EXPECTED_SHA256)."
+              echo "::error::Published asset digest ($ACTUAL_SHA256) does not match expected Windows installer SHA-256 ($EXPECTED_SHA256)."
               exit 1
             fi
-            echo "Verified published Windows ZIP asset via GitHub Release digest: $DOWNLOAD_URL ($ACTUAL_SHA256)"
+            echo "Verified published Windows installer asset via GitHub Release digest: $DOWNLOAD_URL ($ACTUAL_SHA256)"
           else
             ACTUAL_SHA256="$(curl -fsSL "$DOWNLOAD_URL" | sha256sum | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
             if [[ ! "$ACTUAL_SHA256" =~ ^[0-9A-F]{64}$ ]] || [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-              echo "::error::Downloaded Windows ZIP SHA-256 ($ACTUAL_SHA256) does not match expected SHA-256 ($EXPECTED_SHA256)."
+              echo "::error::Downloaded Windows installer SHA-256 ($ACTUAL_SHA256) does not match expected SHA-256 ($EXPECTED_SHA256)."
               exit 1
             fi
-            echo "Verified published Windows ZIP asset via stream SHA-256: $DOWNLOAD_URL ($ACTUAL_SHA256)"
+            echo "Verified published Windows installer asset via stream SHA-256: $DOWNLOAD_URL ($ACTUAL_SHA256)"
           fi
 
       - name: Publish to winget-pkgs
@@ -1512,22 +1808,22 @@ jobs:
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'LongYinan.Portato' }}
           VERSION: ${{ needs.publish.outputs.version }}
           RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
+          WINDOWS_INSTALLER_NAME: ${{ needs.publish.outputs.windows_installer_name }}
         run: |
           set -euo pipefail
           if [ -z "$WINGET_TOKEN" ]; then
             echo "WINGET_TOKEN is not set; skipping WinGet submission."
             exit 0
           fi
-          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_ZIP_NAME" ]; then
-            echo "::error::Missing release outputs required for WinGet submission (version, release_tag, or windows_zip_name)."
+          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_INSTALLER_NAME" ]; then
+            echo "::error::Missing release outputs required for WinGet submission (version, release_tag, or windows_installer_name)."
             exit 1
           fi
-          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_INSTALLER_NAME"
           KOMAC_LOG="$RUNNER_TEMP/komac-submit.log"
           GITHUB_TOKEN="$WINGET_TOKEN" "$RUNNER_TEMP/komac/komac" update "$PACKAGE_ID" \
             --version "$VERSION" \
-            --urls "$INSTALLER_URL" \
+            --urls "${INSTALLER_URL}|arm64" \
             --submit | tee "$KOMAC_LOG"
           # Strip ANSI escape codes before scanning for the created winget-pkgs PR URL.
           PR_NUMBER="$(sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$KOMAC_LOG" \
@@ -1541,7 +1837,7 @@ jobs:
 
       # Komac exits 0 in CI when get_existing_pull_request matches a closed or
       # stale PR, so confirm the exact installer manifest (with the published
-      # arm64 ZIP URL and SHA-256) exists on winget-pkgs default branch or on
+      # arm64 nullsoft URL and SHA-256) exists on winget-pkgs default branch or on
       # an open PR targeting the default branch that adds/modifies it.
       - name: Verify WinGet submission
         if: steps.submit.outputs.submitted == 'true'
@@ -1550,16 +1846,16 @@ jobs:
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'LongYinan.Portato' }}
           VERSION: ${{ needs.publish.outputs.version }}
           RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
-          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          WINDOWS_INSTALLER_NAME: ${{ needs.publish.outputs.windows_installer_name }}
+          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_installer_sha256 }}
           PR_NUMBER: ${{ steps.submit.outputs.pr_number }}
         run: |
           set -euo pipefail
           if [ -z "$EXPECTED_SHA256" ]; then
-            echo "::error::Missing windows_zip_sha256 output for WinGet verification."
+            echo "::error::Missing windows_installer_sha256 output for WinGet verification."
             exit 1
           fi
-          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_INSTALLER_NAME"
           FIRST_LETTER="$(printf '%s' "${PACKAGE_ID:0:1}" | tr '[:upper:]' '[:lower:]')"
           MANIFEST_PATH="manifests/$FIRST_LETTER/${PACKAGE_ID//./\/}/$VERSION"
           INSTALLER_MANIFEST="$MANIFEST_PATH/$PACKAGE_ID.installer.yaml"
@@ -1590,6 +1886,7 @@ jobs:
               sys.exit(1)
           expected_url = os.environ["EXPECTED_URL"]
           expected_sha = os.environ["EXPECTED_SHA"].upper()
+          root_type = str(doc.get("InstallerType", "")).lower()
           installers = doc.get("Installers")
           if not isinstance(installers, list):
               sys.exit(1)
@@ -1597,9 +1894,10 @@ jobs:
               if not isinstance(item, dict):
                   continue
               arch = str(item.get("Architecture", "")).lower()
+              inst_type = str(item.get("InstallerType") or root_type).lower()
               url = str(item.get("InstallerUrl", ""))
               sha = str(item.get("InstallerSha256", "")).upper()
-              if arch == "arm64" and url == expected_url and sha == expected_sha:
+              if arch == "arm64" and inst_type == "nullsoft" and url == expected_url and sha == expected_sha:
                   sys.exit(0)
           sys.exit(1)
           '

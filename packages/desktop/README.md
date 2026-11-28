@@ -90,24 +90,27 @@ release that includes it.
 The [desktop release workflow](../../.github/workflows/desktop-release.yml) produces:
 
 - `Portato-<version>-arm64.dmg` for installation.
-- `mlx-node-<version>-darwin-arm64.zip` for automatic updates.
-- `mlx-node-<version>-darwin-arm64.zip.blockmap` for differential downloads.
+- `Portato-<version>-darwin-arm64.zip` for automatic updates.
+- `Portato-<version>-darwin-arm64.zip.blockmap` for differential downloads.
 - `latest-mac.yml` with the update version, archive size/hash, minimum macOS, and rollout percentage.
-- `Portato-<version>-win32-arm64.zip`, a portable Windows ARM64 app with the
-  native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it and run
-  `Portato-win32-arm64\mlx-node.exe`; no automatic update feed is used. When the
+- `Portato-<version>-win32-arm64-setup.exe`, a per-user Windows ARM64 NSIS
+  installer (installs `Portato.exe`, the native addon, CUDA/cuDNN/OpenBLAS DLLs,
+  and NVRTC headers to `%LOCALAPPDATA%\Programs\Portato` with Start Menu and
+  Desktop shortcuts and Add/Remove Programs registration; supports `/S` silent
+  install/upgrade). No in-app automatic update feed is used on Windows. When the
   `ES_USERNAME`, `ES_PASSWORD`, `CREDENTIAL_ID` and `ES_TOTP_SECRET` secrets are
-  set, every `.exe`, `.dll` and `.node` in it without an existing valid,
-  timestamped signature (NVIDIA's DLLs already carry one) is Authenticode-signed
-  and timestamped through SSL.com eSigner (via pinned `CodeSignTool` v1.3.2)
-  before the ZIP is built; without them the ZIP ships unsigned, with a warning.
+  set, every `.exe`, `.dll` and `.node` without an existing valid, timestamped
+  signature (NVIDIA's DLLs already carry one), `Uninstall.exe`, and the final
+  setup `.exe` are Authenticode-signed and timestamped through SSL.com eSigner
+  (via pinned `CodeSignTool` v1.3.2); without them the installer ships unsigned,
+  with a warning.
 
 Stable Windows ARM64 builds also produce two workflow artifacts (kept off GitHub Releases):
 
 - `mlx-node-desktop-windows-arm64-msix`: unsigned `Portato-<version>-win32-arm64.msix`
   for Microsoft Store Partner Center ingestion.
 - `mlx-node-desktop-winget-manifests`: WinGet 1.12.0 multi-file manifests pointing at
-  the GitHub Release `win32-arm64.zip` archive.
+  the GitHub Release `win32-arm64-setup.exe` installer.
 
 ## Microsoft Store (Windows ARM64 MSIX)
 
@@ -143,8 +146,8 @@ binary downloads/updates so updates flow exclusively through the Microsoft Store
 
 ## WinGet (Windows Package Manager)
 
-WinGet distributes the portable `Portato-<version>-win32-arm64.zip` release asset as a
-nested portable package (`ArchiveBinariesDependOnPath: true`, `mlx-node` command alias).
+WinGet distributes the `Portato-<version>-win32-arm64-setup.exe` release asset as a
+per-user Nullsoft (`nullsoft`) installer (`%LOCALAPPDATA%\Programs\Portato`).
 
 For the one-time initial submission to `microsoft/winget-pkgs`:
 
@@ -155,7 +158,7 @@ For the one-time initial submission to `microsoft/winget-pkgs`:
    ```bash
    yarn workspace @mlx-node/desktop winget:manifests \
      --version <version> \
-     --zip packages/desktop/out/Portato-<version>-win32-arm64.zip
+     --installer packages/desktop/out/Portato-<version>-win32-arm64-setup.exe
    ```
 
 2. Copy the generated `manifests/<letter>/<Publisher>/<App>/<version>/` directory into
@@ -167,17 +170,17 @@ secret `WINGET_TOKEN` (a GitHub PAT with `public_repo` scope) and optionally set
 `WINGET_PACKAGE_ID` repository variable (defaults to `LongYinan.Portato`). Once the
 GitHub release is published (even if the subsequent Homebrew cask bump fails), the
 workflow's `winget` job installs a pinned, SHA-256-verified Komac binary in a
-credential-free step, then runs `komac update <package-id> --version <version> --urls <exact-release-tag-zip-url> --submit`
+credential-free step, then runs `komac update <package-id> --version <version> --urls <exact-release-tag-installer-url>|arm64 --submit`
 with `WINGET_TOKEN` scoped strictly to that submission step via `GITHUB_TOKEN`.
 
 The macOS DMG and update ZIP contain the same Developer ID signed, notarized, and stapled app. The ZIP is
 created after stapling, then extracted to verify its signature, ticket, and version
-before publication. Dry runs build and verify the macOS and Windows archives but
+before publication. Dry runs build and verify the macOS and Windows artifacts but
 skip notarization and release uploads.
 
 The app uses [electron-updater](https://www.electron.build/v26/docs/features/auto-update/)
 with public GitHub Releases. macOS installation still uses Squirrel.Mac. Keep the
-update ZIP name (`mlx-node-<version>-darwin-arm64.zip`), the userData folder name (`mlx-node`),
+update ZIP name (`Portato-<version>-darwin-arm64.zip`), the userData folder name (`mlx-node`),
 bundle ID `ai.mlxnode.desktop`, and Developer ID signing identity
 consistent across releases. No additional update server, client token, or signing
 secret is needed. Packaging includes `Contents/Resources/app-update.yml` before signing.

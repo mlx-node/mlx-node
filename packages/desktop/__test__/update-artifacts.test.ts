@@ -24,7 +24,7 @@ describe('update release artifacts', () => {
   it('produces metadata and blockmaps the installed updater can consume without changing the archive', async () => {
     const root = temporary();
     const archive = randomBytes(256 * 1024);
-    const zipPath = join(root, 'mlx-node-0.0.14-darwin-arm64.zip');
+    const zipPath = join(root, 'Portato-0.0.14-darwin-arm64.zip');
     writeFileSync(zipPath, archive);
     const { manifestPath, blockmapPath } = await createUpdateArtifacts({
       zipPath,
@@ -46,7 +46,7 @@ describe('update release artifacts', () => {
       releaseDate: '2026-09-08T00:00:00.000Z',
       files: [
         {
-          url: 'mlx-node-0.0.14-darwin-arm64.zip',
+          url: 'Portato-0.0.14-darwin-arm64.zip',
           size: archive.length,
           sha512: createHash('sha512').update(archive).digest('base64'),
         },
@@ -74,7 +74,7 @@ describe('update release artifacts', () => {
       ['0.0.13', previous],
       ['0.0.14', updated],
     ] as const) {
-      const zipPath = join(root, `mlx-node-${version}-darwin-arm64.zip`);
+      const zipPath = join(root, `Portato-${version}-darwin-arm64.zip`);
       writeFileSync(zipPath, bytes);
       const result = await createUpdateArtifacts({ zipPath, version, minimumSystemVersion: '26.0' });
       maps.push(JSON.parse(gunzipSync(readFileSync(result.blockmapPath)).toString()));
@@ -97,7 +97,7 @@ describe('update release artifacts', () => {
   it('rejects mismatched versions and missing OS eligibility before generating release files', async () => {
     const root = temporary();
     const options = {
-      zipPath: join(root, 'mlx-node-0.0.14-darwin-arm64.zip'),
+      zipPath: join(root, 'Portato-0.0.14-darwin-arm64.zip'),
       version: '0.0.13',
       minimumSystemVersion: '26.0',
     };

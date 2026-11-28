@@ -63,7 +63,16 @@ curl http://127.0.0.1:8000/v1/audio/voices \
 The response includes a `Location` header and this resource:
 
 ```json
-{"id":"voice_<uuid>","object":"audio.voice","type":"audio_sample","name":"Example","model":"Base-8bit","created_at":1791849600,"persistent":false,"status":"active"}
+{
+  "id": "voice_<uuid>",
+  "object": "audio.voice",
+  "type": "audio_sample",
+  "name": "Example",
+  "model": "Base-8bit",
+  "created_at": 1791849600,
+  "persistent": false,
+  "status": "active"
+}
 ```
 
 Use the returned ID as `"voice":{"id":"voice_<uuid>"}` in speech JSON or the
@@ -345,15 +354,15 @@ transport; headers can no longer change. CORS exposes both retry headers.
 Additional settings are available through `createInferenceHost({ audio: ... })`
 or `createServer({ audio: ... })`:
 
-| Setting                 | Default                                     |
-| ----------------------- | ------------------------------------------- |
-| `maxUploadBytes`        | 25 MiB WAV                                  |
-| `maxTempBytes`          | 512 MiB across uploads and WAV downloads    |
-| `maxConcurrentRequests` | 17 active audio requests, including uploads |
-| `inputIdleMs`           | 30000 ms while actually waiting for input   |
-| `outputDrainMs`         | 30000 ms of continuous output backpressure  |
+| Setting                 | Default                                                |
+| ----------------------- | ------------------------------------------------------ |
+| `maxUploadBytes`        | 25 MiB WAV                                             |
+| `maxTempBytes`          | 512 MiB across uploads and WAV downloads               |
+| `maxConcurrentRequests` | 17 active audio requests, including uploads            |
+| `inputIdleMs`           | 30000 ms while actually waiting for input              |
+| `outputDrainMs`         | 30000 ms of continuous output backpressure             |
 | `maxVoiceRecords`       | 128 voice metadata records, including inactive records |
-| `maxReferenceSeconds`   | 30 seconds per reference upload            |
+| `maxReferenceSeconds`   | 30 seconds per reference upload                        |
 
 The concurrency cap covers ASR, TTS and voice resource operations together. The temporary storage quota is
 an independent hard bound: it covers retained ASR/reference uploads and TTS WAV spools,
@@ -407,33 +416,10 @@ not compress or buffer events. Use SSE if a proxy cannot preserve final trailers
 ## Validation
 
 Normal tests use substitute inference backends and the native audio codecs;
-no checkpoint download is needed. Real-model comparisons are opt-in:
-
-```sh
-yarn exec oxnode scripts/server/audio-benchmark.ts /path/to/models recording.wav report.json
-yarn exec oxnode scripts/server/audio-voices-smoke.ts /path/to/models reference.wav transcript.txt
-# Native ASR stage timings without the HTTP layer (feature, encoder, prefill, decode)
-yarn exec oxnode scripts/server/asr-bench.ts /path/to/models/<asr-checkpoint> recording.wav
-yarn exec oxnode scripts/server/asr-stream-bench.ts /path/to/models/<asr-checkpoint> recording.wav
-# Native TTS timings without the HTTP layer (synthesis ms, first PCM, RTF, frames/s)
-yarn exec oxnode scripts/server/tts-bench.ts /path/to/models/<tts-checkpoint> [voice] [text]
-```
-
-`BASE_MODEL` selects the reference-voice smoke checkpoint (default `Base-8bit`).
-The voice smoke uses the official Node SDK to prepare/query/release references,
-compare cloned WAV and PCM bytes with fixed sampling, observe native eviction,
-and verify invalidation on model disposal. It writes no persistent voice assets.
-
-Environment variables `ASR_MODEL`, `TTS_MODEL`, and `DESIGN_MODEL` select existing
-checkpoint directory names. The script measures cold and warm HTTP/SDK timings,
-compares PCM hashes and one-shot transcripts, checks revision events, exercises
-ASR cancellation and reuse, concurrent ASR/TTS, and capability-slot replacement.
-Three samples are smoke measurements, not a statistically robust production SLO.
-
-The [OpenAI SDK smoke runner](../scripts/server/audio-sdk-smoke.ts) exercises
-real requests from the official Node client, including multipart, binary
-audio, SSE, error objects and duplex NDJSON. It covers generated
-SDK methods as well as the server's revision, voice and input-stream extensions.
+no checkpoint download is needed. The server test suite under
+`__test__/server/audio-*.test.ts` exercises the HTTP/SSE/NDJSON protocol and
+official OpenAI Node SDK compatibility (including multipart uploads, binary
+audio, SSE events, error objects, and duplex NDJSON).
 
 The protocol intentionally follows OpenAI field names while exposing its
 revision semantics and checkpoint-dependent PCM rate. References:

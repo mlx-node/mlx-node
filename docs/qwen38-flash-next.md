@@ -194,20 +194,20 @@ completion, refill, and source errors without representing itself as a real
 model benchmark. A future valid capture can be replayed with the ignored
 `real_trace_partial_replay` test and the variables below.
 
-| Setting                       | Behavior                                                                                                                              |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `QWEN4_EXP_ROUTE_TRACE`       | A valid P3.0-c JSONL route trace for the ignored partial replay test.                                                                 |
-| `QWEN4_EXP_REPLAY_CAPACITIES` | Comma-separated replay capacities (default `128,192,256,384,512`).                                                                    |
-| `QWEN4_EXP_REPLAY_SLOT_COST`  | Bytes charged per unique missing `(layer, expert)` (default 8 MiB).                                                                   |
-| `QWEN4_EXP_REPLAY_EXPECTED`   | Optional P3.0-c `lru-results.json`; every replay field must match.                                                                    |
-| `QWEN4_EXP_REPLAY_LABEL`      | Capture label selecting one expected row when the results contain multiple captures.                                                  |
-| `QWEN4_EXP_REAL_MODEL`        | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                                                  |
-| `QWEN4_EXP_REAL_INPUTS`       | Their prompts: a `{name, tokenIds}` case list from `oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38 --output inputs.json`. |
-| `QWEN4_EXP_REAL_AUX`          | The MTP checkpoint dir the slot tests attach.                                                                                         |
-| `QWEN4_EXP_REAL_STEPS`        | Greedy decode steps per case (default 256).                                                                                           |
-| `QWEN4_EXP_REAL_CASES`        | Comma-separated case names (default `6k,16k`).                                                                                        |
-| `QWEN4_EXP_REAL_EXPECTED`     | A `QWEN4_EXP_REAL_OUT` file of an earlier run: each case's greedy argmax must equal its `reference.argmax`.                           |
-| `QWEN4_EXP_REAL_OUT`          | Where the greedy test writes each case's argmax and tokens.                                                                           |
+| Setting                       | Behavior                                                                                                    |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `QWEN4_EXP_ROUTE_TRACE`       | A valid P3.0-c JSONL route trace for the ignored partial replay test.                                       |
+| `QWEN4_EXP_REPLAY_CAPACITIES` | Comma-separated replay capacities (default `128,192,256,384,512`).                                          |
+| `QWEN4_EXP_REPLAY_SLOT_COST`  | Bytes charged per unique missing `(layer, expert)` (default 8 MiB).                                         |
+| `QWEN4_EXP_REPLAY_EXPECTED`   | Optional P3.0-c `lru-results.json`; every replay field must match.                                          |
+| `QWEN4_EXP_REPLAY_LABEL`      | Capture label selecting one expected row when the results contain multiple captures.                        |
+| `QWEN4_EXP_REAL_MODEL`        | Opt-in real-model tests (ignored by default): the Qwen3.8 GGUF path.                                        |
+| `QWEN4_EXP_REAL_INPUTS`       | Their prompts: path to a JSON list of `{name, tokenIds}` cases.                                             |
+| `QWEN4_EXP_REAL_AUX`          | The MTP checkpoint dir the slot tests attach.                                                               |
+| `QWEN4_EXP_REAL_STEPS`        | Greedy decode steps per case (default 256).                                                                 |
+| `QWEN4_EXP_REAL_CASES`        | Comma-separated case names (default `6k,16k`).                                                              |
+| `QWEN4_EXP_REAL_EXPECTED`     | A `QWEN4_EXP_REAL_OUT` file of an earlier run: each case's greedy argmax must equal its `reference.argmax`. |
+| `QWEN4_EXP_REAL_OUT`          | Where the greedy test writes each case's argmax and tokens.                                                 |
 
 Run them with `QWEN4_EXP_REAL_MODEL=... QWEN4_EXP_REAL_INPUTS=... cargo test -p mlx-core --lib real_ -- --ignored --test-threads=1 --nocapture`.
 
@@ -476,9 +476,7 @@ positions. Tests also cover slot lifetimes, source corruption, bounded reads,
 dynamic admission, cancellation, and specialized quantized kernels. See the
 [fixture provenance](../crates/mlx-core/tests/fixtures/qwen4-exp/README.md).
 
-The [consolidated research report](research/qwen38-flash-next.md) records the
-mlx.fast source ports, exact and experimental arithmetic, workload/caching
-conditions, correctness checks, and measurements. Historical macOS 26 runs
+Historical macOS 26 runs
 exceeded 90% of the published reference prefill rate with experimental arithmetic
 enabled; the current macOS 27 recheck does not establish that target, and decode
 remains below it. The checkpoints and prompts differ from the private reference.

@@ -31,8 +31,7 @@
     "@mlx-node/rerank": "workspace:*",
     "@mlx-node/server": "workspace:*",
     "@mlx-node/tts": "workspace:*",
-    "@napi-rs/keyring": "^2.1.2",
-    "semver": "^7.8.6"
+    "@napi-rs/keyring": "^2.1.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.6"

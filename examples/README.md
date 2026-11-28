@@ -1,56 +1,45 @@
 # MLX-Node Examples
 
-This directory contains example scripts demonstrating MLX-Node capabilities.
-
-## Generation Speed Benchmark (`lm.ts`)
-
-`lm.ts` runs token generation through mlx-node and reports tokens/second.
-
-### Prerequisites
+Build the workspace once before running examples:
 
 ```bash
-# Build the project (from project root)
-yarn install && yarn build
+yarn build
 ```
 
-### Model Setup
+Run any TypeScript example with `oxnode` (not `tsx`).
 
-Convert a Qwen model to MLX float32 format:
+## Downloading Models
+
+Use the built-in CLI to fetch checkpoints into `.cache/models/` (no Python tooling required):
 
 ```bash
-# Using mlx-lm
-python -m mlx_lm.convert \
-    --hf-path Qwen/Qwen2.5-0.5B-Instruct \
-    --mlx-path .cache/models/qwen3-0.6b-mlx-f32 \
-    --dtype float32
+yarn mlx download model
 ```
 
-### Running
+## Examples
 
-```bash
-node examples/lm.ts
-# Or with oxnode
-npx oxnode examples/lm.ts
-```
+### Chat & Language Models (`@mlx-node/lm`)
 
-### Interpreting Results
+- **`examples/lm.ts`** — 4-turn streaming `ChatSession` demo with TTFT / prefill / decode throughput metrics and KV cache reuse checks. Defaults to `.cache/models/qwen3.5-9B-unsloth` and optionally accepts `[model-name]` plus `--image <path>` / `--image2 <path>` for VLM turns:
+  ```bash
+  oxnode examples/lm.ts
+  oxnode examples/lm.ts qwen3.5-9B-unsloth --image examples/ocr.png
+  ```
+- **`examples/tool-use-example.ts`** — Tool calling with `ChatSession` and `sendToolResult`.
+- **`examples/gemma4-qat-smoke.ts`** — Gemma 4 E2B QAT greedy text (and optional image) smoke check.
 
-`lm.ts`:
+### Vision & Document OCR (`@mlx-node/vlm`)
 
-- Uses the model at `.cache/models/qwen3-0.6b-mlx-f32`
-- Generates with `temperature=0.7, topP=0.9`
-- Displays tokens/second for performance
+- **`examples/vlm-inference.ts`** — Multi-turn Qianfan-OCR VLM chat.
+- **`examples/paddle-ocr-pipeline.ts`** — PP-DocLayoutV3 + PaddleOCR-VL-1.5 document OCR pipeline (uses `examples/ocr.png`).
 
-Expected output format:
+### Text-to-Speech (`@mlx-node/tts`)
 
-```
-Generated (42 tokens, 850ms, 49.41 tokens/s):
-[generated text...]
-```
+- **`examples/tts/streaming.ts`** — Streaming Qwen3-TTS synthesis.
+- **`examples/tts/instruct.ts`** — Instruction-controlled / VoiceDesign synthesis.
+- **`examples/tts/http-stream.ts`** — Streaming `/v1/audio/speech/stream` against `@mlx-node/server`.
 
-### Performance Notes
+### Training (`@mlx-node/trl`)
 
-- First run may be slower due to model loading and Metal shader compilation
-- Subsequent runs typically show consistent performance
-- tokens/s metric excludes model loading time, only measures generation
-- Uses Apple Metal GPU acceleration
+- **`examples/sft/`** — SFT fine-tuning (`sft-octokit.ts`) and dataset generation (`generate-dataset.ts`).
+- **`examples/grpo/`** — Multi-turn GRPO GitHub tool training (`train-github-tool.ts`; see [examples/grpo/README.md](grpo/README.md)).

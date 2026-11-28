@@ -24,10 +24,10 @@ import {
   versionFromTag,
   updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsInstallerPath,
   versionFromWindowsMsixPath,
-  versionFromWindowsZipPath,
+  windowsInstallerFileName,
   windowsMsixFileName,
-  windowsZipFileName,
 } from '../scripts/release-version.js';
 
 /** Everything agreeing on 0.0.9 — the shape a good release has. */
@@ -163,20 +163,21 @@ describe('assertVersionsAgree, untagged path', () => {
   });
 });
 
-describe('Windows ZIP release versions', () => {
-  it('round-trips a Windows path and checks the version against the other artifacts', () => {
-    const path = `packages\\desktop\\out\\${windowsZipFileName('0.0.14')}`;
-    expect(windowsZipFileName('0.0.14')).toBe('Portato-0.0.14-win32-arm64.zip');
-    expect(versionFromWindowsZipPath(path)).toBe('0.0.14');
-    expect(assertVersionsAgree({ ...AGREED, windowsZip: '0.0.9' })).toBe('0.0.9');
-    expect(() => assertVersionsAgree({ ...AGREED, windowsZip: '0.0.8' })).toThrow(/Windows ZIP filename/);
+describe('Windows installer release versions', () => {
+  it('round-trips a Windows installer path and checks the version against the other artifacts', () => {
+    const path = `packages\\desktop\\out\\${windowsInstallerFileName('0.0.14')}`;
+    expect(windowsInstallerFileName('0.0.14')).toBe('Portato-0.0.14-win32-arm64-setup.exe');
+    expect(versionFromWindowsInstallerPath(path)).toBe('0.0.14');
+    expect(assertVersionsAgree({ ...AGREED, windowsInstaller: '0.0.9' })).toBe('0.0.9');
+    expect(() => assertVersionsAgree({ ...AGREED, windowsInstaller: '0.0.8' })).toThrow(/Windows installer filename/);
   });
 
-  it('rejects other platforms, architectures, and invalid versions', () => {
-    expect(versionFromWindowsZipPath('Portato-0.0.14-darwin-arm64.zip')).toBeNull();
-    expect(versionFromWindowsZipPath('Portato-0.0.14-win32-x64.zip')).toBeNull();
-    expect(versionFromWindowsZipPath('Portato-nightly-win32-arm64.zip')).toBeNull();
-    expect(() => windowsZipFileName('nightly')).toThrow();
+  it('rejects other platforms, architectures, archive formats, and invalid versions', () => {
+    expect(versionFromWindowsInstallerPath('Portato-0.0.14-win32-arm64.zip')).toBeNull();
+    expect(versionFromWindowsInstallerPath('Portato-0.0.14-darwin-arm64-setup.exe')).toBeNull();
+    expect(versionFromWindowsInstallerPath('Portato-0.0.14-win32-x64-setup.exe')).toBeNull();
+    expect(versionFromWindowsInstallerPath('Portato-nightly-win32-arm64-setup.exe')).toBeNull();
+    expect(() => windowsInstallerFileName('nightly')).toThrow();
   });
 });
 
@@ -245,17 +246,18 @@ describe('Windows MSIX release versions', () => {
 });
 
 describe('update ZIP release versions', () => {
-  it('names the archive for Apple Silicon discovery by update.electronjs.org', () => {
-    expect(updateZipFileName('0.0.14')).toBe('mlx-node-0.0.14-darwin-arm64.zip');
-    expect(versionFromUpdateZipPath('/out/mlx-node-0.0.14-darwin-arm64.zip')).toBe('0.0.14');
+  it('names the archive for Apple Silicon discovery by electron-updater', () => {
+    expect(updateZipFileName('0.0.14')).toBe('Portato-0.0.14-darwin-arm64.zip');
+    expect(versionFromUpdateZipPath('/out/Portato-0.0.14-darwin-arm64.zip')).toBe('0.0.14');
   });
 
   it('rejects archives for a different app, platform, architecture or version scheme', () => {
     for (const path of [
-      'mlx-node-0.0.14-arm64.zip',
-      'mlx-node-0.0.14-darwin-x64.zip',
+      'Portato-0.0.14-arm64.zip',
+      'Portato-0.0.14-darwin-x64.zip',
+      'mlx-node-0.0.14-darwin-arm64.zip',
       'other-0.0.14-darwin-arm64.zip',
-      'mlx-node-nightly-darwin-arm64.zip',
+      'Portato-nightly-darwin-arm64.zip',
     ]) {
       expect(versionFromUpdateZipPath(path)).toBeNull();
     }

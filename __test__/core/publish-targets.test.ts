@@ -35,7 +35,7 @@ describe('resolvePublishedTargets', () => {
         optionalDependencies: Object.keys(manifest.optionalDependencies ?? {}),
         platformPackageDirs,
       }),
-    ).toEqual(['aarch64-apple-darwin']);
+    ).toEqual(['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'aarch64-pc-windows-msvc']);
   });
 
   it('counts only platform folders with a package.json that is not private', () => {

@@ -21,7 +21,7 @@ const SAMPLE_SHA256_LOWER = '0123456789abcdef'.repeat(4);
 const SAMPLE_SHA256_UPPER = SAMPLE_SHA256_LOWER.toUpperCase();
 
 describe('WinGet manifest generation', () => {
-  it('renders valid 1.12.0 version, installer, and locale manifests with uppercase SHA-256', () => {
+  it('renders valid 1.12.0 version, installer, and locale manifests for the NSIS installer with uppercase SHA-256', () => {
     const generated = generateWingetManifests({
       version: '0.0.21',
       sha256: SAMPLE_SHA256_LOWER,
@@ -42,15 +42,25 @@ describe('WinGet manifest generation', () => {
     expect(generated.files.version.content).toContain('ManifestVersion: 1.12.0');
 
     expect(generated.files.installer.filename).toBe('LongYinan.Portato.installer.yaml');
-    expect(generated.files.installer.content).toContain('InstallerType: zip');
-    expect(generated.files.installer.content).toContain('NestedInstallerType: portable');
-    expect(generated.files.installer.content).toContain('RelativeFilePath: Portato-win32-arm64\\mlx-node.exe');
-    expect(generated.files.installer.content).toContain('PortableCommandAlias: mlx-node');
-    expect(generated.files.installer.content).toContain('ArchiveBinariesDependOnPath: true');
+    expect(generated.files.installer.content).toContain('MinimumOSVersion: 10.0.26100.0');
+    expect(generated.files.installer.content).toContain('InstallerLocale: en-US');
+    expect(generated.files.installer.content).toContain('InstallerType: nullsoft');
+    expect(generated.files.installer.content).toContain('Scope: user');
+    expect(generated.files.installer.content).toContain('UpgradeBehavior: install');
+    expect(generated.files.installer.content).toContain('AppsAndFeaturesEntries:');
+    expect(generated.files.installer.content).toContain('- DisplayName: Portato');
+    expect(generated.files.installer.content).toContain('  Publisher: mlx-node');
+    expect(generated.files.installer.content).toContain('  DisplayVersion: 0.0.21');
+    expect(generated.files.installer.content).toContain('  ProductCode: Portato');
+    expect(generated.files.installer.content).toContain(
+      "  DefaultInstallLocation: '%LOCALAPPDATA%\\Programs\\Portato'",
+    );
+    expect(generated.files.installer.content).not.toContain('NestedInstallerType');
+    expect(generated.files.installer.content).not.toContain('ArchiveBinariesDependOnPath');
     expect(generated.files.installer.content).toContain('ReleaseDate: 2026-11-24');
     expect(generated.files.installer.content).toContain('Architecture: arm64');
     expect(generated.files.installer.content).toContain(
-      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/v0.0.21/Portato-0.0.21-win32-arm64.zip',
+      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/v0.0.21/Portato-0.0.21-win32-arm64-setup.exe',
     );
     expect(generated.files.installer.content).toContain(`InstallerSha256: ${SAMPLE_SHA256_UPPER}`);
 
@@ -77,8 +87,9 @@ describe('WinGet manifest generation', () => {
     });
     expect(generated.files.version.filename).toBe('LongYinan.Portato.yaml');
     expect(generated.files.installer.content).toContain(
-      'InstallerUrl: https://github.com/LongYinan/portato/releases/download/v1.2.3/Portato-1.2.3-win32-arm64.zip',
+      'InstallerUrl: https://github.com/LongYinan/portato/releases/download/v1.2.3/Portato-1.2.3-win32-arm64-setup.exe',
     );
+    expect(generated.files.installer.content).toContain('  Publisher: LongYinan');
     expect(generated.files.locale.content).toContain('Publisher: LongYinan');
     expect(generated.files.locale.content).toContain('PublisherUrl: https://github.com/LongYinan');
   });
@@ -92,7 +103,7 @@ describe('WinGet manifest generation', () => {
     });
     expect(bareTag.releaseTag).toBe('0.0.21');
     expect(bareTag.files.installer.content).toContain(
-      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/0.0.21/Portato-0.0.21-win32-arm64.zip',
+      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/0.0.21/Portato-0.0.21-win32-arm64-setup.exe',
     );
     expect(bareTag.files.locale.content).toContain(
       'ReleaseNotesUrl: https://github.com/mlx-node/mlx-node/releases/tag/0.0.21',
@@ -106,7 +117,7 @@ describe('WinGet manifest generation', () => {
     });
     expect(blankTag.releaseTag).toBe('v0.0.21');
     expect(blankTag.files.installer.content).toContain(
-      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/v0.0.21/Portato-0.0.21-win32-arm64.zip',
+      'InstallerUrl: https://github.com/mlx-node/mlx-node/releases/download/v0.0.21/Portato-0.0.21-win32-arm64-setup.exe',
     );
 
     expect(() =>
@@ -164,18 +175,18 @@ describe('WinGet manifest disk output and SHA-256 hashing', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('hashes a ZIP file and writes the three manifests in the winget-pkgs directory layout', () => {
-    const fakeZip = join(root, 'Portato-0.0.21-win32-arm64.zip');
-    const contents = Buffer.from('portable windows zip payload');
-    writeFileSync(fakeZip, contents);
+  it('hashes an installer file and writes the three manifests in the winget-pkgs directory layout', () => {
+    const fakeInstaller = join(root, 'Portato-0.0.21-win32-arm64-setup.exe');
+    const contents = Buffer.from('signed windows nsis installer payload');
+    writeFileSync(fakeInstaller, contents);
     const expectedSha = createHash('sha256').update(contents).digest('hex').toUpperCase();
 
-    expect(sha256File(fakeZip)).toBe(expectedSha);
+    expect(sha256File(fakeInstaller)).toBe(expectedSha);
 
     const outDir = join(root, 'out');
     const written = writeWingetManifests(outDir, {
       version: '0.0.21',
-      sha256: sha256File(fakeZip),
+      sha256: sha256File(fakeInstaller),
       releaseDate: '2026-11-24',
     });
 
@@ -185,7 +196,7 @@ describe('WinGet manifest disk output and SHA-256 hashing', () => {
     expect(readFileSync(written.paths.locale, 'utf8')).toBe(written.files.locale.content);
   });
 
-  it('throws PayloadError when hashing a missing ZIP path', () => {
-    expect(() => sha256File(join(root, 'missing.zip'))).toThrow(PayloadError);
+  it('throws PayloadError when hashing a missing installer path', () => {
+    expect(() => sha256File(join(root, 'missing-setup.exe'))).toThrow(PayloadError);
   });
 });

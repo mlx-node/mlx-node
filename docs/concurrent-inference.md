@@ -3,12 +3,8 @@
 How mlx-node behaves when several chat requests are in flight at once and how
 the dense and hybrid continuous-batching lanes are built. The original findings came
 from an adversarially verified review of `main` @ `2d1fe60e` (2026-08-08): 25
-load-bearing claims, 19 confirmed, 6 corrected, 0 refuted. This document now
-describes the Stage 0 robustness work and the landed Stage 1 scheduler. The
-staged plans built on the original review:
-`docs/superpowers/plans/2026-08-08-stage0-concurrency-robustness.md` (hazard
-fixes) and `docs/superpowers/plans/2026-08-08-stage1-continuous-batching.md`
-(batched decode → ragged step → hybrids, with the design provenance).
+load-bearing claims, 19 confirmed, 6 corrected, 0 refuted. This document describes
+the Stage 0 robustness work and the landed Stage 1 scheduler.
 
 Request isolation does not imply bit-identical output across batch shapes:
 GEMV/GEMM reduction changes can flip greedy decisions. Scheduled speculative
@@ -674,8 +670,7 @@ whole-turn single-token step, so the row resolves the same decode plan and
 grouped kernel either lane would pick, and a multi-row wave still takes
 generic V2 — parity is exact whenever a row decodes alone, and prefill walks
 one shared slice grid (`prefill_slice_ends`) regardless of which lane admitted,
-restored, or replayed the prompt (see
-[splash-qwen38.md](research/splash-qwen38.md) §7 item 12).
+restored, or replayed the prompt.
 
 ## Stage 0 concurrency hazards (verified status)
 
@@ -929,5 +924,4 @@ above as a cooled median-of-three 4-bit result.
   verification and independent accepted-prefix commits. Greedy adaptive DSpark
   measures per-owner allocation costs; sampled adaptive, media and assistant
   commands use ordered owner lanes. Reset and stats remain
-  barriers. See the [inference reference](research/inference-2026-09-05/README.md#measurements-and-decisions)
-  for throughput, numerical limits and recurrent MTP validation.
+  barriers.

@@ -17,6 +17,4 @@ quantized banks with known codes and compare kernel outputs.
 
 The development-only generators are retained with the local research archive,
 not shipped as runtime tooling. Keep generated weights and oracles together;
-do not update expected outputs merely to make a failing test pass. See the
-[research report](../../../../../docs/research/qwen38-flash-next.md) for the
-archive location and validation scope.
+do not update expected outputs merely to make a failing test pass.

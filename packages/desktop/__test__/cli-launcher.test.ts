@@ -266,10 +266,10 @@ describe('app-owned command', () => {
 
   it('builds a direct Electron-as-Node invocation without cmd.exe, preserving Windows CUDA env and stripping NAPI_RS override', () => {
     const config: DesktopCliConfig = {
-      executable: 'C:\\Users\\A&B (1)\\mlx-node\\mlx-node.exe',
-      entry: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\app\\node_modules\\@mlx-node\\cli\\dist\\cli.js',
-      nativeAddon: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\native\\mlx-core.win32-arm64-msvc.node',
-      nativeRuntimeDir: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\native',
+      executable: 'C:\\Users\\A&B (1)\\Portato\\Portato.exe',
+      entry: 'C:\\Users\\A&B (1)\\Portato\\resources\\app\\node_modules\\@mlx-node\\cli\\dist\\cli.js',
+      nativeAddon: 'C:\\Users\\A&B (1)\\Portato\\resources\\native\\mlx-core.win32-arm64-msvc.node',
+      nativeRuntimeDir: 'C:\\Users\\A&B (1)\\Portato\\resources\\native',
       modelsDir: 'D:\\Models',
     };
     const direct = directCliInvocation(config, ['agent', 'update'], 'win32', {

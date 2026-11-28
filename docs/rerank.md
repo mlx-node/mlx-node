@@ -140,4 +140,4 @@ Logs contain model/profile/weight formats, counts, tokens, truncation counts, st
 
 Official model cards declare CC BY-NC 4.0. That is separate from mlx-node's MIT runtime license. Preserve the checkpoint's model card/license when distributing converted weights. See [package notice](../packages/rerank/NOTICE).
 
-[Validation procedure](../scripts/rerank/README.md) pins model revisions, Python versions and frozen score thresholds. [Validation report](validation/rerank.md) records measured results and remaining limits. Real-model numerical, lifecycle and existing regression gates must pass before merging; this feature does not auto-merge or publish anything.
+Real-model numerical, lifecycle and existing regression gates must pass before merging; this feature does not auto-merge or publish anything.

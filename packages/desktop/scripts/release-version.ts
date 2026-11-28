@@ -82,21 +82,21 @@ export function versionFromDmgPath(path: string): string | null {
 
 /** Include architecture for electron-updater and versions for blockmap lookup. */
 export function updateZipFileName(version: string): string {
-  return `mlx-node-${assertSemver('version', version)}-darwin-arm64.zip`;
+  return `Portato-${assertSemver('version', version)}-darwin-arm64.zip`;
 }
 
 export function versionFromUpdateZipPath(path: string): string | null {
-  const match = /^mlx-node-(.+)-darwin-arm64\.zip$/.exec(artifactBaseName(path));
+  const match = /^Portato-(.+)-darwin-arm64\.zip$/.exec(artifactBaseName(path));
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
 }
 
-/** Unsigned portable Windows installation archive. */
-export function windowsZipFileName(version: string): string {
-  return `Portato-${assertSemver('version', version)}-win32-arm64.zip`;
+/** Windows ARM64 NSIS setup installer. */
+export function windowsInstallerFileName(version: string): string {
+  return `Portato-${assertSemver('version', version)}-win32-arm64-setup.exe`;
 }
 
-export function versionFromWindowsZipPath(path: string): string | null {
-  const match = /^Portato-(.+)-win32-arm64\.zip$/.exec(artifactBaseName(path));
+export function versionFromWindowsInstallerPath(path: string): string | null {
+  const match = /^Portato-(.+)-win32-arm64-setup\.exe$/.exec(artifactBaseName(path));
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
 }
 
@@ -179,8 +179,8 @@ export interface ReleaseVersions {
   dmg: string | null;
   /** Parsed out of the Squirrel.Mac update archive filename. */
   zip: string | null;
-  /** Parsed out of the portable Windows archive, when that job has produced it. */
-  windowsZip?: string | null;
+  /** Parsed out of the Windows NSIS installer filename, when that job has produced it. */
+  windowsInstaller?: string | null;
   /** Parsed out of the Windows MSIX package, when that job has produced it. */
   windowsMsix?: string | null;
 }
@@ -222,9 +222,9 @@ export function assertVersionsAgree(versions: ReleaseVersions): string {
     { label: 'DMG filename', value: versions.dmg, remedy: 'the DMG was named from a different version than it holds' },
     { label: 'ZIP filename', value: versions.zip, remedy: 'the update ZIP must match the version of the app it holds' },
     {
-      label: 'Windows ZIP filename',
-      value: versions.windowsZip ?? null,
-      remedy: 'the Windows ZIP must match the version of the app it holds',
+      label: 'Windows installer filename',
+      value: versions.windowsInstaller ?? null,
+      remedy: 'the Windows installer must match the version of the app it holds',
     },
     {
       label: 'Windows MSIX filename',

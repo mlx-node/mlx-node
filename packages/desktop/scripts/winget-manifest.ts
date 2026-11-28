@@ -1,18 +1,18 @@
 /**
- * Generate official WinGet 1.12.0 multi-file manifests for the portable
- * Windows ARM64 ZIP release (`microsoft/winget-pkgs`).
+ * Generate official WinGet 1.12.0 multi-file manifests for the Windows ARM64
+ * NSIS installer release (`microsoft/winget-pkgs`).
  *
  *   yarn workspace @mlx-node/desktop winget:manifests \
- *     --version 0.0.21 \
- *     --zip out/Portato-0.0.21-win32-arm64.zip \
- *     [--tag v0.0.21] \
+ *     --version 0.0.25 \
+ *     --installer out/Portato-0.0.25-win32-arm64-setup.exe \
+ *     [--tag v0.0.25] \
  *     [--out out/winget] \
  *     [--id LongYinan.Portato] \
  *     [--repo mlx-node/mlx-node] \
  *     [--release-date YYYY-MM-DD]
  *
- * Or pass `--sha256 <64-hex>` instead of `--zip` when the archive digest is
- * already known.
+ * Or pass `--sha256 <64-hex>` instead of `--installer` when the installer
+ * digest is already known.
  */
 
 import { createHash } from 'node:crypto';
@@ -23,7 +23,7 @@ import { parseArgs } from 'node:util';
 
 import { APP_NAME } from '../src/app-name.js';
 import { PayloadError } from './payload.js';
-import { assertSemver, ReleaseVersionError, versionFromTag, windowsZipFileName } from './release-version.js';
+import { assertSemver, ReleaseVersionError, versionFromTag, windowsInstallerFileName } from './release-version.js';
 
 export const WINGET_MANIFEST_VERSION = '1.12.0';
 export const DEFAULT_WINGET_PACKAGE_ID = 'LongYinan.Portato';
@@ -41,7 +41,7 @@ export interface WingetManifestInput {
   version: string;
   /** Exact GitHub release tag hosting the assets (defaults to `v${version}`). */
   tag?: string;
-  /** 64-character hex SHA-256 of the Windows ARM64 portable ZIP. */
+  /** 64-character hex SHA-256 of the Windows ARM64 NSIS installer. */
   sha256: string;
   /** WinGet package identifier (`Publisher.Package`, default `LongYinan.Portato`). */
   packageIdentifier?: string;
@@ -148,8 +148,8 @@ export function assertGitHubRepo(repo: string): string {
 export function sha256File(filePath: string): string {
   if (!existsSync(filePath) || !statSync(filePath).isFile()) {
     throw new PayloadError(
-      `Windows ZIP archive not found: ${filePath}`,
-      'build the Windows ZIP before generating WinGet manifests',
+      `Windows installer not found: ${filePath}`,
+      'build the Windows installer before generating WinGet manifests',
     );
   }
   const hash = createHash('sha256');
@@ -201,8 +201,8 @@ export function generateWingetManifests(input: WingetManifestInput): GeneratedWi
   const releaseDate = assertReleaseDate(input.releaseDate ?? new Date().toISOString().slice(0, 10));
 
   const [owner] = repo.split('/');
-  const zipName = windowsZipFileName(version);
-  const installerUrl = `https://github.com/${repo}/releases/download/${releaseTag}/${zipName}`;
+  const installerName = windowsInstallerFileName(version);
+  const installerUrl = `https://github.com/${repo}/releases/download/${releaseTag}/${installerName}`;
   const releaseNotesUrl = `https://github.com/${repo}/releases/tag/${releaseTag}`;
   const publisherUrl = `https://github.com/${owner}`;
   const packageUrl = `https://github.com/${repo}`;
@@ -224,12 +224,18 @@ export function generateWingetManifests(input: WingetManifestInput): GeneratedWi
       '',
       `PackageIdentifier: ${packageIdentifier}`,
       `PackageVersion: ${version}`,
-      'InstallerType: zip',
-      'NestedInstallerType: portable',
-      'NestedInstallerFiles:',
-      `- RelativeFilePath: ${APP_NAME}-win32-arm64\\mlx-node.exe`,
-      '  PortableCommandAlias: mlx-node',
-      'ArchiveBinariesDependOnPath: true',
+      'MinimumOSVersion: 10.0.26100.0',
+      'InstallerLocale: en-US',
+      'InstallerType: nullsoft',
+      'Scope: user',
+      'UpgradeBehavior: install',
+      'AppsAndFeaturesEntries:',
+      `- DisplayName: ${APP_NAME}`,
+      `  Publisher: ${owner}`,
+      `  DisplayVersion: ${version}`,
+      `  ProductCode: ${APP_NAME}`,
+      'InstallationMetadata:',
+      `  DefaultInstallLocation: '%LOCALAPPDATA%\\Programs\\${APP_NAME}'`,
       `ReleaseDate: ${releaseDate}`,
       'Installers:',
       '- Architecture: arm64',
@@ -313,7 +319,7 @@ if (isDirectExecution()) {
     options: {
       version: { type: 'string' },
       tag: { type: 'string' },
-      zip: { type: 'string' },
+      installer: { type: 'string' },
       sha256: { type: 'string' },
       out: { type: 'string', default: join(APP_DIR, 'out', 'winget') },
       id: { type: 'string' },
@@ -324,21 +330,21 @@ if (isDirectExecution()) {
 
   if (!values.version) {
     console.error(
-      'usage: winget-manifest.ts --version <ver> (--zip <path-to-zip> | --sha256 <hex>) [--tag <tag>] [--out <dir>] [--id <pkg-id>] [--repo <owner/repo>] [--release-date <YYYY-MM-DD>]',
+      'usage: winget-manifest.ts --version <ver> (--installer <path-to-exe> | --sha256 <hex>) [--tag <tag>] [--out <dir>] [--id <pkg-id>] [--repo <owner/repo>] [--release-date <YYYY-MM-DD>]',
     );
     process.exit(2);
   }
-  if (!values.zip && !values.sha256) {
-    console.error('either --zip <path-to-zip> or --sha256 <hex> is required');
+  if (!values.installer && !values.sha256) {
+    console.error('either --installer <path-to-exe> or --sha256 <hex> is required');
     process.exit(2);
   }
-  if (values.zip && values.sha256) {
-    console.error('pass either --zip or --sha256, not both');
+  if (values.installer && values.sha256) {
+    console.error('pass either --installer or --sha256, not both');
     process.exit(2);
   }
 
   try {
-    const sha256 = values.zip ? sha256File(values.zip) : values.sha256!;
+    const sha256 = values.installer ? sha256File(values.installer) : values.sha256!;
     const packageIdentifier = values.id ?? (process.env.WINGET_PACKAGE_ID?.trim() || DEFAULT_WINGET_PACKAGE_ID);
     const written = writeWingetManifests(values.out, {
       version: values.version,

@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import { PayloadError } from '../scripts/payload.js';
 import {
   assertWindowsAppRuntimeAssets,
-  missingWindowsZipEntries,
   readPackagedWindowsApp,
   selectWindowsRuntimeFiles,
   WINDOWS_ADDON,
@@ -49,8 +48,8 @@ describe('packaged Windows app', () => {
   let app: string;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'mlx-windows-payload-'));
-    app = join(root, 'mlx-node-win32-arm64');
-    write('mlx-node.exe');
+    app = join(root, 'Portato-win32-arm64');
+    write('Portato.exe');
     write('resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
     for (const relPath of WINDOWS_APP_RUNTIME_FILES) write(`resources/app/${relPath}`, relPath);
     for (const relPath of pdfjsSampleFiles) write(`resources/app/${relPath}`, relPath);
@@ -74,7 +73,11 @@ describe('packaged Windows app', () => {
     expect(packaged.runtimeFiles).toEqual(selectWindowsRuntimeFiles(runtimeNames));
   });
 
-  it('rejects a package with a missing native DLL or header', () => {
+  it('rejects a package missing Portato.exe or a native DLL or header', () => {
+    rmSync(join(app, 'Portato.exe'));
+    expect(() => readPackagedWindowsApp(app)).toThrow(/Portato Windows app/);
+
+    write('Portato.exe');
     rmSync(join(app, 'resources/native/cudnn_ops64_9.dll'));
     expect(() => readPackagedWindowsApp(app)).toThrow(/cudnn_ops64_9\.dll/);
   });
@@ -107,44 +110,4 @@ describe('packaged Windows app', () => {
       expect(() => readPackagedWindowsApp(app)).toThrow(relDir);
     },
   );
-
-  it('checks the final ZIP members, including app native addons, pdfjs-dist assets, dashboard, and NVRTC headers', () => {
-    const required = [
-      'mlx-node-win32-arm64/mlx-node.exe',
-      'mlx-node-win32-arm64/resources/app/package.json',
-      ...WINDOWS_APP_RUNTIME_FILES.map((file) => `mlx-node-win32-arm64/resources/app/${file}`),
-      ...pdfjsSampleFiles.map((file) => `mlx-node-win32-arm64/resources/app/${file}`),
-      'mlx-node-win32-arm64/resources/www/index.html',
-      'mlx-node-win32-arm64/resources/native/include/cuda_runtime.h',
-      ...selectWindowsRuntimeFiles(runtimeNames).map((name) => `mlx-node-win32-arm64/resources/native/${name}`),
-    ];
-    expect(missingWindowsZipEntries(required, 'mlx-node-win32-arm64', runtimeNames)).toEqual([]);
-    expect(missingWindowsZipEntries(required.slice(1), 'mlx-node-win32-arm64', runtimeNames)).toEqual(['mlx-node.exe']);
-
-    for (const file of WINDOWS_APP_RUNTIME_FILES) {
-      const pruned = required.filter((entry) => entry !== `mlx-node-win32-arm64/resources/app/${file}`);
-      expect(missingWindowsZipEntries(pruned, 'mlx-node-win32-arm64', runtimeNames)).toEqual([`resources/app/${file}`]);
-    }
-
-    for (let i = 0; i < WINDOWS_APP_RUNTIME_DIRS.length; i += 1) {
-      const dir = WINDOWS_APP_RUNTIME_DIRS[i];
-      const sample = pdfjsSampleFiles[i];
-      const withoutDirFiles = required.filter((entry) => entry !== `mlx-node-win32-arm64/resources/app/${sample}`);
-      expect(missingWindowsZipEntries(withoutDirFiles, 'mlx-node-win32-arm64', runtimeNames)).toEqual([
-        `resources/app/${dir}`,
-      ]);
-      // Bare directory entries without a file inside must still fail.
-      expect(
-        missingWindowsZipEntries(
-          [
-            ...withoutDirFiles,
-            `mlx-node-win32-arm64/resources/app/${dir}/`,
-            `mlx-node-win32-arm64/resources/app/${dir}`,
-          ],
-          'mlx-node-win32-arm64',
-          runtimeNames,
-        ),
-      ).toEqual([`resources/app/${dir}`]);
-    }
-  });
 });
