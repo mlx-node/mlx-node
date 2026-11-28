@@ -19,11 +19,13 @@ import {
   Undo2,
   Workflow,
 } from 'lucide-react';
+import { useIsPresent } from 'motion/react';
 import {
   createElement,
   type ReactElement,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -31,7 +33,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { matchPath, UNSAFE_NavigationContext, useNavigate, useSearchParams } from 'react-router-dom';
 
 import {
   ATTACH_MAX,
@@ -139,6 +141,7 @@ import { oneLine } from '../lib/web-tools';
 import { type AppCommand, useCommands } from '../shell/commands';
 import { useCrumbs } from '../shell/crumbs';
 import { type Hotkey, useHotkeys, usePageSearch } from '../shell/hotkeys';
+import { readLiveLocation } from '../shell/live-location';
 import { useScrollRoot } from '../shell/scroll-root';
 import { messageAgent, stopAgent } from './chat/agent-actions';
 import { AgentPane } from './chat/agent-pane';
@@ -194,6 +197,7 @@ import {
   stopPending,
   storeVariant,
   subscribeDrafts,
+  subscribeDraftText,
   takePlanNotice,
   writeAttachments,
   writeDraft,
@@ -370,9 +374,27 @@ function withShown(
   return [{ ...shown, turns: 0 }, ...rows];
 }
 
+interface ActiveChatHandle {
+  shownPlace: () => string | null;
+  focusComposer: () => void;
+  open: (id: string) => void;
+}
+
+/** The currently mounted, non-exiting Chat page so toasts outliving an earlier mount can target it. */
+let activeChat: ActiveChatHandle | null = null;
+
 export default function Chat(): ReactElement {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
+  const navigation = useContext(UNSAFE_NavigationContext);
+  const navigationRef = useRef(navigation);
+  navigationRef.current = navigation;
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+  useLayoutEffect(() => {
+    navigationRef.current = navigation;
+    navigateRef.current = navigate;
+  }, [navigation, navigate]);
   const rawId = params.get('c');
   const conversationId = rawId !== null && rawId !== '' ? rawId : null;
   const modeParam = params.get('mode');
@@ -454,7 +476,8 @@ export default function Chat(): ReactElement {
   }, [gone, conversationId]);
 
   // The draft of the place on screen; a place keeps its own while the page shows another.
-  const [draft, setDraftState] = useState(() => readDraft(place));
+  const present = useIsPresent();
+  const draft = useSyncExternalStore(subscribeDraftText, () => readDraft(place));
   const [shownPlace, setShownPlace] = useState(place);
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [threadKey, setThreadKey] = useState(place);
@@ -474,7 +497,6 @@ export default function Chat(): ReactElement {
   const [lastSent, setLastSent] = useState<Resend | null>(null);
   if (shownPlace !== place) {
     setShownPlace(place);
-    setDraftState(readDraft(place));
     setStripError(null);
     // The created conversation keeps the New screen's thread cell: the bubble stays where it was drawn.
     if (shownPlace !== NEW_PLACE || createdId !== place) {
@@ -503,12 +525,17 @@ export default function Chat(): ReactElement {
   const [lowered, setLowered] = useState<{ ts: number; mode: PermissionMode } | null>(null);
   const [born, setBorn] = useState<{ conversation: string; draft: string } | null>(null);
   const placeRef = useRef(place);
+  /** The place shown on this active Chat page; null while leaving the route or after unmount. */
+  const shownPlaceRef = useRef<string | null>(present ? place : null);
   useLayoutEffect(() => {
     placeRef.current = place;
-  });
+    shownPlaceRef.current = present ? place : null;
+    return () => {
+      shownPlaceRef.current = null;
+    };
+  }, [place, present]);
   const setDraft = useCallback(
     (text: string) => {
-      setDraftState(text);
       writeDraft(place, text);
     },
     [place],
@@ -541,7 +568,6 @@ export default function Chat(): ReactElement {
         if (restored) {
           writeDraft(id, sending.text);
           writeAttachments(id, sending.files);
-          setDraftState(sending.text);
         }
         writeFailed(id, { text: sending.text, files: sending.files, strip: null, restored });
       }
@@ -629,7 +655,6 @@ export default function Chat(): ReactElement {
   const keepEdit = useCallback((id: string, text: string): boolean => {
     if (!restorable(id, readingNow.current)) return false;
     writeDraft(id, text);
-    if (placeRef.current === id) setDraftState(text);
     return true;
   }, []);
   const queueControls = useQueueControls(isNew ? null : conversationId, queued, announce, keepEdit);
@@ -939,12 +964,39 @@ export default function Chat(): ReactElement {
   const focusComposer = useCallback(() => {
     requestAnimationFrame(() => composerRef.current?.focus({ preventScroll: true }));
   }, []);
-  /** A message back in the box of its own conversation; that conversation opens when the page shows another. */
-  const putBackTo = useCallback(
-    (id: string, text: string): void => {
-      writeDraft(id, text);
-      if (placeRef.current === id) setDraftState(text);
+  const focusActiveComposer = useCallback(() => {
+    if (activeChat !== null) activeChat.focusComposer();
+    else if (shownPlaceRef.current !== null) focusComposer();
+  }, [focusComposer]);
+  const openActiveConversation = useCallback(
+    (id: string) => {
+      if (activeChat !== null) activeChat.open(id);
       else void navigate(chatUrl(id));
+    },
+    [navigate],
+  );
+  useLayoutEffect(() => {
+    if (!present) return;
+    const handle: ActiveChatHandle = {
+      shownPlace: () => shownPlaceRef.current,
+      focusComposer,
+      open: (id) => void navigateRef.current(chatUrl(id)),
+    };
+    activeChat = handle;
+    return () => {
+      if (activeChat === handle) activeChat = null;
+    };
+  }, [present, focusComposer]);
+  /** A message back in the box of its own conversation; opens that conversation when `open` is true and another shows. */
+  const putBackTo = useCallback(
+    (id: string, text: string, open = true): void => {
+      writeDraft(id, text);
+      const host = activeChat;
+      if (host !== null && host.shownPlace() === id) return;
+      if (open) {
+        if (host !== null) host.open(id);
+        else void navigate(chatUrl(id));
+      }
     },
     [navigate],
   );
@@ -960,13 +1012,13 @@ export default function Chat(): ReactElement {
     readDraft,
     putBack: putBackTo,
     keepText: writeDraft,
-    openConversation: (id) => void navigate(chatUrl(id)),
+    openConversation: openActiveConversation,
     titleOf: (id) => {
       const row = rowOf(id);
       return chatTitle(row?.title ?? '', row?.mode ?? mode);
     },
     composer: () => composerRef.current,
-    focusComposer,
+    focusComposer: focusActiveComposer,
     announce,
   });
   const rewindOnMessage = rewind.onRewind;
@@ -992,17 +1044,19 @@ export default function Chat(): ReactElement {
           : [],
       DROPPED_STAGES,
     );
-    const putBack = (): void => {
-      putBackTo(id, text);
+    const keepFiles = (): void => {
       if (files.length === 0) return;
       const kept = readAttachments(id);
       const added = files.filter((file) => !kept.some((item) => item.id === file.id));
       writeAttachments(id, [...kept, ...added].slice(0, ATTACH_MAX));
     };
     if (readDraft(id).trim() === '') {
-      putBack();
-      focusComposer();
-      announce(CHAT.hook.promptBack);
+      putBackTo(id, text, false);
+      keepFiles();
+      if (shownPlaceRef.current === id) {
+        focusComposer();
+        announce(CHAT.hook.promptBack);
+      }
       return;
     }
     toast.info(CHAT.hook.promptKept, {
@@ -1010,13 +1064,34 @@ export default function Chat(): ReactElement {
       action: {
         label: CHAT.history.putBack,
         onClick: (toastId) => {
-          putBack();
-          focusComposer();
+          putBackTo(id, text);
+          keepFiles();
+          focusActiveComposer();
           toast.dismiss(toastId);
         },
       },
     });
-  }, [loadedHere, conversationId, shownEnd, sendingTo, sending, lastSent, putBackTo, focusComposer, announce]);
+  }, [
+    loadedHere,
+    conversationId,
+    shownEnd,
+    sendingTo,
+    sending,
+    lastSent,
+    putBackTo,
+    focusComposer,
+    focusActiveComposer,
+    announce,
+  ]);
+  const isLiveAtConversation = useCallback((from: string): boolean => {
+    if (shownPlaceRef.current !== from) return false;
+    const live = readLiveLocation(navigationRef.current.navigator, navigationRef.current.basename);
+    if (live !== null) {
+      if (matchPath('/chat', live.pathname) === null) return false;
+      if (new URLSearchParams(live.search).get('c') !== from) return false;
+    }
+    return true;
+  }, []);
   /**
    * Fork the conversation shown: whole (`entry` null) or up to and with the answer of the message at `entry`, named by
    * its time too: the host refuses it when another entry is there now.
@@ -1031,7 +1106,7 @@ export default function Chat(): ReactElement {
       void historyActions
         .fork(from, entry === null || message === undefined ? null : { entry, ts: message.ts }, {
           folder: openFolder,
-          here: () => placeRef.current === from,
+          here: () => isLiveAtConversation(from),
           open: (copy) => {
             forkOpened.current = copy;
             void navigate(chatUrl(copy));
@@ -1040,7 +1115,7 @@ export default function Chat(): ReactElement {
         })
         .finally(() => setForking((current) => (current === from ? null : current)));
     },
-    [isNew, conversationId, openFolder, navigate],
+    [isNew, conversationId, openFolder, navigate, isLiveAtConversation],
   );
   const threadRewind = useMemo(
     () => (isNew ? undefined : { off: rewindReason, offAt: rewindAt, onRewind: rewindOnMessage, onFork: forkNow }),
@@ -1135,6 +1210,10 @@ export default function Chat(): ReactElement {
     const target = fromNew ? null : conversationId;
     const origin = place;
     const epoch = placeEpoch(origin);
+    const originLive = readLiveLocation(navigationRef.current.navigator, navigationRef.current.basename);
+    const originParams = originLive !== null ? new URLSearchParams(originLive.search) : null;
+    const originConvParam = originParams?.get('c') ?? null;
+    const originModeParam = originParams?.get('mode') ?? null;
     // Retry takes the failed message; another send leaves it until this one goes through, unless the composer has it.
     const prior = readFailed(origin);
     if (prior !== null && (prior.restored || (prior.text === text && prior.files === files))) {
@@ -1169,7 +1248,20 @@ export default function Chat(): ReactElement {
     stick.pin();
     announce(CHAT.status.sent);
     // The reply belongs to the place it was sent from; the user may be elsewhere by the time it arrives.
-    const stillShown = (): boolean => placeRef.current === origin;
+    const stillShown = (): boolean => {
+      if (shownPlaceRef.current !== origin) return false;
+      const live = readLiveLocation(navigationRef.current.navigator, navigationRef.current.basename);
+      if (live !== null) {
+        if (matchPath('/chat', live.pathname) === null) return false;
+        const liveParams = new URLSearchParams(live.search);
+        if (origin !== NEW_PLACE) {
+          if (liveParams.get('c') !== origin) return false;
+        } else if (originLive !== null) {
+          if (liveParams.get('c') !== originConvParam || liveParams.get('mode') !== originModeParam) return false;
+        }
+      }
+      return true;
+    };
     const drop = (): void => setSending((current) => (current === next ? null : current));
     try {
       if (fromNew) {
@@ -1238,7 +1330,6 @@ export default function Chat(): ReactElement {
       if (restored) {
         writeDraft(origin, text);
         writeAttachments(origin, files, epoch);
-        if (stillShown()) setDraftState(text);
       }
       const reason = err instanceof DashboardApiError ? err.reason : undefined;
       const code = err instanceof DashboardApiError ? err.code : undefined;
@@ -1335,7 +1426,6 @@ export default function Chat(): ReactElement {
       if (restored) {
         writeDraft(origin, text);
         writeAttachments(origin, files, epoch);
-        if (placeRef.current === origin) setDraftState(text);
       }
       const reason = err instanceof DashboardApiError ? err.reason : undefined;
       const code = err instanceof DashboardApiError ? err.code : undefined;
@@ -1354,22 +1444,15 @@ export default function Chat(): ReactElement {
             ? { tone: 'danger', text: outcome.toast, action: retry }
             : { ...outcome.strip, action: outcome.strip.action ?? retry };
         writeFailed(origin, { text, files, strip: failure, restored: false }, epoch);
-        if (placeRef.current !== origin) toast.error(failure.text);
+        if (shownPlaceRef.current !== origin) toast.error(failure.text);
         return;
       }
       if ('toast' in outcome) toast.error(outcome.toast);
-      else if (placeRef.current === origin) setStripError({ ...outcome.strip, action: undefined });
+      else if (shownPlaceRef.current === origin) setStripError({ ...outcome.strip, action: undefined });
       else toast.error(outcome.strip.text);
     }
   };
 
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
   // A read keeps the place it started in: the user may be elsewhere, or Chat may be closed, by the time it ends.
   const addFiles = (files: readonly File[]): void => {
     if (files.length === 0) return;
@@ -1431,7 +1514,7 @@ export default function Chat(): ReactElement {
             result.refused.length > 1
               ? fill(CHAT.attach.more, { text: first, n: files.length - result.added.length - 1 })
               : first;
-          if (alive.current && placeRef.current === origin) setAttachNote({ place: origin, text });
+          if (shownPlaceRef.current === origin) setAttachNote({ place: origin, text });
           else toast.error(text);
         },
         () => undefined,

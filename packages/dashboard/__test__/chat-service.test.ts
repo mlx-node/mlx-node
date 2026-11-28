@@ -908,6 +908,42 @@ describe('Chat service — engine facts and unload', () => {
     }
   });
 
+  it('matches recommended catalog metadata for a 2-level nested GGUF path under its catalog repo folder', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-chat-nested-catalog-'));
+    const nested = join(dir, 'qwen3.8-27b-gguf', 'UD-Q4_K_XL');
+    mkdirSync(nested, { recursive: true });
+    const weight = join(nested, 'custom-split-00001-of-00002.gguf');
+    writeFileSync(weight, 'x');
+    writeFileSync(join(nested, 'custom-split-00002-of-00002.gguf'), 'x');
+    const fake = fakeService('chat-basic', {
+      mutate: scripted,
+      endpointModels: [
+        { name: 'custom-split', path: weight, base: 'custom-split', variant: 'UD-Q4_K_XL', format: 'gguf' },
+        {
+          name: 'other-local',
+          path: join(dir, 'other-local', 'weights.gguf'),
+          base: 'other-local',
+          variant: 'Q4_K_M',
+          format: 'gguf',
+        },
+      ],
+    });
+    try {
+      const state = await fake.service.state();
+      const matched = state.models.find((m) => m.id === 'custom-split')!;
+      const unmatched = state.models.find((m) => m.id === 'other-local')!;
+      expect(matched.recommended).toBe(true);
+      expect(matched.recommendedOrder).toBe(0);
+      expect(typeof matched.description).toBe('string');
+      expect(matched.description!.length).toBeGreaterThan(0);
+      expect(unmatched.recommended).toBeUndefined();
+      expect(unmatched.description).toBeUndefined();
+    } finally {
+      await fake.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('unload: refused while a turn runs or the app engine loads, with no engine request; else the engine names the model', async () => {
     let snapshot = liveWith([], ['qwen3.5-4b']);
     const fake = fakeService('chat-basic', {

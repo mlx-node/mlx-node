@@ -13,8 +13,8 @@ import {
 } from '../ui/src/components/arc-x/model-picker/model-picker.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { cssRules, cssValue } from './helpers/css-rules.js';
-import { mount, rerender, unmountAll } from './helpers/mount.js';
-import { allByRole, byRole, waitFor } from './render.js';
+import { flush, mount, rerender, unmountAll } from './helpers/mount.js';
+import { byRole, waitFor } from './render.js';
 
 afterEach(unmountAll);
 
@@ -24,6 +24,8 @@ const BF16 = 'qwen3.8-27b-bf16';
 
 const QWEN27: ModelBaseOption = {
   base: 'Qwen3.8-27B',
+  note: 'Strong coding and reasoning for everyday work',
+  recommended: true,
   state: 'loaded',
   stateVariant: 'UD-Q4_K_XL',
   facts: ['3 quantizations', '256K context'],
@@ -34,50 +36,70 @@ const QWEN27: ModelBaseOption = {
     { id: BF16, label: 'BF16', state: 'idle', facts: ['MLX', '55.6 GB'] },
   ],
 };
+
 const AGENTS: ModelBaseOption = {
   base: 'agents-a1',
+  note: 'Long-horizon agent work and tool loops',
+  recommended: true,
   state: 'idle',
   facts: ['256K context', 'MLX', '70.2 GB'],
   preselect: 'agents-a1',
   variants: [{ id: 'agents-a1', label: 'BF16', state: 'idle', facts: ['MLX', '70.2 GB'] }],
 };
-const QWEN36: ModelBaseOption = {
-  base: 'Qwen3.6-35B-A3B',
+
+const GEMMA: ModelBaseOption = {
+  base: 'gemma-4-26b',
   state: 'idle',
-  facts: ['4 quantizations', '256K context'],
-  preselect: 'Qwen3.6-35B-A3B-UD-Q4_K_XL',
+  facts: ['2 quantizations', '128K context'],
+  preselect: 'gemma-4-26b-q4',
   variants: [
-    { id: 'Qwen3.6-35B-A3B-UD-IQ2_M', label: 'UD-IQ2_M', state: 'idle', facts: ['GGUF', '11.9 GB'] },
-    { id: 'Qwen3.6-35B-A3B-UD-Q4_K_XL', label: 'UD-Q4_K_XL', state: 'idle', facts: ['GGUF', '22.9 GB'] },
-    { id: 'qwen3.6-35b-a3b-nvfp4', label: 'NVFP4', state: 'idle', facts: ['MLX', '26.5 GB'] },
-    { id: 'qwen3.6-35b-a3b-bf16', label: 'BF16', state: 'idle', facts: ['MLX', '71.9 GB'] },
+    { id: 'gemma-4-26b-q4', label: 'Q4_K_M', state: 'idle', facts: ['GGUF', '14.2 GB'] },
+    { id: 'gemma-4-26b-bf16', label: 'BF16', state: 'idle', facts: ['MLX', '52.0 GB'] },
   ],
 };
-const SMALL: ModelBaseOption = {
-  base: 'qwen3-0.6b',
+
+const LIQUID: ModelBaseOption = {
+  base: 'lfm2.5-1.2b',
   state: 'loading',
   facts: ['16K context', 'MLX', '1.2 GB'],
   warning: 'small for Work',
-  preselect: 'qwen3-0.6b',
+  preselect: 'lfm2.5-1.2b',
   variants: [
-    { id: 'qwen3-0.6b', label: 'BF16', state: 'loading', facts: ['MLX', '1.2 GB'], warning: 'small for Work' },
+    { id: 'lfm2.5-1.2b', label: 'BF16', state: 'loading', facts: ['MLX', '1.2 GB'], warning: 'small for Work' },
   ],
 };
-const BASES = [QWEN27, AGENTS, QWEN36, SMALL];
+
+const CUSTOM: ModelBaseOption = {
+  base: 'acme-7b',
+  state: 'idle',
+  facts: ['32K context', 'MLX', '4.1 GB'],
+  preselect: 'acme-7b',
+  variants: [{ id: 'acme-7b', label: 'MLX', state: 'idle', facts: ['MLX', '4.1 GB'] }],
+};
+
+const BASES = [QWEN27, AGENTS, GEMMA, LIQUID, CUSTOM];
 
 const LEVELS = (['none', 'low', 'medium', 'high'] as const).map((value) => ({
   value,
   label: CHAT.thinkingLevel.levels[value],
+  note: CHAT.thinkingLevel.levelNotes[value],
 }));
 
 /** BASES with levels on the conversation's model (XL). */
 function levelled(extra: Partial<ModelEffort> = {}): ModelBaseOption[] {
-  const effort: ModelEffort = { levels: LEVELS, value: 'high', ...extra };
+  const effort: ModelEffort = {
+    levels: LEVELS,
+    value: 'high',
+    defaultValue: 'medium',
+    note: CHAT.thinkingLevel.about,
+    ...extra,
+  };
   return [
     { ...QWEN27, variants: [{ ...QWEN27.variants[0]!, effort }, ...QWEN27.variants.slice(1)] },
     AGENTS,
-    QWEN36,
-    SMALL,
+    GEMMA,
+    LIQUID,
+    CUSTOM,
   ];
 }
 
@@ -91,89 +113,6 @@ function picker(extra: Partial<ModelPickerProps> = {}) {
   });
 }
 
-/** `n` bases with one variant each, all loaded. */
-function many(n: number): ModelBaseOption[] {
-  return Array.from({ length: n }, (_, index) => ({
-    base: `model-${String(index)}`,
-    state: 'loaded' as const,
-    facts: [],
-    preselect: `model-${String(index)}`,
-    variants: [{ id: `model-${String(index)}`, label: 'BF16', state: 'loaded' as const, facts: [] }],
-  }));
-}
-
-/** One base with `n` variants. */
-function wide(n: number): ModelBaseOption {
-  const variants = Array.from({ length: n }, (_, index) => ({
-    id: `wide-q${String(index)}`,
-    label: `Q${String(index)}`,
-    state: 'loaded' as const,
-    facts: [],
-  }));
-  return { base: 'wide', state: 'loaded', facts: [], preselect: variants[0]!.id, variants };
-}
-
-const ROW = 44;
-const VIEW = 374;
-
-/**
- * happy-dom does no layout: each option is ROW tall at its index, a listbox shows VIEW px, and scrollTop is stored.
- * Returns the restore function.
- */
-function stubLayout(): () => void {
-  const scroll = new WeakMap<Element, number>();
-  const place = (element: HTMLElement): number =>
-    element.getAttribute('role') === 'option' && element.parentElement !== null
-      ? [...element.parentElement.children].indexOf(element) * ROW
-      : 0;
-  const stubs: Record<string, PropertyDescriptor> = {
-    offsetTop: {
-      configurable: true,
-      get(this: HTMLElement) {
-        return place(this);
-      },
-    },
-    offsetHeight: {
-      configurable: true,
-      get(this: HTMLElement) {
-        return this.getAttribute('role') === 'option' ? ROW : 0;
-      },
-    },
-    clientHeight: {
-      configurable: true,
-      get(this: HTMLElement) {
-        return this.getAttribute('role') === 'listbox' ? VIEW : 0;
-      },
-    },
-    scrollTop: {
-      configurable: true,
-      get(this: HTMLElement) {
-        return scroll.get(this) ?? 0;
-      },
-      set(this: HTMLElement, value: number) {
-        scroll.set(this, value);
-      },
-    },
-  };
-  const saved = new Map<string, PropertyDescriptor | undefined>();
-  for (const [name, descriptor] of Object.entries(stubs)) {
-    saved.set(name, Object.getOwnPropertyDescriptor(HTMLElement.prototype, name));
-    Object.defineProperty(HTMLElement.prototype, name, descriptor);
-  }
-  return () => {
-    for (const [name, descriptor] of saved) {
-      if (descriptor === undefined) Reflect.deleteProperty(HTMLElement.prototype, name);
-      else Object.defineProperty(HTMLElement.prototype, name, descriptor);
-    }
-  };
-}
-
-function pointerMove(target: Element, x: number, y: number): void {
-  act(() => {
-    target.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: y, bubbles: true }));
-  });
-}
-
 function key(target: Element, value: string, extra: KeyboardEventInit = {}): void {
   act(() => {
     target.dispatchEvent(new KeyboardEvent('keydown', { key: value, bubbles: true, cancelable: true, ...extra }));
@@ -184,69 +123,97 @@ function click(target: HTMLElement): void {
   act(() => target.click());
 }
 
+function pointerDown(target: Element, pointerType = 'mouse'): void {
+  act(() => {
+    target.dispatchEvent(new PointerEvent('pointerdown', { button: 0, pointerType, bubbles: true, cancelable: true }));
+  });
+}
+
 function trigger(container: HTMLElement): HTMLButtonElement {
-  return container.querySelector<HTMLButtonElement>('button[aria-haspopup="listbox"]')!;
+  return container.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
 }
 
-/** Opens the popover; returns the base list and a reader of the quantization list (it is replaced per base). */
-async function open(container: HTMLElement): Promise<{ left: HTMLElement; right: () => HTMLElement }> {
+async function openMenu(container: HTMLElement): Promise<HTMLElement> {
   key(trigger(container), 'ArrowDown');
-  await waitFor(() => allByRole(document.body, 'listbox').length === 2);
-  const [left] = allByRole(document.body, 'listbox');
-  return { left: left!, right: () => allByRole(document.body, 'listbox')[1]! };
+  await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+  return byRole(document.body, 'menu', CHAT.model)!;
 }
 
-function active(list: HTMLElement): string {
-  const id = list.getAttribute('aria-activedescendant');
-  const row = id === null ? null : document.getElementById(id);
-  return row?.querySelector('[title]')?.getAttribute('title') ?? '';
+function menuItems(menu: HTMLElement): HTMLElement[] {
+  return [...menu.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"]')];
 }
 
-function labels(list: HTMLElement): string[] {
-  return allByRole(list, 'option').map((row) => row.querySelector('[title]')?.getAttribute('title') ?? '');
+function findItem(menu: HTMLElement, text: string): HTMLElement {
+  const hit = menuItems(menu).find((item) => item.textContent?.includes(text));
+  if (hit === undefined) throw new Error(`No menu item containing "${text}" in "${menu.textContent}"`);
+  return hit;
+}
+
+/** Stub window.matchMedia to match (or not match) the narrow viewport query. Returns a restore function. */
+function stubNarrow(matches: boolean): () => void {
+  const original = window.matchMedia;
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    writable: true,
+    value: (query: string) => ({
+      matches,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+      onchange: null,
+    }),
+  });
+  return () => {
+    Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: original });
+  };
 }
 
 describe('ModelPicker: the pill', () => {
-  it('shows the base and the variant badge; its name says the state; the title is the full id', () => {
+  it('shows the base name, state, title, aria-haspopup="menu", and [data-model]', () => {
     const container = mount(picker());
     const button = trigger(container);
+    expect(button.getAttribute('aria-haspopup')).toBe('menu');
     expect(button.getAttribute('aria-label')).toBe(
       fill(CHAT.pillName, { model: 'Qwen3.8-27B UD-Q4_K_XL', state: CHAT.pillStates.loaded }),
     );
     expect(button.getAttribute('data-state')).toBe('loaded');
     expect(button.getAttribute('title')).toBe(XL);
-    expect(button.querySelector('[data-model]')?.getAttribute('data-model')).toBe('Qwen3.8-27B');
+    expect(button.querySelector('[data-model]')?.getAttribute('data-model')).toBe(XL);
+    expect(button.querySelector('[data-model]')?.textContent).toBe('Qwen3.8-27B');
     expect(button.querySelector('[data-chip-label]')).toBeNull();
   });
 
-  it('a model with no Thinking row has no badge, whatever its variant label', () => {
-    const long: ModelBaseOption = {
-      ...AGENTS,
-      variants: [{ ...AGENTS.variants[0]!, label: 'BF16 (lfm2.5-1.2b-thinking-mlx)' }],
-    };
-    const container = mount(picker({ value: 'agents-a1', bases: [long] }));
-    expect(trigger(container).querySelector('[data-chip-label]')).toBeNull();
-  });
-
-  it('crowded (Work): the badge is whole on the pill line or not drawn, never cut; elsewhere it hides only under 520 px', () => {
-    const rules = cssRules('components/arc-x/model-picker/model-picker.module.css');
-    expect(rules.some((rule) => rule.selectors.includes('.trigger[data-crowded] .variant'))).toBe(false);
-    expect(
-      ['flex-wrap', 'overflow', 'align-self'].map((property) =>
-        cssValue(rules, '.trigger[data-crowded] .name', property),
-      ),
-    ).toEqual(['wrap', 'clip', 'stretch']);
-    expect(cssValue(rules, '.trigger[data-crowded] .name::before', 'height')).toBe('var(--control-height-sm)');
-    const levels = levelled({ levels: [{ value: 'high', label: 'High' }] });
-    const crowded = trigger(mount(picker({ crowded: true, bases: levels })));
+  it('shows effort label, warning dot, crowded attributes, and working spinner', () => {
+    const crowded = trigger(
+      mount(picker({ crowded: true, levelWarning: true, working: true, bases: levelled({ value: 'low' }) })),
+    );
     expect(crowded.hasAttribute('data-crowded')).toBe(true);
-    expect(crowded.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(true);
-    const chat = trigger(mount(picker({ bases: levels })));
+    const chip = crowded.querySelector('[data-chip-label][data-chip-level]')!;
+    expect(chip).not.toBeNull();
+    expect(chip.textContent).toBe('Low');
+    expect(chip.hasAttribute('data-fit-whole')).toBe(true);
+    expect(chip.querySelector('span[aria-hidden="true"]')).not.toBeNull();
+    expect(crowded.getAttribute('title')).toBe(fill(CHAT.thinkingLevel.chip, { model: XL, level: 'Low' }));
+    expect(crowded.getAttribute('aria-label')).toBe(
+      fill(CHAT.thinkingLevel.chipName, {
+        model: fill(CHAT.pillName, { model: 'Qwen3.8-27B UD-Q4_K_XL', state: CHAT.pillStates.loaded }),
+        level: 'Low',
+      }),
+    );
+    // When working, MorphLoader replaces the ChevronDown SVG.
+    expect(crowded.querySelector('[role="status"], svg')).not.toBeNull();
+
+    unmountAll();
+    const chat = trigger(mount(picker({ bases: levelled({ value: 'high' }) })));
     expect(chat.hasAttribute('data-crowded')).toBe(false);
     expect(chat.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(false);
+    expect(chat.querySelector('[data-chip-level] span[aria-hidden="true"]')).toBeNull();
   });
 
-  it('a model that is not served: the stored id, no badge, no state', () => {
+  it('a model that is not served: shows the stored id, no level badge, no state', () => {
     const old = 'Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004';
     const container = mount(picker({ value: old }));
     const button = trigger(container);
@@ -254,316 +221,342 @@ describe('ModelPicker: the pill', () => {
     expect(button.getAttribute('data-state')).toBeNull();
     expect(button.querySelector('[data-chip-label]')).toBeNull();
     expect(button.querySelector('[data-model]')?.getAttribute('data-model')).toBe(old);
+    expect(button.querySelector('[data-model]')?.textContent).toBe(old);
   });
 
-  it('no model: a disabled trigger that says so; disabled with a reason stays off', () => {
+  it('no model: disabled trigger saying No model; disabled with a reason wraps in Tooltip', () => {
     const none = mount(picker({ value: null, bases: [] }));
     expect((byRole(none, 'button', CHAT.noModel) as HTMLButtonElement).disabled).toBe(true);
+
     unmountAll();
     const busy = mount(picker({ disabled: true, disabledReason: 'Wait for the answer to finish.' }));
     expect(trigger(busy).disabled).toBe(true);
+    expect(trigger(busy).parentElement?.tagName.toLowerCase()).toBe('span');
+  });
+
+  it('programmatic trigger.click() toggles the menu open and closed', async () => {
+    const container = mount(picker());
+    const button = trigger(container);
+    click(button);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    expect(byRole(document.body, 'menu', CHAT.model)).not.toBeNull();
+
+    click(button);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+    expect(byRole(document.body, 'menu', CHAT.model)).toBeNull();
+  });
+
+  it('a real pointer click sequence (pointerdown + click) opens once without double-toggling closed', async () => {
+    const container = mount(picker());
+    const button = trigger(container);
+    pointerDown(button, 'mouse');
+    act(() => {
+      window.dispatchEvent(new PointerEvent('pointerup', { button: 0, pointerType: 'mouse', bubbles: true }));
+    });
+    click(button);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    expect(byRole(document.body, 'menu', CHAT.model)).not.toBeNull();
+
+    // Subsequent programmatic click still closes the open menu.
+    click(button);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+
+    // Dragging away before releasing clears the flag on the next tick so a later programmatic click opens it.
+    pointerDown(button, 'mouse');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    act(() => {
+      window.dispatchEvent(new PointerEvent('pointerup', { button: 0, pointerType: 'mouse', bubbles: true }));
+    });
+    await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    click(button);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+  });
+
+  it('forwards side and align placement to the menu content', async () => {
+    const container = mount(picker({ side: 'bottom', align: 'end' }));
+    const menu = await openMenu(container);
+    expect(menu.getAttribute('data-side')).toBe('bottom');
+    expect(menu.getAttribute('data-align')).toBe('end');
+  });
+
+  it('toggling disabled false -> true -> false while open closes the menu and does not spontaneously re-open it', async () => {
+    const container = mount(picker({ disabled: false }));
+    await openMenu(container);
+    expect(byRole(document.body, 'menu', CHAT.model)).not.toBeNull();
+
+    rerender(picker({ disabled: true }));
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+    expect(byRole(document.body, 'menu', CHAT.model)).toBeNull();
+
+    rerender(picker({ disabled: false }));
+    await flush();
+    expect(byRole(document.body, 'menu', CHAT.model)).toBeNull();
+  });
+
+  it('delayed touch click (detail >= 1) after pointerToggled reset does not double-toggle the trigger', async () => {
+    const container = mount(picker());
+    const button = trigger(container);
+    pointerDown(button, 'touch');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    act(() => {
+      window.dispatchEvent(new PointerEvent('pointerup', { button: 0, pointerType: 'touch', bubbles: true }));
+    });
+    await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+
+    act(() => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+    });
+    await flush();
+    expect(byRole(document.body, 'menu', CHAT.model)).not.toBeNull();
+  });
+
+  it('crowded trigger keeps flexible width with no .measure lock, and non-crowded .measure shares [data-chip-label]', () => {
+    const crowdedContainer = mount(picker({ crowded: true, bases: levelled({ value: 'high' }) }));
+    const crowdedButton = trigger(crowdedContainer);
+    const effortChip = crowdedButton.querySelector<HTMLElement>('[data-chip-label][data-fit-whole]')!;
+    expect(effortChip).not.toBeNull();
+    expect(effortChip.hasAttribute('data-chip-level')).toBe(true);
+    expect(effortChip.textContent).toBe('High');
+    // Work mode keeps .triggerText flexible (no .measure locking an inline pixel width over data-dropped).
+    expect(crowdedButton.querySelector('[data-key]')).toBeNull();
+    const triggerText = effortChip.parentElement?.parentElement as HTMLElement | null;
+    expect(triggerText).not.toBeNull();
+    expect(triggerText?.style.width === '' || triggerText?.style.width === 'auto').toBe(true);
+
+    unmountAll();
+    const chatContainer = mount(picker({ crowded: false, bases: levelled({ value: 'high' }) }));
+    const chatButton = trigger(chatContainer);
+    const firstChip = chatButton.querySelector<HTMLElement>('[data-chip-label]')!;
+    expect(firstChip).not.toBeNull();
+    expect(firstChip.hasAttribute('data-chip-level')).toBe(true);
+    expect(firstChip.hasAttribute('aria-hidden')).toBe(false);
+    const measure = chatButton.querySelector<HTMLElement>('[data-key]')!;
+    expect(measure).not.toBeNull();
+    const measureEffort = measure.querySelector<HTMLElement>('[data-chip-label]')!;
+    expect(measureEffort).not.toBeNull();
+    expect(measureEffort.hasAttribute('data-chip-level')).toBe(false);
+    expect(measureEffort.hasAttribute('data-fit-whole')).toBe(false);
+    expect(measureEffort.textContent).toBe('High');
+    expect([...chatButton.querySelectorAll<HTMLElement>('[data-chip-label]')]).toEqual([firstChip, measureEffort]);
   });
 });
 
-describe('ModelPicker: the popover', () => {
-  it('opens on the base of the model, focus in the base list; both checks; the right list is that base', async () => {
+describe('ModelPicker: recommended outside vs More models inside', () => {
+  it('renders recommended models outside with blurbs and non-recommended under More models grouped by provider', async () => {
     const container = mount(picker());
-    const { left, right } = await open(container);
-    expect(document.activeElement).toBe(left);
-    expect(active(left)).toBe('Qwen3.8-27B');
-    expect(labels(left)).toEqual(['Qwen3.8-27B', 'agents-a1', 'Qwen3.6-35B-A3B', 'qwen3-0.6b']);
-    const selected = allByRole(left, 'option').filter((row) => row.getAttribute('aria-selected') === 'true');
-    expect(selected.map((row) => row.querySelector('[title]')!.getAttribute('title'))).toEqual(['Qwen3.8-27B']);
-    expect(left.getAttribute('aria-controls')).toBe(right().id);
-    expect(right().getAttribute('aria-label')).toBe(fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' }));
-    expect(labels(right())).toEqual(['UD-Q4_K_XL', 'UD-Q4_K_M', 'BF16']);
-    const checked = allByRole(right(), 'option').filter((row) => row.getAttribute('aria-selected') === 'true');
-    expect(checked).toHaveLength(1);
-    expect(checked[0]!.textContent).toContain('UD-Q4_K_XL');
-    expect(document.body.textContent).toContain(CHAT.modelQuant);
+    const menu = await openMenu(container);
+    expect(menu.textContent).toContain('Qwen3.8-27B');
+    expect(menu.textContent).toContain('Strong coding and reasoning for everyday work');
+    expect(menu.textContent).toContain('agents-a1');
+    expect(menu.textContent).toContain('Long-horizon agent work and tool loops');
+    expect(menu.textContent).not.toContain('gemma-4-26b');
+    expect(menu.textContent).not.toContain('lfm2.5-1.2b');
+    expect(menu.textContent).toContain(CHAT.modelMore);
+
+    // Open More models submenu via ArrowRight.
+    const moreTrigger = findItem(menu, CHAT.modelMore);
+    act(() => moreTrigger.focus());
+    key(moreTrigger, 'ArrowRight');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.modelMoreList) !== null);
+    const moreMenu = byRole(document.body, 'menu', CHAT.modelMoreList)!;
+    expect(moreMenu.textContent).toContain('Gemma');
+    expect(moreMenu.textContent).toContain('gemma-4-26b');
+    expect(moreMenu.textContent).toContain('Liquid');
+    expect(moreMenu.textContent).toContain('lfm2.5-1.2b');
+    expect(moreMenu.textContent).toContain('small for Work');
+    expect(moreMenu.textContent).toContain(CHAT.modelOtherProvider);
+    expect(moreMenu.textContent).toContain('acme-7b');
   });
 
-  it('line 2: the state part, the count before the context; an idle base has no state word', async () => {
-    const loading: ModelBaseOption = { ...QWEN27, state: 'loading', stateVariant: 'UD-Q4_K_M' };
-    const container = mount(picker({ bases: [loading, AGENTS, SMALL] }));
-    const { left, right } = await open(container);
-    const rows = allByRole(left, 'option');
-    expect(rows[0]!.textContent).toContain('Loading… · UD-Q4_K_M · 3 quantizations · 256K context');
-    expect(rows[1]!.textContent).toBe('agents-a1256K context · MLX · 70.2 GBBF16');
-    expect(rows[1]!.textContent).not.toContain(CHAT.modelLoaded);
-    expect(rows[2]!.textContent).toContain('small for Work');
-    expect(allByRole(right(), 'option')[0]!.textContent).toContain('Loaded · GGUF · 17.6 GB');
+  it('falls back to showing all bases outside when none are marked recommended', async () => {
+    const plain = BASES.map((base) => ({ ...base, recommended: false }));
+    const container = mount(picker({ bases: plain }));
+    const menu = await openMenu(container);
+    expect(menu.textContent).toContain('Qwen3.8-27B');
+    expect(menu.textContent).toContain('gemma-4-26b');
+    expect(menu.textContent).toContain('lfm2.5-1.2b');
+    expect(menu.textContent).not.toContain(CHAT.modelMore);
   });
 
-  it('→ then Enter lands on the conversation model: nothing is sent and the popover closes', async () => {
+  it('More models row shows the currently active non-recommended model name and respects explicit provider overrides', async () => {
+    const overridden: ModelBaseOption = {
+      ...CUSTOM,
+      base: 'custom-reasoner',
+      provider: 'Partner Lab',
+      preselect: 'custom-reasoner',
+      variants: [{ id: 'custom-reasoner', label: 'MLX', state: 'idle', facts: [] }],
+    };
+    const container = mount(picker({ value: 'lfm2.5-1.2b', bases: [QWEN27, LIQUID, overridden] }));
+    const menu = await openMenu(container);
+    const moreTrigger = findItem(menu, CHAT.modelMore);
+    expect(moreTrigger.textContent).toContain('lfm2.5-1.2b');
+
+    act(() => moreTrigger.focus());
+    key(moreTrigger, 'ArrowRight');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.modelMoreList) !== null);
+    const moreMenu = byRole(document.body, 'menu', CHAT.modelMoreList)!;
+    expect(moreMenu.textContent).toContain('Partner Lab');
+    expect(moreMenu.textContent).toContain('custom-reasoner');
+  });
+});
+
+describe('ModelPicker: multi-variant quantization submenus', () => {
+  it('ArrowRight on a multi-variant outside base opens its quantization submenu and picks a quantization', async () => {
     const onValueChange = vi.fn();
     const container = mount(picker({ onValueChange }));
-    const { left, right } = await open(container);
-    key(left, 'ArrowRight');
-    await waitFor(() => document.activeElement === right());
-    expect(active(right())).toBe('UD-Q4_K_XL');
-    key(right(), 'Enter');
-    await waitFor(() => allByRole(document.body, 'listbox').length === 0);
-    expect(onValueChange).not.toHaveBeenCalled();
-  });
+    const menu = await openMenu(container);
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+    act(() => qwenRow.focus());
+    key(qwenRow, 'ArrowRight');
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', quantLabel) !== null);
+    const quantMenu = byRole(document.body, 'menu', quantLabel)!;
+    expect(quantMenu.textContent).toContain('UD-Q4_K_XL');
+    expect(quantMenu.textContent).toContain('Loaded · GGUF · 17.6 GB');
+    expect(quantMenu.textContent).toContain('UD-Q4_K_M');
+    expect(quantMenu.textContent).toContain('BF16');
 
-  it('a pointer over other bases moves the active row but never the right list', async () => {
-    const container = mount(picker());
-    const { left, right } = await open(container);
-    const rows = allByRole(left, 'option');
-    pointerMove(rows[2]!, 10, 100);
-    pointerMove(rows[3]!, 10, 150);
-    expect(active(left)).toBe('qwen3-0.6b');
-    expect(labels(right())).toEqual(['UD-Q4_K_XL', 'UD-Q4_K_M', 'BF16']);
-  });
-
-  it('a click on a base with 2+ opens it and picks nothing; a click on a quantization picks once and closes', async () => {
-    const onValueChange = vi.fn();
-    const container = mount(picker({ onValueChange }));
-    const { left, right } = await open(container);
-    click(allByRole(left, 'option')[2]!);
-    await waitFor(() => labels(right())[0] === 'UD-IQ2_M');
-    expect(onValueChange).not.toHaveBeenCalled();
-    expect(allByRole(left, 'option')[2]!.hasAttribute('data-open')).toBe(true);
-    expect(allByRole(left, 'option')[0]!.hasAttribute('data-open')).toBe(false);
-    await waitFor(() => document.activeElement === right());
-    expect(active(right())).toBe('UD-Q4_K_XL');
-    click(allByRole(right(), 'option')[2]!);
+    click(findItem(quantMenu, 'UD-Q4_K_M'));
     expect(onValueChange).toHaveBeenCalledTimes(1);
-    expect(onValueChange).toHaveBeenCalledWith('qwen3.6-35b-a3b-nvfp4');
-    await waitFor(() => allByRole(document.body, 'listbox').length === 0);
+    expect(onValueChange).toHaveBeenCalledWith(M);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
   });
 
-  it('a click on a base with one quantization picks it', async () => {
+  it('direct mouse click on a multi-variant base row commits its preselect immediately; touch tap opens the submenu instead', async () => {
     const onValueChange = vi.fn();
-    const container = mount(picker({ onValueChange }));
-    const { left } = await open(container);
-    click(allByRole(left, 'option')[1]!);
-    expect(onValueChange).toHaveBeenCalledWith('agents-a1');
-    await waitFor(() => allByRole(document.body, 'listbox').length === 0);
-  });
+    const container = mount(picker({ value: 'agents-a1', onValueChange }));
+    const menu = await openMenu(container);
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+    pointerDown(qwenRow, 'mouse');
+    click(qwenRow);
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith(XL);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
 
-  it('keys: arrows and letters move the base row; Enter opens a base with 2+ and picks a base with 1', async () => {
-    const onValueChange = vi.fn();
-    const container = mount(picker({ onValueChange }));
-    const { left, right } = await open(container);
-    key(left, 'ArrowDown');
-    expect(active(left)).toBe('agents-a1');
-    expect(labels(right())[0]).toBe('UD-Q4_K_XL');
-    key(left, 'q');
-    expect(active(left)).toBe('Qwen3.6-35B-A3B');
-    key(left, 'Q');
-    expect(active(left)).toBe('qwen3-0.6b');
-    key(left, 'q');
-    expect(active(left)).toBe('Qwen3.8-27B');
-    key(left, 'End');
-    expect(active(left)).toBe('qwen3-0.6b');
-    key(left, 'Home');
-    expect(active(left)).toBe('Qwen3.8-27B');
-    key(left, 'ArrowDown');
-    key(left, 'ArrowDown');
-    key(left, 'Enter');
-    await waitFor(() => document.activeElement === right());
-    expect(labels(right())[0]).toBe('UD-IQ2_M');
-    expect(active(right())).toBe('UD-Q4_K_XL');
-    key(right(), 'ArrowDown');
-    expect(active(right())).toBe('NVFP4');
-    key(right(), 'Home');
-    expect(active(right())).toBe('UD-IQ2_M');
-    key(right(), 'End');
-    expect(active(right())).toBe('BF16');
-    key(right(), 'u');
-    expect(active(right())).toBe('UD-IQ2_M');
-    key(right(), 'ArrowLeft');
-    expect(document.activeElement).toBe(left);
-    expect(active(left)).toBe('Qwen3.6-35B-A3B');
-    key(left, 'ArrowDown');
-    key(left, ' ');
-    expect(onValueChange).toHaveBeenCalledWith('qwen3-0.6b');
-  });
-
-  it('Shift+Tab from the quantizations makes the open base active in the base list', async () => {
-    const container = mount(picker());
-    const { left, right } = await open(container);
-    key(left, 'ArrowDown');
-    key(left, 'ArrowDown');
-    key(left, 'ArrowRight');
-    await waitFor(() => document.activeElement === right());
-    key(left, 'ArrowUp');
-    expect(active(left)).toBe('agents-a1');
-    key(right(), 'Tab', { shiftKey: true });
-    expect(active(left)).toBe('Qwen3.6-35B-A3B');
-  });
-
-  it('new bases in another order (a load ended) keep the open base and both active rows on the same keys', async () => {
-    const container = mount(picker());
-    const { left, right } = await open(container);
-    click(allByRole(left, 'option')[2]!);
-    await waitFor(() => document.activeElement === right());
-    key(right(), 'ArrowDown');
-    expect(active(right())).toBe('NVFP4');
-    key(left, 'End');
-    expect(active(left)).toBe('qwen3-0.6b');
-    const list = right();
-    const resorted: ModelBaseOption[] = [
-      { ...QWEN36, variants: [QWEN36.variants[3]!, ...QWEN36.variants.slice(0, 3)] },
-      SMALL,
-      AGENTS,
-      QWEN27,
-    ];
-    rerender(picker({ bases: resorted }));
-    expect(labels(left)).toEqual(['Qwen3.6-35B-A3B', 'qwen3-0.6b', 'agents-a1', 'Qwen3.8-27B']);
-    expect(active(left)).toBe('qwen3-0.6b');
-    expect(allByRole(left, 'option')[0]!.hasAttribute('data-open')).toBe(true);
-    expect(labels(right())[0]).toBe('BF16');
-    expect(active(right())).toBe('NVFP4');
-    expect(right()).toBe(list);
-    expect(list.className).toContain('_swap_');
-    expect(allByRole(list, 'option').filter((row) => row.className.includes('_swap_'))).toEqual([]);
-  });
-
-  it('a conversation model that is not served: the fallback base opens, no check in either list', async () => {
-    const container = mount(picker({ value: 'gone-model', fallback: 'qwen3.6-35b-a3b-nvfp4' }));
-    const { left, right } = await open(container);
-    expect(active(left)).toBe('Qwen3.6-35B-A3B');
-    expect(labels(right())[0]).toBe('UD-IQ2_M');
-    expect(document.querySelectorAll('[role="option"][aria-selected="true"]')).toHaveLength(0);
-  });
-
-  it('the footer: the swap warning while a variant is not loaded, else the footer; the memory row comes last', async () => {
-    const onUnload = vi.fn();
-    const action = createElement('button', { type: 'button', onClick: onUnload }, 'Unload');
-    const container = mount(
-      picker({ swapWarning: 'A running answer waits.', memory: { text: `${XL} is in memory.`, action } }),
-    );
-    const { left } = await open(container);
-    expect(document.body.textContent).toContain('A running answer waits.');
-    expect(document.body.textContent).not.toContain('Models load on first use.');
-    const panel = left.parentElement!.parentElement!.parentElement!;
-    const memory = panel.lastElementChild!;
-    expect(memory.textContent).toBe(`${XL} is in memory.Unload`);
-    expect(left.contains(memory)).toBe(false);
-    act(() => memory.querySelector('button')!.click());
-    expect(onUnload).toHaveBeenCalledTimes(1);
     unmountAll();
-    const all = mount(picker({ value: 'model-0', bases: many(3), swapWarning: 'A running answer waits.' }));
-    await open(all);
-    expect(document.body.textContent).toContain('Models load on first use.');
-    expect(document.body.textContent).not.toContain('A running answer waits.');
+    const touchChange = vi.fn();
+    const touchContainer = mount(picker({ value: 'agents-a1', onValueChange: touchChange }));
+    const touchMenu = await openMenu(touchContainer);
+    const touchRow = findItem(touchMenu, 'Qwen3.8-27B');
+    pointerDown(touchRow, 'touch');
+    click(touchRow);
+    expect(touchChange).not.toHaveBeenCalled();
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', quantLabel) !== null);
   });
 
-  it('structure: the left list sets the height, the right list is a scroller inside its column', async () => {
-    const rules = cssRules('components/arc-x/model-picker/model-picker.module.css');
-    expect(cssValue(rules, '.panel.panel', 'max-height')).toBe('var(--radix-popover-content-available-height, 100vh)');
-    expect(cssValue(rules, '.panel.panel', 'flex-direction')).toBe('column');
-    expect(cssValue(rules, '.columns', 'flex')).toBe(
-      '0 1 calc(var(--control-height-sm) + var(--picker-row) * var(--picker-rows))',
-    );
-    expect(cssValue(rules, '.columns', 'min-height')).toBe('0');
-    expect(cssValue(rules, '.column', 'min-height')).toBe('0');
-    expect(cssValue(rules, '.list', 'max-height')).toBeUndefined();
-    expect(cssValue(rules, '.list', 'overflow-y')).toBe('auto');
-    expect(cssValue(rules, '.list', 'overscroll-behavior')).toBe('contain');
-    expect(cssValue(rules, '.body', 'position')).toBe('relative');
-    expect(cssValue(rules, '.list.inner', 'position')).toBe('absolute');
-    expect(cssValue(rules, '.list.inner', 'inset')).toBe('0');
-    expect(cssValue(rules, '.row', 'min-height')).toBe('var(--picker-row)');
-    expect(cssValue(rules, '.heading', 'flex')).toBe('none');
-    expect(cssValue(rules, '.footer', 'flex')).toBe('none');
-    expect(cssValue(rules, '.memory', 'flex')).toBe('none');
-    expect(rules.some((rule) => rule.reduce && rule.selectors.includes('.swap'))).toBe(true);
-    expect(cssValue(rules, '.warning > svg', 'display')).toBe('inline-block');
-    for (const [n, rows] of [
-      [2, '4'],
-      [6, '6'],
-      [40, '8.5'],
-    ] as const) {
-      const container = mount(picker({ value: 'model-0', bases: many(n) }));
-      const { left, right } = await open(container);
-      const columns = left.parentElement!.parentElement!;
-      expect(columns.style.getPropertyValue('--picker-rows')).toBe(rows);
-      expect(right().className).toContain('_inner_');
-      expect(right().parentElement!.className).toContain('_body_');
-      unmountAll();
-    }
+  it('picking a model with effort levels sends both the model id and its effort value', async () => {
+    const onValueChange = vi.fn();
+    const bases = levelled({ value: 'medium' });
+    const container = mount(picker({ value: 'agents-a1', bases, onValueChange }));
+    const menu = await openMenu(container);
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+    pointerDown(qwenRow, 'mouse');
+    click(qwenRow);
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith(XL, 'medium');
   });
 
-  describe('a long list', () => {
-    let restore: (() => void) | undefined;
-    afterEach(() => {
-      restore?.();
-      restore = undefined;
-    });
+  it('picking a single-variant base commits it directly; picking the already-selected model does not fire onValueChange', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(picker({ onValueChange }));
+    const menu = await openMenu(container);
+    click(findItem(menu, 'agents-a1'));
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith('agents-a1');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
 
-    it('opens with the selected row in view, in both lists', async () => {
-      restore = stubLayout();
-      const bases = [...many(40), { ...wide(30), preselect: 'wide-q25' }];
-      const container = mount(picker({ bases, value: 'wide-q25' }));
-      const { left, right } = await open(container);
-      expect(active(left)).toBe('wide');
-      await waitFor(() => left.scrollTop === 41 * ROW - VIEW);
-      expect(active(right())).toBe('Q25');
-      await waitFor(() => right().scrollTop === 26 * ROW - VIEW);
-    });
+    unmountAll();
+    const sameChange = vi.fn();
+    const sameContainer = mount(picker({ value: 'agents-a1', onValueChange: sameChange }));
+    const sameMenu = await openMenu(sameContainer);
+    click(findItem(sameMenu, 'agents-a1'));
+    expect(sameChange).not.toHaveBeenCalled();
+  });
 
-    it('ArrowDown, ArrowUp, Home and End keep the active row in view', async () => {
-      restore = stubLayout();
-      const container = mount(picker({ bases: [wide(40), ...many(40)], value: 'wide-q0' }));
-      const { left, right } = await open(container);
-      for (const list of [left, right()]) {
-        expect(list.scrollTop).toBe(0);
-        for (let step = 0; step < 9; step += 1) key(list, 'ArrowDown');
-        expect(list.scrollTop).toBe(10 * ROW - VIEW);
-        key(list, 'End');
-        expect(list.scrollTop).toBe(41 * ROW - VIEW - (list === left ? 0 : ROW));
-        for (let step = 0; step < 10; step += 1) key(list, 'ArrowUp');
-        expect(list.scrollTop).toBe((list === left ? 30 : 29) * ROW);
-        key(list, 'Home');
-        expect(list.scrollTop).toBe(0);
-      }
-    });
+  it('multi-variant base inside More models also opens its own quantization submenu', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(picker({ onValueChange }));
+    const menu = await openMenu(container);
+    const moreTrigger = findItem(menu, CHAT.modelMore);
+    act(() => moreTrigger.focus());
+    key(moreTrigger, 'ArrowRight');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.modelMoreList) !== null);
+    const moreMenu = byRole(document.body, 'menu', CHAT.modelMoreList)!;
 
-    it('a pointer that rests while a list scrolls by key keeps the key row; a real move takes it', async () => {
-      const container = mount(picker({ bases: [wide(40), ...many(40)], value: 'wide-q0' }));
-      const { left, right } = await open(container);
-      for (const list of [left, right()]) {
-        const rows = allByRole(list, 'option');
-        pointerMove(rows[5]!, 40, 200);
-        expect(list.getAttribute('aria-activedescendant')).toBe(rows[5]!.id);
-        key(list, 'ArrowDown');
-        expect(list.getAttribute('aria-activedescendant')).toBe(rows[6]!.id);
-        pointerMove(rows[3]!, 40, 200);
-        expect(list.getAttribute('aria-activedescendant')).toBe(rows[6]!.id);
-        pointerMove(rows[3]!, 40, 204);
-        expect(list.getAttribute('aria-activedescendant')).toBe(rows[3]!.id);
-      }
+    const gemmaRow = findItem(moreMenu, 'gemma-4-26b');
+    act(() => gemmaRow.focus());
+    key(gemmaRow, 'ArrowRight');
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'gemma-4-26b' });
+    await waitFor(() => byRole(document.body, 'menu', quantLabel) !== null);
+    const quantMenu = byRole(document.body, 'menu', quantLabel)!;
+    click(findItem(quantMenu, 'BF16'));
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith('gemma-4-26b-bf16');
+  });
+
+  it('VoiceOver/AT synthetic click without prior mouse pointerdown on a multi-variant SubTrigger does not commit preselect', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(picker({ value: 'agents-a1', onValueChange }));
+    // Simulate prior mouse pointer activity elsewhere in the document.
+    pointerDown(document.body, 'mouse');
+    const menu = await openMenu(container);
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+
+    // Synthetic AT click with no pointerdown on this row must not commit preselect; Radix opens Quantization.
+    click(qwenRow);
+    expect(onValueChange).not.toHaveBeenCalled();
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', quantLabel) !== null);
+  });
+
+  it('fast mouse click after hover on a multi-variant SubTrigger closes cleanly without flashing the submenu open', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(picker({ value: 'agents-a1', onValueChange }));
+    const menu = await openMenu(container);
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+    act(() => {
+      qwenRow.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', bubbles: true }));
     });
+    pointerDown(qwenRow, 'mouse');
+    click(qwenRow);
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith(XL);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+    await act(async () => new Promise<void>((resolve) => setTimeout(resolve, 140)));
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' });
+    expect(byRole(document.body, 'menu', quantLabel)).toBeNull();
   });
 });
 
-describe('ModelPicker: thinking levels', () => {
-  it('D2/D3: the chip badge is the level, in its title and its name; a warning dot', () => {
-    const plain = trigger(mount(picker({ bases: levelled() })));
-    expect(plain.querySelector('[data-chip-level]')?.textContent).toBe('High');
-    expect(plain.getAttribute('title')).toBe(fill(CHAT.thinkingLevel.chip, { model: XL, level: 'High' }));
+describe('ModelPicker: Effort submenu', () => {
+  it('shows Effort row with current level, Default tag, level notes, and subNote; hidden when model has no levels', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(picker({ bases: levelled(), onValueChange }));
+    const menu = await openMenu(container);
+    const effortTrigger = findItem(menu, CHAT.thinkingLevel.effort);
+    expect(effortTrigger.textContent).toContain('High');
+
+    act(() => effortTrigger.focus());
+    key(effortTrigger, 'ArrowRight');
+    const effortLabel = fill(CHAT.thinkingLevel.list, { model: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', effortLabel) !== null);
+    const effortMenu = byRole(document.body, 'menu', effortLabel)!;
+    expect(effortMenu.textContent).toContain(CHAT.thinkingLevel.defaultTag);
+    expect(effortMenu.textContent).toContain(CHAT.thinkingLevel.levelNotes.low);
+    expect(effortMenu.textContent).toContain(CHAT.thinkingLevel.about);
+
+    click(findItem(effortMenu, 'Low'));
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith(XL, 'low');
+
     unmountAll();
-    expect(
-      trigger(mount(picker({ bases: levelled({ levels: [], value: '' }) }))).querySelector('[data-chip-level]'),
-    ).toBeNull();
-    unmountAll();
-    const low = trigger(mount(picker({ bases: levelled({ value: 'low' }), levelWarning: true })));
-    expect(low.querySelector('[data-chip-level]')?.textContent).toBe('Low');
-    expect(low.getAttribute('title')).toBe(fill(CHAT.thinkingLevel.chip, { model: XL, level: 'Low' }));
-    expect(low.getAttribute('aria-label')).toBe(
-      fill(CHAT.thinkingLevel.chipName, {
-        model: fill(CHAT.pillName, { model: 'Qwen3.8-27B UD-Q4_K_XL', state: CHAT.pillStates.loaded }),
-        level: 'Low',
-      }),
-    );
-    expect(low.querySelector('[data-chip-level] span[aria-hidden="true"]')).not.toBeNull();
+    const noLevels = mount(picker({ bases: BASES }));
+    const plainMenu = await openMenu(noLevels);
+    expect(plainMenu.textContent).not.toContain(CHAT.thinkingLevel.effort);
   });
 
-  it('D6: while an answer runs the chip opens, the model rows are off with the reason, the level still changes', async () => {
+  it('stays enabled when listDisabled is true while model rows and More models are disabled', async () => {
     const onValueChange = vi.fn();
     const container = mount(
       picker({
@@ -574,21 +567,251 @@ describe('ModelPicker: thinking levels', () => {
       }),
     );
     expect(trigger(container).disabled).toBe(false);
-    key(trigger(container), 'ArrowDown');
-    await waitFor(() => allByRole(document.body, 'listbox').length === 3);
-    const [left, right, levels] = allByRole(document.body, 'listbox');
-    expect(document.body.textContent).toContain(CHAT.modelBusy);
-    expect(document.body.textContent).not.toContain('Models load on first use.');
-    expect(document.body.textContent).toContain(CHAT.thinkingLevel.next);
-    click(allByRole(right!, 'option')[1]!);
-    click(allByRole(left!, 'option')[1]!);
+    const menu = await openMenu(container);
+    expect(menu.textContent).toContain(CHAT.modelBusy);
+    expect(menu.textContent).not.toContain('Models load on first use.');
+
+    // Model rows and More models are disabled.
+    expect(findItem(menu, 'agents-a1').getAttribute('aria-disabled')).toBe('true');
+    expect(findItem(menu, 'Qwen3.8-27B').getAttribute('aria-disabled')).toBe('true');
+    expect(findItem(menu, CHAT.modelMore).getAttribute('aria-disabled')).toBe('true');
+    click(findItem(menu, 'agents-a1'));
     expect(onValueChange).not.toHaveBeenCalled();
-    expect(
-      allByRole(right!, 'option')
-        .slice(1)
-        .every((option) => option.getAttribute('aria-disabled') === 'true'),
-    ).toBe(true);
-    click(allByRole(levels!, 'option').find((option) => option.textContent === 'Low')!);
+
+    // Effort stays enabled and commits the new level.
+    const effortTrigger = findItem(menu, CHAT.thinkingLevel.effort);
+    expect(effortTrigger.getAttribute('aria-disabled')).toBeNull();
+    act(() => effortTrigger.focus());
+    key(effortTrigger, 'ArrowRight');
+    const effortLabel = fill(CHAT.thinkingLevel.list, { model: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', effortLabel) !== null);
+    const effortMenu = byRole(document.body, 'menu', effortLabel)!;
+    expect(effortMenu.textContent).toContain(CHAT.thinkingLevel.next);
+    click(findItem(effortMenu, 'Low'));
+    expect(onValueChange).toHaveBeenCalledTimes(1);
     expect(onValueChange).toHaveBeenCalledWith(XL, 'low');
+  });
+});
+
+describe('ModelPicker: narrow viewport pages', () => {
+  let restore: (() => void) | undefined;
+  afterEach(() => {
+    restore?.();
+    restore = undefined;
+  });
+
+  it('opens Effort, More models, and Quantization as in-menu pages with Back and ArrowLeft/ArrowRight navigation', async () => {
+    restore = stubNarrow(true);
+    const onValueChange = vi.fn();
+    const container = mount(picker({ bases: levelled(), onValueChange }));
+    const menu = await openMenu(container);
+
+    // Navigate to Effort page via ArrowRight, wait for focus to settle, then ArrowLeft back to main.
+    const effortRow = findItem(menu, CHAT.thinkingLevel.effort);
+    act(() => effortRow.focus());
+    key(effortRow, 'ArrowRight');
+    await waitFor(
+      () =>
+        menu.querySelector('[data-page="effort"]') !== null &&
+        document.activeElement?.getAttribute('role') === 'menuitemradio',
+    );
+    expect(menu.textContent).toContain(CHAT.thinkingLevel.levelNotes.medium);
+    key(document.activeElement!, 'ArrowLeft');
+    await waitFor(
+      () =>
+        menu.querySelector('[data-page="main"]') !== null &&
+        (document.activeElement as HTMLElement | null)?.dataset.row === 'effort',
+    );
+
+    // Navigate to More models -> gemma-4-26b quant page -> pick BF16.
+    click(findItem(menu, CHAT.modelMore));
+    await waitFor(
+      () =>
+        menu.querySelector('[data-page="more"]') !== null &&
+        menu.contains(document.activeElement) &&
+        document.activeElement !== menu,
+    );
+    click(findItem(menu, 'gemma-4-26b'));
+    await waitFor(
+      () =>
+        menu.querySelector('[data-page="quant:gemma-4-26b"]') !== null &&
+        document.activeElement?.getAttribute('role') === 'menuitemradio',
+    );
+    click(findItem(menu, 'BF16'));
+    expect(onValueChange).toHaveBeenCalledTimes(1);
+    expect(onValueChange).toHaveBeenCalledWith('gemma-4-26b-bf16');
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
+  });
+
+  it('focuses the selected multi-variant row inside narrow More models and falls back to main when listDisabled flips true', async () => {
+    restore = stubNarrow(true);
+    const props: Partial<ModelPickerProps> = {
+      value: 'gemma-4-26b-q4',
+      bases: levelled(),
+      listDisabled: false,
+      listDisabledReason: CHAT.modelBusy,
+    };
+    const container = mount(picker(props));
+    const menu = await openMenu(container);
+
+    click(findItem(menu, CHAT.modelMore));
+    await waitFor(
+      () =>
+        menu.querySelector('[data-page="more"]') !== null &&
+        (document.activeElement as HTMLElement | null)?.dataset.row === 'quant:gemma-4-26b',
+    );
+    const active = document.activeElement as HTMLElement;
+    expect(active.hasAttribute('data-checked')).toBe(true);
+    expect(active.hasAttribute('data-back')).toBe(false);
+
+    rerender(picker({ ...props, listDisabled: true }));
+    await waitFor(() => menu.querySelector('[data-page="main"]') !== null);
+    expect(menu.textContent).toContain(CHAT.modelBusy);
+
+    // ArrowRight on disabled More models row does nothing.
+    const disabledMore = findItem(menu, CHAT.modelMore);
+    key(disabledMore, 'ArrowRight');
+    await flush();
+    expect(menu.querySelector('[data-page="main"]')).not.toBeNull();
+  });
+
+  it('keeps the focus highlight aligned when a transforming .page wrapper becomes item.offsetParent', async () => {
+    restore = stubNarrow(true);
+    const container = mount(picker({ bases: levelled() }));
+    const menu = await openMenu(container);
+    const list = menu.querySelector<HTMLElement>('[data-page="main"]')!;
+    const highlight = list.firstElementChild as HTMLElement;
+    const pageEl = list.children[1]?.firstElementChild as HTMLElement;
+    const effortRow = findItem(menu, CHAT.thinkingLevel.effort);
+
+    Object.defineProperty(pageEl, 'offsetParent', { configurable: true, get: () => list });
+    Object.defineProperty(pageEl, 'offsetTop', { configurable: true, get: () => 6 });
+    Object.defineProperty(effortRow, 'offsetParent', { configurable: true, get: () => pageEl });
+    Object.defineProperty(effortRow, 'offsetTop', { configurable: true, get: () => 120 });
+    Object.defineProperty(effortRow, 'offsetHeight', { configurable: true, get: () => 40 });
+
+    act(() => effortRow.focus());
+    await waitFor(() => highlight.style.height === '40px');
+    expect(highlight.style.height).toBe('40px');
+    expect(highlight.style.transform).toContain('126px');
+  });
+});
+
+describe('ModelPicker: footer, memory, and CSS structure', () => {
+  it('applies footer precedence (listDisabledReason > swapWarning > footer) and keeps memory action clickable', async () => {
+    const onUnload = vi.fn();
+    const action = createElement('button', { type: 'button', onClick: onUnload }, 'Unload');
+    const container = mount(
+      picker({ swapWarning: 'A running answer waits.', memory: { text: `${XL} is in memory.`, action } }),
+    );
+    const menu = await openMenu(container);
+    expect(menu.textContent).toContain('A running answer waits.');
+    expect(menu.textContent).not.toContain('Models load on first use.');
+    expect(menu.textContent).toContain(`${XL} is in memory.`);
+    const unload = byRole(menu, 'button', 'Unload')!;
+    expect(unload).not.toBeNull();
+    click(unload);
+    expect(onUnload).toHaveBeenCalledTimes(1);
+
+    unmountAll();
+    const allLoaded: ModelBaseOption[] = [
+      {
+        base: 'model-0',
+        recommended: true,
+        state: 'loaded',
+        facts: [],
+        preselect: 'model-0',
+        variants: [{ id: 'model-0', label: 'BF16', state: 'loaded', facts: [] }],
+      },
+    ];
+    const quiet = mount(picker({ value: 'model-0', bases: allLoaded, swapWarning: 'A running answer waits.' }));
+    const quietMenu = await openMenu(quiet);
+    expect(quietMenu.textContent).toContain('Models load on first use.');
+    expect(quietMenu.textContent).not.toContain('A running answer waits.');
+  });
+
+  it('cycles Tab focus between menu items and Unload in .foot while shielding Space and letters from menu typeahead', async () => {
+    const onUnload = vi.fn();
+    const action = createElement('button', { type: 'button', onClick: onUnload }, 'Unload');
+    const container = mount(picker({ memory: { text: `${XL} is in memory.`, action } }));
+    const menu = await openMenu(container);
+    const unload = byRole(menu, 'button', 'Unload')!;
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+
+    act(() => qwenRow.focus());
+    expect(document.activeElement).toBe(qwenRow);
+
+    key(qwenRow, 'Tab');
+    expect(document.activeElement).toBe(unload);
+
+    // Letters and Space while focused on Unload must not trigger Radix menu typeahead and steal focus.
+    key(unload, 'a');
+    key(unload, ' ');
+    expect(document.activeElement).toBe(unload);
+
+    // Tab cycles back to the menu items.
+    key(unload, 'Tab');
+    expect(document.activeElement).not.toBe(unload);
+    expect(document.activeElement?.getAttribute('role')?.startsWith('menuitem')).toBe(true);
+  });
+
+  it('skips disabled tabIndex={0} buttons in .foot on Tab while still reaching enabled controls', async () => {
+    const busyUnload = createElement('button', { type: 'button', tabIndex: 0, disabled: true }, 'Unload');
+    const container = mount(picker({ memory: { text: `${XL} is in memory.`, action: busyUnload } }));
+    const menu = await openMenu(container);
+    const unload = byRole(menu, 'button', 'Unload') as HTMLButtonElement;
+    expect(unload.disabled).toBe(true);
+    expect(unload.getAttribute('tabindex')).toBe('0');
+    const unloadFocus = vi.spyOn(unload, 'focus');
+    const qwenRow = findItem(menu, 'Qwen3.8-27B');
+
+    act(() => qwenRow.focus());
+    key(qwenRow, 'Tab');
+    expect(unloadFocus).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(qwenRow);
+    expect(document.activeElement).not.toBe(unload);
+
+    unmountAll();
+    const mixed = createElement(
+      'span',
+      null,
+      createElement('button', { type: 'button', tabIndex: 0, disabled: true }, 'Unload'),
+      createElement('button', { type: 'button', tabIndex: 0 }, 'Details'),
+    );
+    const mixedContainer = mount(picker({ memory: { text: `${XL} is in memory.`, action: mixed } }));
+    const mixedMenu = await openMenu(mixedContainer);
+    const disabledBtn = byRole(mixedMenu, 'button', 'Unload') as HTMLButtonElement;
+    const enabledBtn = byRole(mixedMenu, 'button', 'Details') as HTMLButtonElement;
+    const disabledFocus = vi.spyOn(disabledBtn, 'focus');
+    const row = findItem(mixedMenu, 'Qwen3.8-27B');
+
+    act(() => row.focus());
+    key(row, 'Tab');
+    expect(disabledFocus).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(enabledBtn);
+
+    key(enabledBtn, 'Tab');
+    expect(document.activeElement?.getAttribute('role')?.startsWith('menuitem')).toBe(true);
+  });
+
+  it('enforces overflow: clip layout-shift guards on trigger elements and Arc menu surface rules', () => {
+    const rules = cssRules('components/arc-x/model-picker/model-picker.module.css');
+    expect(cssValue(rules, '.trigger', 'overflow')).toBe('clip');
+    expect(cssValue(rules, '.triggerMark', 'overflow')).toBe('clip');
+    expect(cssValue(rules, '.triggerText', 'overflow')).toBe('clip');
+    expect(cssValue(rules, '.menu', 'width')).toBe('304px');
+    expect(cssValue(rules, '.effortMenu', 'width')).toBe('264px');
+    expect(cssValue(rules, '.moreMenu', 'width')).toBe('272px');
+    expect(cssValue(rules, '.quantMenu', 'width')).toBe('260px');
+    expect(cssValue(rules, '.autoHeight', 'display')).toBe('flex');
+    expect(cssValue(rules, '.autoHeight', 'flex-direction')).toBe('column');
+    expect(cssValue(rules, '.list', 'min-height')).toBe('0');
+    expect(cssValue(rules, '.list', 'overflow-x')).toBe('hidden');
+    expect(cssValue(rules, '.list', 'overscroll-behavior')).toBe('contain');
+    expect(cssValue(rules, '.item', 'min-height')).toBe('54px');
+    expect(cssValue(rules, '.effortItem', 'min-height')).toBe('50px');
+    expect(cssValue(rules, '.row', 'min-height')).toBe('40px');
+    expect(cssValue(rules, '.compact', 'min-height')).toBe('38px');
+    expect(rules.some((rule) => rule.reduce && rule.selectors.includes(".menu[data-state='closed']"))).toBe(true);
   });
 });

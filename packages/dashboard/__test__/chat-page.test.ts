@@ -356,9 +356,13 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-afterEach(() => {
+afterEach(async () => {
   page?.unmount();
+  // A call still in flight fails when the port closes; its toast must not land in the next test.
+  const closed = api?.closed;
   api?.();
+  await closed;
+  await new Promise((resolve) => setImmediate(resolve));
   page = undefined;
   api = undefined;
   writeDraft(NEW_PLACE, '');
@@ -367,6 +371,7 @@ afterEach(() => {
   for (const id of used.splice(0)) forgetPlace(id);
   Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
   vi.restoreAllMocks();
+  toast.dismiss();
 });
 
 describe('Chat page: places and modes', () => {
@@ -745,6 +750,9 @@ describe('Chat page: sending', () => {
     click(button(CHAT.sendErrors['model-unavailable'][1]));
     await waitFor(() => !shown().includes(CHAT.sendErrors['model-unavailable'][0]));
     expect(shown()).not.toContain(CHAT.sendErrors.other[0]);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    key(document.activeElement ?? document.body, { key: 'Escape' });
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) === null);
     expect(composer().value).toBe('second');
   });
 
@@ -2073,7 +2081,7 @@ describe('Chat page: a fork or a recap that runs, a model that is gone, a prompt
     expect(shown()).not.toContain(CHAT.outcomes['refused-chat']);
     expect(hasButton(CHAT.updateAgent)).toBe(false);
     click(button(CHAT.pickModel));
-    await waitFor(() => byRole(document.body, 'listbox') !== null);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
     expect(writes()).toEqual([]);
   });
 
@@ -2326,8 +2334,8 @@ describe('Chat page: Unload', () => {
 
   async function openPicker(state: keyof typeof CHAT.pillStates): Promise<HTMLElement> {
     key(button(fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates[state] })), { key: 'ArrowDown' });
-    await waitFor(() => byRole(document.body, 'listbox') !== null);
-    return byRole(document.body, 'listbox')!;
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    return byRole(document.body, 'menu', CHAT.model)!;
   }
 
   async function stopUnsent(id: string): Promise<void> {
@@ -2347,11 +2355,12 @@ describe('Chat page: Unload', () => {
     });
     await stopUnsent('p-unload');
     expect(shown()).toContain(inMemory);
-    const list = await openPicker('loaded');
-    const memoryRow = list.parentElement!.parentElement!.parentElement!.lastElementChild!;
+    const menu = await openPicker('loaded');
+    const list = menu.querySelector('[data-page]')!;
+    const memoryRow = menu.lastElementChild!.lastElementChild!;
     expect(memoryRow.textContent).toContain(inMemory);
     expect(unloadButtons()).toHaveLength(2);
-    expect(list.contains(unloadButtons()[0]!)).toBe(false);
+    expect(unloadButtons().every((b) => !list.contains(b))).toBe(true);
     click(unloadButtons().find((b) => memoryRow.contains(b))!);
     await waitFor(() => unloadButtons().every((b) => face(b) === CHAT.engine.unloading));
     await waitFor(() => writes().some((w) => w.path === '/chat/engine/unload'));
@@ -3734,10 +3743,11 @@ describe('Chat page: conversation actions', () => {
     });
     const trigger = button(fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }));
     key(trigger, { key: 'ArrowDown' });
-    await waitFor(() => byRole(document.body, 'listbox') !== null);
-    const list = byRole(document.body, 'listbox')!;
-    key(list, { key: 'End' });
-    key(list, { key: 'Enter' });
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    const menu = byRole(document.body, 'menu', CHAT.model)!;
+    key(menu, { key: 'End' });
+    await waitFor(() => document.activeElement?.textContent?.includes('qwen3.5-9b') === true);
+    key(document.activeElement!, { key: 'Enter' });
     await waitFor(() => writes().length === 1);
     expect(writes()[0]).toEqual({
       method: 'PATCH',
@@ -3769,15 +3779,18 @@ describe('Chat page: conversation actions', () => {
       }),
     );
     key(trigger, { key: 'ArrowDown' });
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    const menu = byRole(document.body, 'menu', CHAT.model)!;
+    const effortTrigger = allByRole(menu, 'menuitem').find((item) =>
+      item.textContent?.includes(CHAT.thinkingLevel.effort),
+    )!;
+    act(() => effortTrigger.focus());
+    key(effortTrigger, { key: 'ArrowRight' });
     const levelList = fill(CHAT.thinkingLevel.list, { model: 'qwen3.5-4b' });
-    await waitFor(() => byRole(document.body, 'listbox', levelList) !== null);
-    const group = byRole(document.body, 'listbox', levelList)!;
-    expect(document.body.textContent).toContain(CHAT.thinkingLevel.about);
-    act(() =>
-      allByRole(group, 'option')
-        .find((o) => o.textContent === 'Low')!
-        .click(),
-    );
+    await waitFor(() => byRole(document.body, 'menu', levelList) !== null);
+    const group = byRole(document.body, 'menu', levelList)!;
+    expect(group.textContent).toContain(CHAT.thinkingLevel.about);
+    click(allByRole(group, 'menuitemradio').find((o) => o.textContent?.includes('Low'))!);
     await waitFor(() => writes().length === 1);
     expect(writes()[0]).toEqual({ method: 'PATCH', path: '/chat/conversations/p-think', body: { thinking: 'low' } });
     const statusText = [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent).join(' ');
@@ -3791,8 +3804,9 @@ describe('Chat page: conversation actions', () => {
       conversations: { 'p-think': sync('p-think') },
     });
     key(button(fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle })), { key: 'ArrowDown' });
-    await waitFor(() => byRole(document.body, 'listbox') !== null);
-    expect(byRole(document.body, 'listbox', levelList)).toBeNull();
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    expect(byRole(document.body, 'menu', CHAT.model)!.textContent).not.toContain(CHAT.thinkingLevel.effort);
+    expect(byRole(document.body, 'menu', levelList)).toBeNull();
   });
 
   it('Thinking on the New screen: the pick is kept per mode and goes with the first message; the chip names it', async () => {
@@ -3814,14 +3828,17 @@ describe('Chat page: conversation actions', () => {
       ),
       { key: 'ArrowDown' },
     );
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    const menu = byRole(document.body, 'menu', CHAT.model)!;
+    const effortTrigger = allByRole(menu, 'menuitem').find((item) =>
+      item.textContent?.includes(CHAT.thinkingLevel.effort),
+    )!;
+    act(() => effortTrigger.focus());
+    key(effortTrigger, { key: 'ArrowRight' });
     const levelList = fill(CHAT.thinkingLevel.list, { model: 'qwen3.5-4b' });
-    await waitFor(() => byRole(document.body, 'listbox', levelList) !== null);
-    const group = byRole(document.body, 'listbox', levelList)!;
-    act(() =>
-      allByRole(group, 'option')
-        .find((o) => o.textContent === 'Off')!
-        .click(),
-    );
+    await waitFor(() => byRole(document.body, 'menu', levelList) !== null);
+    const group = byRole(document.body, 'menu', levelList)!;
+    click(allByRole(group, 'menuitemradio').find((o) => o.textContent?.includes('Off'))!);
     expect(JSON.parse(localStorage.getItem('mlx-node:chat-thinking:v1') ?? '{}')).toEqual({ chat: 'none' });
     const named = fill(CHAT.thinkingLevel.chipName, {
       model: fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }),
@@ -3860,13 +3877,15 @@ describe('Chat page: conversation actions', () => {
     });
     const trigger = button(fill(CHAT.pillName, { model: 'Qwen3.8-27B UD-Q4_K_XL', state: CHAT.pillStates.idle }));
     key(trigger, { key: 'ArrowDown' });
-    await waitFor(() => allByRole(document.body, 'listbox').length === 2);
-    const left = allByRole(document.body, 'listbox')[0]!;
-    key(left, { key: 'ArrowRight' });
-    const right = (): HTMLElement => allByRole(document.body, 'listbox')[1]!;
-    await waitFor(() => document.activeElement === right());
-    key(right(), { key: 'ArrowUp' });
-    key(right(), { key: 'Enter' });
+    await waitFor(() => byRole(document.body, 'menu', CHAT.model) !== null);
+    const menu = byRole(document.body, 'menu', CHAT.model)!;
+    const qwenRow = allByRole(menu, 'menuitem').find((item) => item.textContent?.includes('Qwen3.8-27B'))!;
+    act(() => qwenRow.focus());
+    key(qwenRow, { key: 'ArrowRight' });
+    const quantLabel = fill(CHAT.modelQuantList, { base: 'Qwen3.8-27B' });
+    await waitFor(() => byRole(document.body, 'menu', quantLabel) !== null);
+    const quantMenu = byRole(document.body, 'menu', quantLabel)!;
+    click(allByRole(quantMenu, 'menuitemradio').find((item) => item.textContent?.includes('UD-Q4_K_M'))!);
     await waitFor(() => writes().length === 1);
     await flushTimers();
     expect(writes()).toEqual([{ method: 'PATCH', path: '/chat/conversations/p-quant', body: { modelId: M } }]);

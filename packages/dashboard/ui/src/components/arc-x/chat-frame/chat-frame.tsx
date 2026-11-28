@@ -184,7 +184,7 @@ export function ChatFrame(props: ChatFrameProps): ReactElement {
         </header>
         {docked ? (
           <div className={styles.list}>
-            <ScrollArea className={styles.listScroll} viewportRef={untabbable}>
+            <ScrollArea className={styles.listScroll} viewportClassName={styles.paneViewport} viewportRef={untabbable}>
               {props.list}
             </ScrollArea>
           </div>
@@ -216,7 +216,9 @@ export function ChatFrame(props: ChatFrameProps): ReactElement {
             {viewColumn ? (
               <div className={styles.view}>{view.content}</div>
             ) : rail.open ? (
-              <ScrollArea className={styles.railScroll}>{rail.content}</ScrollArea>
+              <ScrollArea className={styles.railScroll} viewportClassName={styles.paneViewport}>
+                {rail.content}
+              </ScrollArea>
             ) : null}
           </aside>
         ) : (

@@ -56,11 +56,13 @@ Every `.ts` / `.tsx` file that shipped with a first line `"use client";` has tha
 module-level directives): `lib/arc-provider.tsx`, `lib/use-copy-feedback.ts`, and the `.tsx` file of every item above
 except `arc-foundation` and `arc-motion-tokens`. No other file changed except the regex replacements below
 (this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`, or a plain
-list where the pattern matched four fixed key names), the `number-field/number-field.tsx` draft fix in the row for
-line 400, the `combobox/combobox.tsx` fixes and the one `drawer/drawer.tsx` fix in the last rows of the table.
+list where the pattern matched four fixed key names), the `button/button.module.css` overflow clip, the
+`number-field/number-field.tsx` draft fix in the row for line 400, the `combobox/combobox.tsx` fixes and the one
+`drawer/drawer.tsx` fix in the last rows of the table.
 
 | File | Line (here) | Upstream | Here |
 |---|---|---|---|
+| `button/button.module.css` | 2–3 | `.button { position: relative; display: inline-flex; … }` | comment line above `.button` plus `overflow: clip;` on `.button` |
 | `button/button.tsx` | 7 | — | `import { hasNonWhitespace, stripTags } from "../../../lib/text-scan";` |
 | `button/button.tsx` | 122 | `icon={!/\S/.test(key.replace(/<[^>]*>/g, ""))}` | `icon={!hasNonWhitespace(stripTags(key))}` |
 | `input/input.tsx` | 6 | — | `import { isNumericWord, stripCommas } from "../../../lib/text-scan";` |
@@ -87,6 +89,11 @@ line 400, the `combobox/combobox.tsx` fixes and the one `drawer/drawer.tsx` fix 
 | `combobox/combobox.tsx` | 258 | — | `onMouseDown={(event) => event.preventDefault()}` on the popover |
 | `drawer/drawer.tsx` | 97 | — | the comment line above the `offset` value |
 | `drawer/drawer.tsx` | 98 | `const offset = useMotionValue<number \| string>(0);` (four lines higher, above `pan`) | ``const offset = useMotionValue<number \| string>(reduced ? 0 : `${sign * 100}%`);`` |
+
+The button fix: `Button` crossfades labels inside `<AnimatePresence mode="popLayout">`. Motion's `PopChild` measures
+past `position: sticky` ancestors, so when a button inside a sticky bar swaps children during a scroll-root reset, the
+exiting `.labelPhase` can be positioned hundreds of pixels below `.button` and inflate the scroll root's `scrollHeight`.
+`overflow: clip;` on `.button` contains exiting labels without clipping focus outlines or box shadows.
 
 The drawer fix: the panel's motion value started at 0 while the entrance starts at `100%`. Motion writes that first
 frame into the value when the panel mounts, the jump read as a velocity of 100 % in 30 ms, and the entrance spring

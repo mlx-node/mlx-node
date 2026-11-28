@@ -197,6 +197,68 @@ describe('modelBases', () => {
   it('the chat is on M while memory holds XL: M is preselected', () => {
     expect(bases({}, [XL.id], M.id).find((row) => row.base === 'Qwen3.8-27B')!.preselect).toBe(M.id);
   });
+
+  it('propagates recommended metadata, sorts recommended bases by curated order within each state rank, and populates effort notes and defaultValue', () => {
+    const models = [
+      build('zeta-q4', 'zeta', 'Q4_0', 4),
+      build('alpha-q4', 'alpha', 'Q4_0', 4),
+      build('Hy4-flash-Q4_K_M', 'Hy4-flash', 'Q4_K_M', 168.3, {
+        recommended: true,
+        recommendedOrder: 3,
+        description: '512-expert MoE streamed from SSD, 256K context',
+      }),
+      build('Inkling-2-Mini-UD-Q4_K_XL', 'Inkling-2-Mini', 'UD-Q4_K_XL', 18.7, {
+        recommended: true,
+        recommendedOrder: 1,
+        description: 'Looped MoE with vision and DFlash2 draft, 1M context',
+      }),
+      build('Qwen3.8-27B-UD-Q4_K_M', 'Qwen3.8-27B', 'UD-Q4_K_M', 17.5, {
+        recommended: true,
+        recommendedOrder: 0,
+        description: 'Best tool use — recommended default',
+        thinking: { levels: ['none', 'low', 'medium', 'high'], default: 'high' },
+      }),
+      build('Qwen3.8-27B-UD-Q4_K_XL', 'Qwen3.8-27B', 'UD-Q4_K_XL', 18.6, {
+        recommended: true,
+        recommendedOrder: 0,
+        description: 'Best tool use — recommended default',
+        thinking: { levels: ['none', 'low', 'medium', 'high'], default: 'high' },
+      }),
+    ];
+    const rows = modelBases(
+      host({ models }),
+      new Set(['zeta-q4']),
+      'chat',
+      'Qwen3.8-27B-UD-Q4_K_M',
+      {},
+      { level: 'low', busy: false },
+    );
+    // Loaded state rank still leads; idle recommended models follow in curated recommendedOrder before idle non-recommended alphabetically.
+    expect(rows.map((row) => row.base)).toEqual(['zeta', 'Qwen3.8-27B', 'Inkling-2-Mini', 'Hy4-flash', 'alpha']);
+    expect(rows[0]!.recommended).toBeUndefined();
+    expect(rows[0]!.note).toBeUndefined();
+    expect(rows[1]!.recommended).toBe(true);
+    expect(rows[1]!.note).toBe('Best tool use — recommended default');
+    expect(rows[2]!.recommended).toBe(true);
+    expect(rows[2]!.note).toBe('Looped MoE with vision and DFlash2 draft, 1M context');
+    expect(rows[3]!.recommended).toBe(true);
+    expect(rows[3]!.note).toBe('512-expert MoE streamed from SSD, 256K context');
+    expect(rows[4]!.recommended).toBeUndefined();
+    expect(rows[4]!.note).toBeUndefined();
+
+    const effort = rows[1]!.variants[0]!.effort;
+    expect(effort).toEqual({
+      levels: [
+        { value: 'none', label: CHAT.thinkingLevel.levels.none, note: CHAT.thinkingLevel.levelNotes.none },
+        { value: 'low', label: CHAT.thinkingLevel.levels.low, note: CHAT.thinkingLevel.levelNotes.low },
+        { value: 'medium', label: CHAT.thinkingLevel.levels.medium, note: CHAT.thinkingLevel.levelNotes.medium },
+        { value: 'high', label: CHAT.thinkingLevel.levels.high, note: CHAT.thinkingLevel.levelNotes.high },
+      ],
+      value: 'low',
+      defaultValue: 'high',
+      note: CHAT.thinkingLevel.about,
+    });
+  });
 });
 
 describe('the last model picked per base', () => {

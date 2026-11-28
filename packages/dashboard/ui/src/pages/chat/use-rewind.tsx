@@ -45,8 +45,8 @@ export interface RewindOptions {
   commands: number;
   /** The text in a conversation's message box. */
   readDraft: (conversationId: string) => string;
-  /** Puts a rewound message in the message box of its conversation; the page opens it when it shows another. */
-  putBack: (conversationId: string, text: string) => void;
+  /** Puts a rewound message in the message box of its conversation; opens it when `open` is true and another shows. */
+  putBack: (conversationId: string, text: string, open?: boolean) => void;
   /** Puts a rewound message in the message box of a conversation the page does not show, and opens nothing. */
   keepText: (conversationId: string, text: string) => void;
   openConversation: (conversationId: string) => void;
@@ -178,7 +178,7 @@ export function useRewind(options: RewindOptions): RewindControls {
     }
     if (here && result.entry === 0) setAtStart(id);
     if (now.readDraft(id).trim() === '') {
-      if (here) now.putBack(id, was.text);
+      if (here) now.putBack(id, was.text, false);
       else now.keepText(id, was.text);
       say(words, where);
       return;
@@ -368,7 +368,7 @@ export function useRewind(options: RewindOptions): RewindControls {
   const refill = (id: string, text: string, said: string | null): void => {
     const now = opts.current;
     if (now.readDraft(id).trim() === '') {
-      now.putBack(id, text);
+      now.putBack(id, text, false);
       if (said !== null) toast.success(said);
       return;
     }

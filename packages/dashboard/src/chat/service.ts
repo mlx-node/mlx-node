@@ -11,6 +11,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { MLX_AGENT_MIN_RELEASE } from '@mlx-node/agent/binary';
+import { catalogTargetForSlug, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { agentConfigDir } from '@mlx-node/agent/paths';
 import { ggufSplitPartNames, parseGgufFileName } from '@mlx-node/lm/model-discovery';
 import { levelsFor } from '@mlx-node/server/host/thinking-levels';
@@ -3580,6 +3581,7 @@ export class ChatService {
     }
     const models = served.map((m, index) => {
       const thinking = this.thinkingOf(m);
+      const catalog = recommendedCatalogMeta(m);
       return {
         id: m.name,
         base: m.base,
@@ -3590,6 +3592,7 @@ export class ChatService {
         images: inMemory.get(m.name)?.images ?? m.images ?? false,
         family: m.modelType ?? null,
         ...(thinking === undefined ? {} : { thinking }),
+        ...(catalog === undefined ? {} : catalog),
       };
     });
     const resident: ChatHostState['resident'] = [];
@@ -3697,6 +3700,49 @@ export class ChatService {
       canInstall: this.opts.installAgent !== undefined,
     };
   }
+}
+
+interface RecommendedCatalogMeta {
+  recommended: true;
+  recommendedOrder: number;
+  description: string;
+}
+
+const RECOMMENDED_CHAT_BY_LABEL = new Map<string, RecommendedCatalogMeta>(
+  MODEL_CATALOG.filter((entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat').map((entry, index) => [
+    entry.label.toLowerCase(),
+    { recommended: true, recommendedOrder: index, description: entry.description },
+  ]),
+);
+
+function recommendedCatalogMeta(model: {
+  name: string;
+  base: string;
+  path: string;
+}): RecommendedCatalogMeta | undefined {
+  const pathBase = basename(model.path);
+  const parentDir = dirname(model.path);
+  const slugs = [
+    pathBase,
+    ...(pathBase.toLowerCase().endsWith('.gguf') ? [basename(parentDir), basename(dirname(parentDir))] : []),
+    model.name,
+  ];
+  for (const raw of slugs) {
+    const slug = raw.trim().toLowerCase();
+    if (slug === '' || slug === '.' || slug === '..') continue;
+    const target = catalogTargetForSlug(slug);
+    if (
+      target !== undefined &&
+      target.kind === 'build' &&
+      !target.entry.hidden &&
+      (target.entry.category ?? 'chat') === 'chat'
+    ) {
+      const meta = RECOMMENDED_CHAT_BY_LABEL.get(target.entry.label.toLowerCase());
+      if (meta !== undefined) return meta;
+    }
+  }
+  const baseKey = model.base.trim().toLowerCase();
+  return baseKey === '' ? undefined : RECOMMENDED_CHAT_BY_LABEL.get(baseKey);
 }
 
 /**

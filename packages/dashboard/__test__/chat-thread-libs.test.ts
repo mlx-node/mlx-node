@@ -43,7 +43,16 @@ import {
 import { CONTINUE_PROMPT } from '../ui/src/lib/chat-types.js';
 import { dayGroupLabel, groupByDay, matchesQuery } from '../ui/src/lib/conversations.js';
 import { formatClock } from '../ui/src/lib/format.js';
-import { JUMP_FAR, PIN_SLACK, distanceToEnd, jumpVisible, nextPinned } from '../ui/src/lib/stick-to-bottom.js';
+import {
+  CHASE_SNAP_PX,
+  CHASE_TAU_MS,
+  JUMP_FAR,
+  PIN_SLACK,
+  distanceToEnd,
+  jumpVisible,
+  nextChaseTop,
+  nextPinned,
+} from '../ui/src/lib/stick-to-bottom.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import { BLOCKER_SENTENCES, sendFailure } from '../ui/src/pages/chat/blockers.js';
 import {
@@ -559,6 +568,34 @@ describe('stick to bottom', () => {
     expect(jumpVisible(false, true, at(1_490))).toBe(true);
     expect(jumpVisible(false, false, at(1_500 - JUMP_FAR))).toBe(false);
     expect(jumpVisible(false, false, at(1_500 - JUMP_FAR - 1))).toBe(true);
+  });
+
+  it('nextChaseTop moves monotonically, is frame-rate independent, clamps huge dt, and snaps within CHASE_SNAP_PX', () => {
+    expect(CHASE_TAU_MS).toBeGreaterThan(0);
+
+    // Monotonic approach upward and downward.
+    const up1 = nextChaseTop(0, 400, 16);
+    const up2 = nextChaseTop(up1, 400, 16);
+    expect(up1).toBeGreaterThan(0);
+    expect(up2).toBeGreaterThan(up1);
+    expect(up2).toBeLessThan(400);
+
+    const down1 = nextChaseTop(400, 100, 16);
+    expect(down1).toBeLessThan(400);
+    expect(down1).toBeGreaterThan(100);
+
+    // Frame-rate independent: two 16ms steps match one 32ms step.
+    const single32 = nextChaseTop(0, 400, 32);
+    expect(up2).toBeCloseTo(single32, 10);
+
+    // Huge dt is clamped to MAX_DT_MS (50ms) and negative dt does not step backwards.
+    expect(nextChaseTop(0, 400, 5_000)).toBeCloseTo(nextChaseTop(0, 400, 50), 10);
+    expect(nextChaseTop(0, 400, 5_000)).toBeLessThan(400);
+    expect(nextChaseTop(100, 400, -10)).toBe(100);
+
+    // Snaps directly to target when starting or landing within CHASE_SNAP_PX.
+    expect(nextChaseTop(400 - CHASE_SNAP_PX, 400, 16)).toBe(400);
+    expect(nextChaseTop(400 - CHASE_SNAP_PX - 0.1, 400, 16)).toBe(400);
   });
 });
 

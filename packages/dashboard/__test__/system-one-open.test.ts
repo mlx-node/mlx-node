@@ -24,6 +24,7 @@ import { useJson } from '@/lib/use-api';
 import Models from '@/pages/models';
 import { useModelDownloads } from '@/pages/models/use-model-downloads';
 import SystemOne from '@/pages/system-one';
+import { systemOneModelBases } from '@/pages/system-one/model-options';
 import { NoSystemOneModelsCard, SystemOneModelsDrawer } from '@/pages/system-one/models-drawer';
 import { createElement, type ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
@@ -126,7 +127,7 @@ async function openAt(href: string): Promise<{ mode: string | null; model: strin
     (text) => text.includes('Try an example'),
   );
   const picked = (): string | null =>
-    mounted!.container.querySelector('button[aria-haspopup="listbox"]')?.getAttribute('title') ?? null;
+    mounted!.container.querySelector('button[aria-haspopup="menu"]')?.getAttribute('title') ?? null;
   await waitFor(() => picked() !== null);
   const mode = mounted.container
     .querySelector('[aria-label="System One mode"] [aria-pressed="true"]')
@@ -227,5 +228,59 @@ describe('the System One drawer and the empty card while they load', () => {
     expect(placeholders()).toEqual({ card: 2, drawer: 2 });
     held.release();
     await waitFor(() => document.querySelectorAll('#empty-card [data-model]').length === 4);
+  });
+});
+
+describe('systemOneModelBases catalog slug matching', () => {
+  it('matches System One catalog metadata via parent and grandparent GGUF directory slugs from model.path', () => {
+    const catalog = catalogWithState(modelsDir);
+    const models: SystemOneModelInfo[] = [
+      // 1-level GGUF folder slug (id/name do not match catalog label or slug).
+      {
+        id: 'alias-clef-q4',
+        name: 'AliasOne',
+        modelType: 'clef',
+        format: 'gguf',
+        variant: 'Q4_K_M',
+        supportsImages: false,
+        contextWindow: 16384,
+        resident: false,
+        path: '/models/clef-gguf-q4_k_m/alias-clef-q4.gguf',
+      },
+      // 2-level nested GGUF folder slug (Windows-style backslashes).
+      {
+        id: 'alias-clairic-split',
+        name: 'AliasTwo',
+        modelType: 'clairic',
+        format: 'gguf',
+        variant: 'UD-Q4_K_XL',
+        supportsImages: true,
+        contextWindow: 65536,
+        resident: false,
+        path: 'C:\\models\\clairic-gguf\\UD-Q4_K_XL\\alias-00001-of-00002.gguf',
+      },
+      // Non-catalog local model should remain non-recommended.
+      {
+        id: 'custom-local',
+        name: 'CustomLocal',
+        modelType: 'clef',
+        format: 'gguf',
+        variant: 'Q4_K_M',
+        supportsImages: false,
+        contextWindow: 16384,
+        resident: false,
+        path: '/models/custom-lab/custom-local.gguf',
+      },
+    ];
+
+    const bases = systemOneModelBases(models, null, false, catalog);
+    const byBase = new Map(bases.map((b) => [b.base, b]));
+
+    expect(byBase.get('AliasOne')?.recommended).toBe(true);
+    expect(byBase.get('AliasOne')?.note).toBeTruthy();
+    expect(byBase.get('AliasTwo')?.recommended).toBe(true);
+    expect(byBase.get('AliasTwo')?.note).toBeTruthy();
+    expect(byBase.get('CustomLocal')?.recommended).toBeUndefined();
+    expect(byBase.get('CustomLocal')?.note).toBeUndefined();
   });
 });

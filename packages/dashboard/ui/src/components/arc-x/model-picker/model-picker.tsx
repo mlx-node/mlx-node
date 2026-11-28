@@ -1,36 +1,51 @@
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Info, TriangleAlert } from 'lucide-react';
+import * as Menu from '@radix-ui/react-dropdown-menu';
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Gauge, Layers, TriangleAlert } from 'lucide-react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
-  type CSSProperties,
+  Fragment,
+  type FocusEvent,
   type KeyboardEvent,
-  type PointerEvent,
+  type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactElement,
   type ReactNode,
-  useCallback,
+  type RefObject,
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react';
 
 import { CHAT, fill } from '../../../lib/chat-strings';
 import { cn } from '../../../lib/cn';
-import { Badge } from '../../arc/badge/badge';
-import { Popover, PopoverContent, PopoverTrigger } from '../../arc/popover/popover';
+import { motionTokens } from '../../arc/motion-tokens';
 import { Tooltip } from '../../arc/tooltip/tooltip';
 import { LiveLabel } from '../live-label/live-label';
-import { MiddleText } from '../middle-text/middle-text';
-import { ModelBadge } from '../model-badge/model-badge';
+import { classifyModel, type ModelFamily, ModelLogo } from '../model-badge/model-logos';
 import { MorphLoader } from '../morph-loader/morph-loader';
+import { motionX } from '../motion/motion';
+import { useStaticMotion } from '../motion/use-static-motion';
 import styles from './model-picker.module.css';
+
+export interface ModelEffortLevel {
+  value: string;
+  label: string;
+  /** Short one-line description shown under the level label (e.g. "Quickest answers"). */
+  note?: string;
+}
 
 /** A model's thinking levels and the one a pick of its row keeps. */
 export interface ModelEffort {
   /** Least thinking first. */
-  levels: ReadonlyArray<{ value: string; label: string }>;
+  levels: readonly ModelEffortLevel[];
   /** One of `levels`: the conversation's level when the row is of its base, else the model's default. */
   value: string;
-  /** Behind the ⓘ of the Thinking effort column. */
+  /** Model's default level value: renders Arc's quiet "Default" tag beside that row. */
+  defaultValue?: string;
+  /** Quiet note shown in the Effort submenu (e.g. "Applies to your next message."). */
   note?: string;
 }
 
@@ -44,13 +59,19 @@ export interface ModelVariantOption {
   facts: readonly string[];
   /** e.g. "small for Work"; drawn with a warning icon. */
   warning?: string;
-  /** Absent or no levels: no Thinking effort column, and a pick sends no level. */
+  /** Absent or no levels: no Effort row, and a pick sends no level. */
   effort?: ModelEffort;
 }
 
 export interface ModelBaseOption {
   /** The key of the row. */
   base: string;
+  /** One-line blurb shown under the model name (catalog description; falls back to facts). */
+  note?: string;
+  /** True when on our recommended list -> rendered outside at top level; others sit under "More models". */
+  recommended?: boolean;
+  /** Optional provider/family group label inside "More models" (inferred from classifyModel when omitted). */
+  provider?: string;
   /** 'loading' when a variant is in load, else 'loaded' when one is in memory. */
   state: 'loaded' | 'loading' | 'idle';
   /** The label of the variant that `state` speaks of; left out on a base with one variant. */
@@ -60,7 +81,7 @@ export interface ModelBaseOption {
   warning?: string;
   /** One or more, in display order. */
   variants: readonly ModelVariantOption[];
-  /** The id of the row that is active when this base opens. */
+  /** The id of the row that is preselected when this base is clicked directly. */
   preselect: string;
 }
 
@@ -71,19 +92,19 @@ export interface ModelPickerProps {
   /** The model whose base opens when `value` is not served: the model a new conversation starts on. */
   fallback?: string | null;
   /**
-   * A pick: the model, and its level when the model has levels (the one picked in the Thinking effort column, else
+   * A pick: the model, and its level when the model has levels (the one picked in the Effort submenu, else
    * the row's `effort.value`). Not called when neither differs from the conversation's.
    */
   onValueChange: (id: string, level?: string) => void;
   disabled?: boolean;
   disabledReason?: string;
   /**
-   * Only the model rows are off (an answer runs): the chip still opens, for the Thinking effort column of the
+   * Only the model rows are off (an answer runs): the chip still opens, for the Effort submenu of the
    * conversation's model; the reason is the footer.
    */
   listDisabled?: boolean;
   listDisabledReason?: string;
-  /** The agent did not take the level before the last answer: a warning dot in the chip's level badge. */
+  /** The agent did not take the level before the last answer: a warning dot beside the chip's level. */
   levelWarning?: boolean;
   /** A change is being saved. */
   working?: boolean;
@@ -91,52 +112,43 @@ export interface ModelPickerProps {
   footer?: string;
   /** Shown instead of the footer while one or more variants are not loaded. */
   swapWarning?: string;
-  /** The last row: what the engine holds now, and an action (Unload). Outside the listboxes: a normal tab stop. */
+  /** The last row: what the engine holds now, and an action (Unload). Outside the menu items: a normal tab stop. */
   memory?: { text: string; action: ReactNode };
   /** The tools row holds more chips (Work): the level badge hides under a wider composer. */
   crowded?: boolean;
+  /** Preferred side of the trigger to open the menu on. Defaults to `'top'`. */
+  side?: 'top' | 'bottom';
+  /** Preferred alignment relative to the trigger. Defaults to `'start'`. */
+  align?: 'start' | 'center' | 'end';
 }
 
-/** The left list asks for this many rows at least, and shows 8.5 at most. */
-const MIN_ROWS = 4;
-const MAX_ROWS = 8.5;
-/** The width of `.panel.panel[data-third]` in the CSS, and the gap the panel keeps from the window edge. */
-const THIRD_WIDTH = 713;
-const GUTTER = 16;
+const { duration, ease } = motionTokens;
+const settle = motionX.spring.expand;
+const smooth = motionX.spring.reshape;
+const standard = [...ease.standard] as [number, number, number, number];
+const INSTANT = { duration: 0 } as const;
 
-interface Keys {
-  open: string;
-  base: string;
-  variant: string;
-  level: string;
+type Page =
+  | { kind: 'main' }
+  | { kind: 'effort' }
+  | { kind: 'more' }
+  | { kind: 'quant'; base: string; from: 'main' | 'more' };
+
+const MAIN_PAGE: Page = { kind: 'main' };
+
+function pageKey(page: Page): string {
+  return page.kind === 'quant' ? `quant:${page.base}` : page.kind;
 }
 
-const NO_KEYS: Keys = { open: '', base: '', variant: '', level: '' };
+function pageDepth(page: Page): number {
+  if (page.kind === 'main') return 0;
+  if (page.kind === 'quant' && page.from === 'more') return 2;
+  return 1;
+}
 
 function holding(bases: readonly ModelBaseOption[], id: string | null | undefined): ModelBaseOption | undefined {
   if (id === null || id === undefined) return undefined;
   return bases.find((option) => option.variants.some((variant) => variant.id === id));
-}
-
-/** The rows the keys point at. A key that is gone falls back to the base of `value` (or `fallback`), then the first. */
-function resolve(
-  bases: readonly ModelBaseOption[],
-  value: string | null,
-  fallback: string | null | undefined,
-  keys: Keys,
-): { home: ModelBaseOption | undefined; open: ModelBaseOption | undefined; base: number; variant: number } {
-  const home = holding(bases, value) ?? holding(bases, fallback) ?? bases[0];
-  const open = bases.find((option) => option.base === keys.open) ?? home;
-  let base = bases.findIndex((option) => option.base === keys.base);
-  if (base === -1) base = home === undefined ? 0 : bases.indexOf(home);
-  const variants = open?.variants ?? [];
-  let variant = variants.findIndex((option) => option.id === keys.variant);
-  if (variant === -1)
-    variant = Math.max(
-      0,
-      variants.findIndex((option) => option.id === open?.preselect),
-    );
-  return { home, open, base, variant };
 }
 
 function levelsOf(variant: ModelVariantOption | undefined): ModelEffort | undefined {
@@ -150,672 +162,1156 @@ function keptLabel(variant: ModelVariantOption | undefined): string | null {
   return effort?.levels.find((option) => option.value === effort.value)?.label ?? null;
 }
 
-/** The active level row: `key` when the list has it, else the level the row keeps, else the first. */
-function levelIndex(effort: ModelEffort | undefined, key: string): number {
-  if (effort === undefined) return 0;
-  const at = effort.levels.findIndex((option) => option.value === key);
-  if (at !== -1) return at;
-  return Math.max(
-    0,
-    effort.levels.findIndex((option) => option.value === effort.value),
+/** The chip's name with the level of the model. */
+function withLevel(name: string, level: string | null): string {
+  return level === null ? name : fill(CHAT.thinkingLevel.chipName, { model: name, level });
+}
+
+function providerLabel(family: ModelFamily): string {
+  switch (family) {
+    case 'qwen':
+      return 'Qwen';
+    case 'gemma':
+      return 'Gemma';
+    case 'hy':
+      return 'Tencent Hy';
+    case 'liquid':
+      return 'Liquid';
+    case 'cloudflare':
+      return 'Cloudflare';
+    case 'internscience':
+      return 'InternScience';
+    case 'ornith':
+      return 'Ornith';
+    default:
+      return CHAT.modelOtherProvider;
+  }
+}
+
+function groupByProvider(bases: readonly ModelBaseOption[]): Array<{ provider: string; bases: ModelBaseOption[] }> {
+  const buckets = new Map<string, ModelBaseOption[]>();
+  const other: ModelBaseOption[] = [];
+  for (const base of bases) {
+    const provider = base.provider ?? providerLabel(classifyModel(base.base));
+    if (provider === CHAT.modelOtherProvider) {
+      other.push(base);
+      continue;
+    }
+    const bucket = buckets.get(provider);
+    if (bucket === undefined) buckets.set(provider, [base]);
+    else bucket.push(base);
+  }
+  const groups = Array.from(buckets, ([provider, items]) => ({ provider, bases: items }));
+  if (other.length > 0) groups.push({ provider: CHAT.modelOtherProvider, bases: other });
+  return groups;
+}
+
+const LIST_MAX_HEIGHT = 420;
+const LIST_VERTICAL_PADDING = 12;
+const FOCUSABLE_IN_FOOT = 'button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"]):not(:disabled)';
+
+function firstFocusableMenuItem(list: HTMLElement | null): HTMLElement | null {
+  if (list === null) return null;
+  return (
+    list.querySelector<HTMLElement>(
+      '[role^="menuitem"][data-state="checked"]:not([data-disabled]), [role^="menuitem"][data-checked]:not([data-disabled])',
+    ) ??
+    list.querySelector<HTMLElement>('[role^="menuitem"]:not([data-back]):not([data-disabled])') ??
+    list.querySelector<HTMLElement>('[role^="menuitem"]:not([data-disabled])')
   );
 }
 
-/** Scrolls `list` by the least amount that shows all of its `index`th row; rows are positioned against the list. */
-function reveal(list: HTMLElement | null, index: number): void {
-  const row = list?.children.item(index);
-  if (list === null || !(row instanceof HTMLElement)) return;
-  const top = row.offsetTop;
-  const bottom = top + row.offsetHeight;
-  if (top < list.scrollTop) list.scrollTop = top;
-  else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
-}
+/* ---------------------------------------------------------------------------------------------------------------
+ * Trigger: the mark crossfades and the width springs to the new name, so a switch never snaps the pill.
+ * ------------------------------------------------------------------------------------------------------------- */
 
-/** One printable letter or digit with no modifier: a first-letter move. */
-function letterOf(event: KeyboardEvent): string | null {
-  if (event.key.length !== 1 || event.metaKey || event.ctrlKey || event.altKey) return null;
-  const key = event.key.toLowerCase();
-  return key !== key.toUpperCase() || (key >= '0' && key <= '9') ? key : null;
-}
-
-/** The next row after `from` whose text starts with `letter`, wrapping; `from` when none does. */
-function byLetter(texts: readonly string[], from: number, letter: string): number {
-  for (let step = 1; step <= texts.length; step += 1) {
-    const index = (from + step) % texts.length;
-    if (texts[index]!.toLowerCase().startsWith(letter)) return index;
+function TriggerLabel({
+  modelId,
+  displayName,
+  level,
+  levelWarning,
+  crowded,
+  reduced,
+}: {
+  modelId: string;
+  displayName: string;
+  level: string | null;
+  levelWarning: boolean;
+  crowded: boolean;
+  reduced: boolean;
+}): ReactElement {
+  const measure = useRef<HTMLSpanElement>(null);
+  const measuredKey = useRef<string | null>(null);
+  const [size, setSize] = useState<{ width: number | 'auto'; animate: boolean }>({ width: 'auto', animate: false });
+  const key = `${modelId}|${level ?? ''}`;
+  if (crowded && (size.width !== 'auto' || size.animate)) {
+    setSize({ width: 'auto', animate: false });
   }
-  return from;
+
+  useLayoutEffect(() => {
+    if (crowded) {
+      measuredKey.current = null;
+      return;
+    }
+    const node = measure.current;
+    if (node === null || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry === undefined) return;
+      const measured = Math.ceil(entry.borderBoxSize?.[0]?.inlineSize ?? node.offsetWidth);
+      if (measured <= 0) return;
+      const current = node.dataset.key ?? '';
+      // Only a change of model or effort morphs; the first measure and font swaps settle instantly.
+      const animate = measuredKey.current !== null && measuredKey.current !== current;
+      measuredKey.current = current;
+      setSize({ width: measured, animate });
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      measuredKey.current = null;
+    };
+  }, [crowded]);
+
+  const text = (hidden?: boolean) => (
+    <>
+      <span className={styles.triggerName} data-model={hidden ? undefined : modelId}>
+        {displayName}
+      </span>
+      {level !== null ? (
+        <span
+          className={styles.triggerEffort}
+          aria-hidden={hidden || undefined}
+          data-chip-label=""
+          data-chip-level={hidden ? undefined : ''}
+          data-fit-whole={!hidden && crowded ? '' : undefined}
+        >
+          {level}
+          {levelWarning ? <span className={styles.levelWarn} aria-hidden="true" /> : null}
+        </span>
+      ) : null}
+    </>
+  );
+
+  return (
+    <>
+      <span className={styles.triggerMark} aria-hidden="true">
+        <AnimatePresence initial={false} mode="popLayout">
+          <motion.span
+            key={displayName}
+            className={styles.triggerMarkLayer}
+            initial={reduced ? { opacity: 0 } : { opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={
+              reduced
+                ? { opacity: 0, transition: INSTANT }
+                : { opacity: 0, transition: { duration: duration.instant, ease: standard } }
+            }
+            transition={reduced ? INSTANT : { duration: duration.fast, ease: standard }}
+          >
+            <ModelLogo model={displayName} className={styles.mark} />
+          </motion.span>
+        </AnimatePresence>
+      </span>
+      <motion.span
+        className={styles.triggerText}
+        initial={false}
+        animate={{ width: crowded ? 'auto' : size.width }}
+        transition={!crowded && size.animate && !reduced ? settle : INSTANT}
+      >
+        <AnimatePresence initial={false} mode="popLayout">
+          <motion.span
+            key={key}
+            className={styles.triggerInner}
+            initial={reduced ? { opacity: 0 } : { opacity: 0, y: 3 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={
+              reduced
+                ? { opacity: 0, transition: INSTANT }
+                : { opacity: 0, transition: { duration: duration.instant, ease: standard } }
+            }
+            transition={reduced ? INSTANT : { duration: duration.fast, ease: standard }}
+          >
+            {text()}
+          </motion.span>
+        </AnimatePresence>
+        {!crowded ? (
+          <span ref={measure} data-key={key} className={cn(styles.triggerInner, styles.measure)} aria-hidden="true">
+            {text(true)}
+          </span>
+        ) : null}
+      </motion.span>
+    </>
+  );
 }
 
-/** The move of ArrowUp, ArrowDown, Home, End or a letter in a list of `texts`, or null for another key. */
-function moveOf(event: KeyboardEvent, texts: readonly string[], from: number): number | null {
-  const last = texts.length - 1;
-  if (event.key === 'ArrowDown') return Math.min(last, from + 1);
-  if (event.key === 'ArrowUp') return Math.max(0, from - 1);
-  if (event.key === 'Home') return 0;
-  if (event.key === 'End') return last;
-  const letter = letterOf(event);
-  return letter === null ? null : byLetter(texts, from, letter);
+/* ---------------------------------------------------------------------------------------------------------------
+ * One highlight per menu surface. It glides between items for the pointer and jumps for the keyboard, so moving
+ * through the list never flickers row by row.
+ * ------------------------------------------------------------------------------------------------------------- */
+
+function useGlide(reduced: boolean, resetKey?: string) {
+  const [box, setBox] = useState<{ top: number; height: number; glide: boolean } | null>(null);
+  const container = useRef<HTMLDivElement>(null);
+  const pointer = useRef(false);
+  const timer = useRef(0);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  // A new page of items starts without a highlight, so it never glides in from a row that is gone.
+  const [shownKey, setShownKey] = useState(resetKey);
+  if (shownKey !== resetKey) {
+    setShownKey(resetKey);
+    setBox(null);
+  }
+
+  const onFocus = (event: FocusEvent<HTMLDivElement>): void => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target !== null && !event.currentTarget.contains(target)) return;
+    if (event.target instanceof Node && !event.currentTarget.contains(event.target)) return;
+    const item = target !== null ? target.closest<HTMLElement>('[role^="menuitem"]') : null;
+    const list = container.current;
+    if (item !== null && (list === null || !list.contains(item))) return;
+    window.clearTimeout(timer.current);
+    if (item === null || list === null) {
+      // A short grace period keeps the highlight gliding across separators and labels.
+      timer.current = window.setTimeout(() => setBox(null), pointer.current ? 70 : 0);
+      return;
+    }
+    let top = 0;
+    let node: HTMLElement | null = item;
+    let reachedList = false;
+    while (node !== null && node !== list) {
+      top += node.offsetTop;
+      const parent: HTMLElement | null = node.offsetParent instanceof HTMLElement ? node.offsetParent : null;
+      if (parent === list) {
+        reachedList = true;
+        break;
+      }
+      if (parent === null || !list.contains(parent)) break;
+      node = parent;
+    }
+    const itemTop = reachedList ? top : item.offsetTop;
+    const glide = pointer.current;
+    setBox((current) => ({ top: itemTop, height: item.offsetHeight, glide: glide && current !== null }));
+  };
+
+  const highlight = (
+    <motion.span
+      className={styles.highlight}
+      aria-hidden="true"
+      initial={false}
+      animate={box !== null ? { y: box.top, height: box.height, opacity: 1 } : { opacity: 0 }}
+      transition={{
+        default: box?.glide === true && !reduced ? settle : INSTANT,
+        opacity: { duration: reduced ? 0 : duration.instant },
+      }}
+    />
+  );
+
+  const handlers = {
+    onFocus,
+    onPointerMoveCapture: () => {
+      pointer.current = true;
+    },
+    onKeyDownCapture: () => {
+      pointer.current = false;
+    },
+  };
+  return { container, highlight, handlers };
 }
 
-function Facts(props: {
-  state: ModelBaseOption['state'];
-  stateVariant?: string;
+/** Springs its height to the content, so a page change inside the menu never resizes it in one frame. */
+function AutoHeight({
+  children,
+  reduced,
+  listRef,
+  listId,
+  page,
+  highlight,
+}: {
+  children: ReactNode;
+  reduced: boolean;
+  listRef: RefObject<HTMLDivElement | null>;
+  listId: string;
+  page: string;
+  highlight: ReactNode;
+}): ReactElement {
+  const measureRef = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | 'auto'>('auto');
+  useLayoutEffect(() => {
+    const node = measureRef.current;
+    if (node === null || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (node.offsetHeight <= 0) return;
+      const listEl = listRef.current;
+      let pad = LIST_VERTICAL_PADDING;
+      if (listEl !== null) {
+        const computed = getComputedStyle(listEl);
+        const top = Number.parseFloat(computed.paddingTop);
+        const bottom = Number.parseFloat(computed.paddingBottom);
+        if (Number.isFinite(top) && Number.isFinite(bottom) && top + bottom > 0) pad = top + bottom;
+      }
+      setHeight(Math.min(LIST_MAX_HEIGHT, Math.ceil(node.offsetHeight + pad)));
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [listRef]);
+  return (
+    <motion.div
+      className={styles.autoHeight}
+      initial={false}
+      animate={{ height }}
+      transition={reduced ? INSTANT : smooth}
+    >
+      <div ref={listRef} id={listId} className={styles.list} data-page={page}>
+        {highlight}
+        <div ref={measureRef} className={styles.listInner}>
+          {children}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+/** Prevents Radix's 100ms hover-open timer from flashing a submenu open while the root menu is closing. */
+function GuardedSub({ rootOpen, children }: { rootOpen: boolean; children: ReactNode }): ReactElement {
+  const [subOpen, setSubOpen] = useState(false);
+  if (!rootOpen && subOpen) {
+    setSubOpen(false);
+  }
+  return (
+    <Menu.Sub open={rootOpen && subOpen} onOpenChange={(next) => setSubOpen(rootOpen && next)}>
+      {children}
+    </Menu.Sub>
+  );
+}
+
+function MenuSurface({
+  children,
+  footer,
+  footRef,
+  reduced,
+  page,
+  listId,
+  side,
+  align,
+  onCloseAutoFocus,
+  onKeyDown,
+}: {
+  children: ReactNode;
+  footer?: ReactNode;
+  footRef: RefObject<HTMLDivElement | null>;
+  reduced: boolean;
+  page: string;
+  listId: string;
+  side: 'top' | 'bottom';
+  align: 'start' | 'center' | 'end';
+  onCloseAutoFocus: (event: Event) => void;
+  onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+}): ReactElement {
+  const { container, highlight, handlers } = useGlide(reduced, page);
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key === 'Tab') {
+      const target = event.target instanceof Node ? event.target : null;
+      if (target === null || event.currentTarget.contains(target)) {
+        const foot = footRef.current;
+        const controls = foot === null ? [] : [...foot.querySelectorAll<HTMLElement>(FOCUSABLE_IN_FOOT)];
+        if (controls.length > 0 && foot !== null) {
+          event.preventDefault();
+          if (foot.contains(document.activeElement)) {
+            const activeIdx = controls.indexOf(document.activeElement as HTMLElement);
+            const nextIdx = event.shiftKey ? activeIdx - 1 : activeIdx + 1;
+            if (activeIdx !== -1 && nextIdx >= 0 && nextIdx < controls.length) {
+              controls[nextIdx]!.focus();
+            } else {
+              firstFocusableMenuItem(container.current)?.focus();
+            }
+          } else {
+            const next = event.shiftKey ? controls[controls.length - 1] : controls[0];
+            next?.focus();
+          }
+          return;
+        }
+      }
+    }
+    onKeyDown(event);
+  };
+
+  return (
+    <Menu.Portal>
+      <Menu.Content
+        className={styles.menu}
+        side={side}
+        align={align}
+        sideOffset={8}
+        collisionPadding={12}
+        loop
+        aria-labelledby={undefined}
+        aria-label={CHAT.model}
+        onCloseAutoFocus={onCloseAutoFocus}
+        onKeyDown={handleKeyDown}
+        {...handlers}
+      >
+        <AutoHeight reduced={reduced} listRef={container} listId={listId} page={page} highlight={highlight}>
+          {children}
+        </AutoHeight>
+        {footer}
+      </Menu.Content>
+    </Menu.Portal>
+  );
+}
+
+function SubSurface({
+  children,
+  reduced,
+  className,
+  label,
+}: {
+  children: ReactNode;
+  reduced: boolean;
+  className?: string;
+  label: string;
+}): ReactElement {
+  const { container, highlight, handlers } = useGlide(reduced);
+  return (
+    <Menu.Portal>
+      <Menu.SubContent
+        className={cn(styles.menu, className)}
+        sideOffset={8}
+        alignOffset={-7}
+        collisionPadding={12}
+        loop
+        aria-labelledby={undefined}
+        aria-label={label}
+        {...handlers}
+      >
+        <div ref={container} className={styles.list}>
+          {highlight}
+          {children}
+        </div>
+      </Menu.SubContent>
+    </Menu.Portal>
+  );
+}
+
+/** Phones and narrow frames get in-menu pages instead of side submenus, which would leave the screen. */
+const NARROW_QUERY = '(max-width: 640px)';
+function useNarrow(): boolean {
+  return useSyncExternalStore(
+    (notify) => {
+      if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return () => {};
+      const query = window.matchMedia(NARROW_QUERY);
+      query.addEventListener('change', notify);
+      return () => query.removeEventListener('change', notify);
+    },
+    () =>
+      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        ? window.matchMedia(NARROW_QUERY).matches
+        : false,
+    () => false,
+  );
+}
+
+function StateDot({ state }: { state: ModelBaseOption['state'] }): ReactElement | null {
+  if (state !== 'loaded' && state !== 'loading') return null;
+  return <span className={styles.stateDot} data-state={state} aria-hidden="true" />;
+}
+
+function VariantFacts({
+  state,
+  facts,
+  warning,
+}: {
+  state: ModelVariantOption['state'];
   facts: readonly string[];
   warning?: string;
-}): ReactElement {
-  const parts = [...(props.stateVariant !== undefined ? [props.stateVariant] : []), ...props.facts];
-  const lead = props.state === 'idle' ? '' : ' · ';
+}): ReactElement | null {
+  const hasState = state !== 'idle';
+  const factsText = facts.join(' · ');
+  if (!hasState && factsText === '' && warning === undefined) return null;
   return (
-    <span className={styles.rowFacts}>
-      {props.state === 'loading' ? <LiveLabel active>{CHAT.modelLoading}</LiveLabel> : null}
-      {props.state === 'loaded' ? CHAT.modelLoaded : null}
-      {parts.length > 0 ? lead + parts.join(' · ') : null}
-      {props.warning !== undefined ? (
+    <span className={styles.itemBlurb}>
+      {state === 'loading' ? <LiveLabel active>{CHAT.modelLoading}</LiveLabel> : null}
+      {state === 'loaded' ? CHAT.modelLoaded : null}
+      {factsText !== '' ? (hasState ? ` · ${factsText}` : factsText) : null}
+      {warning !== undefined ? (
         <span className={styles.warning}>
-          {props.state === 'idle' && parts.length === 0 ? '' : ' · '}
+          {hasState || factsText !== '' ? ' · ' : ''}
           <TriangleAlert size={12} strokeWidth={1.75} aria-hidden="true" />
-          {props.warning}
+          {warning}
         </span>
       ) : null}
     </span>
   );
 }
 
-/** The chip's name with the level of the model. */
-function withLevel(name: string, level: string | null): string {
-  return level === null ? name : fill(CHAT.thinkingLevel.chipName, { model: name, level });
+function BaseBlurb({
+  note,
+  facts,
+  warning,
+}: {
+  note?: string;
+  facts: readonly string[];
+  warning?: string;
+}): ReactElement | null {
+  const lead = note !== undefined && note.trim() !== '' ? note : facts.length > 0 ? facts.join(' · ') : '';
+  if (lead === '' && warning === undefined) return null;
+  return (
+    <span className={styles.itemBlurb}>
+      {lead !== '' ? lead : null}
+      {warning !== undefined ? (
+        <span className={styles.warning}>
+          {lead !== '' ? ' · ' : ''}
+          <TriangleAlert size={12} strokeWidth={1.75} aria-hidden="true" />
+          {warning}
+        </span>
+      ) : null}
+    </span>
+  );
 }
 
 /**
- * The model of the next message: a pill with the base and the level, and a popover of cascading lists: the bases, the
- * quantizations of the open base (a base with several), and the Thinking effort of the quantization in view (a model
- * with levels). A window too narrow for three columns shows the levels in place of the quantizations, with a back row.
+ * The model of the next message: one quiet pill that opens a short menu of recommended models with a one-line
+ * note each, an Effort submenu for reasoning models, multi-build Quantization submenus, and every other model
+ * under More models grouped by provider. On narrow viewports, submenus become in-menu pages with a Back row.
  */
 export function ModelPicker(props: ModelPickerProps): ReactElement {
+  const reduced = useStaticMotion();
   const [open, setOpen] = useState(false);
-  const [keys, setKeysState] = useState<Keys>(NO_KEYS);
-  const keysRef = useRef(keys);
-  const [rightLive, setRightLive] = useState({ focus: false, pointer: false });
-  const [levelsLive, setLevelsLive] = useState({ focus: false, pointer: false });
-  /** Narrow window: the levels of the active quantization replace the quantization list. */
-  const [deep, setDeep] = useState(false);
-  /** Three columns fit between the chip's left edge and the window's right edge. */
-  const [room, setRoom] = useState(true);
-  const pointer = useRef<{ x: number; y: number } | null>(null);
-  const focusTo = useRef<'quants' | 'levels' | null>(null);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const id = useId();
-  const [left, setLeft] = useState<HTMLDivElement | null>(null);
-  const [right, setRight] = useState<HTMLDivElement | null>(null);
-  const [levelsNode, setLevelsNode] = useState<HTMLDivElement | null>(null);
-  const leftRef = useRef<HTMLDivElement | null>(null);
-  const rightRef = useRef<HTMLDivElement | null>(null);
-  const levelsRef = useRef<HTMLDivElement | null>(null);
-  const attachLeft = useCallback((node: HTMLDivElement | null) => {
-    leftRef.current = node;
-    setLeft(node);
-  }, []);
-  const attachRight = useCallback((node: HTMLDivElement | null) => {
-    rightRef.current = node;
-    setRight(node);
-  }, []);
-  const attachLevels = useCallback((node: HTMLDivElement | null) => {
-    levelsRef.current = node;
-    setLevelsNode(node);
-  }, []);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const footRef = useRef<HTMLDivElement>(null);
+  const pointerToggled = useRef(false);
+  const pointerCleanup = useRef<(() => void) | null>(null);
+  const multiMouseDownBase = useRef<string | null>(null);
+  const multiPointerCleanup = useRef<(() => void) | null>(null);
+  const lastInput = useRef<'pointer' | 'keyboard'>('pointer');
+  const narrow = useNarrow();
+  const [page, setPage] = useState<Page>(MAIN_PAGE);
+  /** Set once someone moves between pages, so opening the menu never plays a page transition. */
+  const [paged, setPaged] = useState(false);
+  const [slideDir, setSlideDir] = useState<1 | -1>(1);
+  const previousPage = useRef<Page>(MAIN_PAGE);
+  const listId = useId();
 
   const bases = props.bases;
   const empty = bases.length === 0 || props.value === null;
   const disabled = props.disabled === true || empty;
+  const listDisabled = props.listDisabled === true;
+
+  if (disabled && open) {
+    setOpen(false);
+    setPage(MAIN_PAGE);
+    setPaged(false);
+    setSlideDir(1);
+  }
+  const rootOpen = open && !disabled;
+
   const valueBase = holding(bases, props.value);
   const selected = valueBase?.variants.find((variant) => variant.id === props.value);
-  const at = resolve(bases, props.value, props.fallback, keys);
-  const openOption = at.open;
-  const variants = openOption?.variants ?? [];
-  const one = variants.length === 1;
-  // The footer must not follow the active row. The panel hangs from its bottom edge: a change of the footer height
-  // moves the rows under a resting pointer, the active row changes, and the footer flips back.
-  const swap =
-    props.swapWarning !== undefined &&
-    bases.some((option) => option.variants.some((variant) => variant.state !== 'loaded'))
-      ? props.swapWarning
-      : null;
-  const listOff = props.listDisabled === true;
-  const footer = (listOff ? props.listDisabledReason : undefined) ?? swap ?? props.footer ?? null;
+  const homeBase = valueBase ?? holding(bases, props.fallback) ?? bases[0];
+  const homeVariant =
+    selected ?? homeBase?.variants.find((variant) => variant.id === homeBase.preselect) ?? homeBase?.variants[0];
+  const effortVariant = listDisabled ? selected : homeVariant;
+  const effortBase = listDisabled ? valueBase : (valueBase ?? homeBase);
+  const effort = levelsOf(effortVariant);
   const levelShown = keptLabel(selected);
-  const rows = Math.min(Math.max(bases.length, MIN_ROWS), MAX_ROWS);
+  const effortShown = keptLabel(effortVariant);
+  const currentLevel = levelsOf(selected)?.value;
 
-  /** The levels a row opens: while the model rows are off, only the conversation's model has them. */
-  const nextOf = (variant: ModelVariantOption | undefined): ModelEffort | undefined =>
-    listOff && variant?.id !== props.value ? undefined : levelsOf(variant);
-  const activeVariant = variants[at.variant];
-  const levelsVariant = nextOf(activeVariant) !== undefined && (one || room || deep) ? activeVariant : undefined;
-  const effort = nextOf(levelsVariant);
-  const inPlace = levelsVariant !== undefined && (one || !room);
-  const third = levelsVariant !== undefined && !inPlace;
-  const back = inPlace && !one;
-  const levelAt = levelIndex(effort, keys.level);
+  const hasRecommended = bases.some((base) => base.recommended === true);
+  const outsideBases = useMemo(
+    () => (hasRecommended ? bases.filter((base) => base.recommended === true) : bases),
+    [bases, hasRecommended],
+  );
+  const moreBases = useMemo(
+    () => (hasRecommended ? bases.filter((base) => base.recommended !== true) : []),
+    [bases, hasRecommended],
+  );
+  const moreGroups = useMemo(() => groupByProvider(moreBases), [moreBases]);
+  const hasMore = moreBases.length > 0;
+  const inMore = valueBase !== undefined && moreBases.includes(valueBase);
 
-  const setKeys = (next: Partial<Keys>): void => {
-    const merged = { ...keysRef.current, ...next };
-    keysRef.current = merged;
-    setKeysState(merged);
+  const variantById = useMemo(() => {
+    const map = new Map<string, ModelVariantOption>();
+    for (const base of bases) {
+      for (const variant of base.variants) map.set(variant.id, variant);
+    }
+    return map;
+  }, [bases]);
+
+  const hasUnloaded = bases.some((option) => option.variants.some((variant) => variant.state !== 'loaded'));
+  const isSwapWarning = !listDisabled && hasUnloaded && props.swapWarning !== undefined;
+  const footerText =
+    (listDisabled ? props.listDisabledReason : undefined) ??
+    (hasUnloaded ? props.swapWarning : undefined) ??
+    props.footer;
+
+  const clearMultiMouseDown = (): void => {
+    multiPointerCleanup.current?.();
+    multiPointerCleanup.current = null;
+    multiMouseDownBase.current = null;
   };
 
-  const measure = useCallback((): void => {
-    const node = triggerRef.current;
-    if (node === null) return;
-    setRoom(node.getBoundingClientRect().left + THIRD_WIDTH + GUTTER <= window.innerWidth);
-  }, []);
+  useEffect(() => () => clearMultiMouseDown(), []);
+
+  const changeOpen = (next: boolean): void => {
+    if (next && disabled) return;
+    if (next) {
+      setPage(MAIN_PAGE);
+      setPaged(false);
+      setSlideDir(1);
+      previousPage.current = MAIN_PAGE;
+    } else {
+      clearMultiMouseDown();
+    }
+    setOpen(next);
+  };
+
+  // Resolve the active narrow page, falling back cleanly if the backing data disappeared or list became disabled.
+  const shown: Page = (() => {
+    if (!narrow) return MAIN_PAGE;
+    if (page.kind === 'effort') return effort !== undefined ? page : MAIN_PAGE;
+    if (page.kind === 'more') return !listDisabled && hasMore ? page : MAIN_PAGE;
+    if (page.kind === 'quant') {
+      if (listDisabled) return MAIN_PAGE;
+      const target = bases.find((base) => base.base === page.base);
+      return target !== undefined && target.variants.length > 1 ? page : MAIN_PAGE;
+    }
+    return MAIN_PAGE;
+  })();
+  const shownKey = pageKey(shown);
+
+  const moveTo = (next: Page): void => {
+    setSlideDir(pageDepth(next) < pageDepth(shown) ? -1 : 1);
+    setPaged(true);
+    setPage(next);
+  };
+
+  // A new page focuses its checked or first item; going back focuses the row you came from.
   useEffect(() => {
-    if (!open) return;
-    window.addEventListener('resize', measure);
-    return () => window.removeEventListener('resize', measure);
-  }, [open, measure]);
+    if (!rootOpen) {
+      previousPage.current = MAIN_PAGE;
+      return;
+    }
+    if (pageKey(shown) === pageKey(previousPage.current)) return;
+    const from = previousPage.current;
+    previousPage.current = shown;
+    const frame = requestAnimationFrame(() => {
+      const list = document.getElementById(listId);
+      if (list === null) return;
+      const goingBack = pageDepth(shown) < pageDepth(from);
+      let target: HTMLElement | null = null;
+      if (goingBack) {
+        const wantRow = pageKey(from);
+        for (const node of list.querySelectorAll<HTMLElement>('[data-row]:not([data-disabled])')) {
+          if (node.dataset.row === wantRow) {
+            target = node;
+            break;
+          }
+        }
+      }
+      if (target === null) {
+        target = firstFocusableMenuItem(list);
+      }
+      target?.focus({ preventScroll: false });
+      target?.scrollIntoView({ block: 'nearest' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [shown, rootOpen, listId]);
 
-  const openList = (): void => {
-    const home = resolve(bases, props.value, props.fallback, NO_KEYS).home;
-    setKeys({ open: home?.base ?? '', base: home?.base ?? '', variant: home?.preselect ?? '', level: '' });
-    setRightLive({ focus: false, pointer: false });
-    setLevelsLive({ focus: false, pointer: false });
-    setDeep(false);
-    measure();
-    setOpen(true);
-  };
-
-  // Read by the effects below through a ref: they run when a list mounts or the order changes, not on each state.
-  const latest = useRef({ bases, value: props.value, fallback: props.fallback, level: levelAt });
-  useLayoutEffect(() => {
-    latest.current = { bases, value: props.value, fallback: props.fallback, level: levelAt };
-  });
-  const showActive = useCallback((): void => {
-    const now = latest.current;
-    const where = resolve(now.bases, now.value, now.fallback, keysRef.current);
-    reveal(leftRef.current, where.base);
-    reveal(rightRef.current, where.variant);
-    reveal(levelsRef.current, now.level);
+  // Radix returns focus to the pill on close. After a pointer choice it should not draw the keyboard ring.
+  useEffect(() => {
+    const onPointer = (): void => {
+      lastInput.current = 'pointer';
+    };
+    const onKey = (): void => {
+      lastInput.current = 'keyboard';
+    };
+    window.addEventListener('pointerdown', onPointer, true);
+    window.addEventListener('keydown', onKey, true);
+    return () => {
+      window.removeEventListener('pointerdown', onPointer, true);
+      window.removeEventListener('keydown', onKey, true);
+    };
   }, []);
 
-  useLayoutEffect(() => {
-    const target = focusTo.current;
-    const node = target === 'quants' ? rightRef.current : target === 'levels' ? levelsRef.current : null;
-    if (node === null) return;
-    focusTo.current = null;
-    node.focus();
-    showActive();
-  });
+  const onCloseAutoFocus = (event: Event): void => {
+    if (lastInput.current !== 'pointer') return;
+    event.preventDefault();
+    triggerRef.current?.focus({ preventScroll: true, focusVisible: false } as FocusOptions);
+  };
 
-  const order = bases
-    .map((option) => [option.base, ...option.variants.map((variant) => variant.id)].join('\n'))
-    .join('\n\n');
-  useLayoutEffect(() => {
-    showActive();
-    if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(showActive);
-    if (left !== null) observer.observe(left);
-    if (right !== null) observer.observe(right);
-    if (levelsNode !== null) observer.observe(levelsNode);
-    return () => observer.disconnect();
-  }, [left, right, levelsNode, order, showActive]);
-
-  /** Model and level together; nothing is sent when both are the conversation's. */
-  const commit = (variant: ModelVariantOption, level: string | undefined): void => {
-    if (listOff && nextOf(variant) === undefined) return;
-    setOpen(false);
-    const current = levelsOf(selected)?.value;
-    if (level === undefined) {
+  /** Model and level together; nothing is sent when neither differs from the conversation's. */
+  const commit = (variant: ModelVariantOption, explicitLevel?: string): void => {
+    if (listDisabled && variant.id !== props.value) return;
+    const variantEffort = levelsOf(variant);
+    const nextLevel = variantEffort !== undefined ? (explicitLevel ?? variantEffort.value) : undefined;
+    changeOpen(false);
+    if (nextLevel === undefined) {
       if (variant.id !== props.value) props.onValueChange(variant.id);
-    } else if (variant.id !== props.value || level !== current) props.onValueChange(variant.id, level);
+    } else if (variant.id !== props.value || nextLevel !== currentLevel) {
+      props.onValueChange(variant.id, nextLevel);
+    }
   };
 
-  /** A leaf row: a model with no levels (or, while the model rows are off, one that is not the conversation's). */
-  const pick = (variant: ModelVariantOption): void => commit(variant, undefined);
-
-  /** Opens `option` with its preselected row active, and moves focus to its next column. */
-  const openBase = (option: ModelBaseOption): void => {
-    setKeys({ open: option.base, base: option.base, variant: option.preselect, level: '' });
-    setDeep(false);
-    const only = option.variants.length === 1 ? option.variants[0] : undefined;
-    focusTo.current = nextOf(only) !== undefined ? 'levels' : 'quants';
+  const chooseVariantById = (id: string): void => {
+    const variant = variantById.get(id);
+    if (variant !== undefined) commit(variant);
   };
 
-  const enterBase = (option: ModelBaseOption): void => {
-    const only = option.variants.length === 1 ? option.variants[0]! : undefined;
-    if (only !== undefined && nextOf(only) === undefined) pick(only);
-    else openBase(option);
-  };
+  const preselectOf = (base: ModelBaseOption): ModelVariantOption =>
+    base.variants.find((variant) => variant.id === base.preselect) ?? base.variants[0]!;
 
-  /** The levels of `variant` with the level it keeps active, focus in them. */
-  const openLevels = (variant: ModelVariantOption): void => {
-    setKeys({ variant: variant.id, level: '' });
-    if (!room) setDeep(true);
-    focusTo.current = 'levels';
-  };
+  const onMultiBasePointerDown =
+    (base: ModelBaseOption) =>
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      clearMultiMouseDown();
+      if (listDisabled || event.pointerType !== 'mouse' || event.button !== 0 || event.ctrlKey) return;
+      multiMouseDownBase.current = base.base;
+      let timer = 0;
+      const removeListeners = (): void => {
+        window.removeEventListener('pointerup', scheduleReset, true);
+        window.removeEventListener('pointercancel', scheduleReset, true);
+      };
+      const scheduleReset = (): void => {
+        removeListeners();
+        timer = window.setTimeout(() => {
+          multiMouseDownBase.current = null;
+          multiPointerCleanup.current = null;
+        }, 0);
+      };
+      window.addEventListener('pointerup', scheduleReset, true);
+      window.addEventListener('pointercancel', scheduleReset, true);
+      multiPointerCleanup.current = () => {
+        removeListeners();
+        window.clearTimeout(timer);
+      };
+    };
 
-  const levelsBack = (): void => {
-    if (one) {
-      setKeys({ base: openOption?.base ?? '' });
-      left?.focus();
-      return;
-    }
-    if (third) {
-      right?.focus();
-      return;
-    }
-    setDeep(false);
-    focusTo.current = 'quants';
-  };
-
-  const pointerMoved = (event: PointerEvent): boolean => {
-    const last = pointer.current;
-    if (last !== null && last.x === event.clientX && last.y === event.clientY) return false;
-    pointer.current = { x: event.clientX, y: event.clientY };
-    return true;
-  };
-
-  const onLeftKey = (event: KeyboardEvent<HTMLDivElement>): void => {
-    const option = bases[at.base];
-    if (option === undefined) return;
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      enterBase(option);
-      return;
-    }
-    if (event.key === 'ArrowRight') {
-      event.preventDefault();
-      openBase(option);
-      return;
-    }
-    const next = moveOf(
-      event,
-      bases.map((row) => row.base),
-      at.base,
-    );
-    if (next === null) return;
-    event.preventDefault();
-    setKeys({ base: bases[next]!.base });
-    reveal(left, next);
-  };
-
-  const onRightKey = (event: KeyboardEvent<HTMLDivElement>): void => {
-    if (event.key === 'ArrowLeft' || (event.key === 'Tab' && event.shiftKey)) {
-      setKeys({ base: openOption?.base ?? '' });
-      if (event.key === 'Tab') return;
-      event.preventDefault();
-      left?.focus();
-      return;
-    }
-    const variant = variants[at.variant];
-    if (variant === undefined) return;
-    if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowRight') {
-      event.preventDefault();
-      if (nextOf(variant) !== undefined) openLevels(variant);
-      else if (event.key !== 'ArrowRight') pick(variant);
-      return;
-    }
-    const next = moveOf(
-      event,
-      variants.map((row) => row.label),
-      at.variant,
-    );
-    if (next === null) return;
-    event.preventDefault();
-    setKeys({ variant: variants[next]!.id, level: '' });
-    reveal(right, next);
-  };
-
-  const onLevelsKey = (event: KeyboardEvent<HTMLDivElement>): void => {
-    if (event.key === 'ArrowLeft') {
-      event.preventDefault();
-      levelsBack();
-      return;
-    }
-    if (event.key === 'Tab' && event.shiftKey) {
-      if (inPlace) setKeys({ base: openOption?.base ?? '' });
-      return;
-    }
-    const level = effort?.levels[levelAt];
-    if (levelsVariant === undefined || effort === undefined || level === undefined) return;
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      commit(levelsVariant, level.value);
-      return;
-    }
-    const next = moveOf(
-      event,
-      effort.levels.map((row) => row.label),
-      levelAt,
-    );
-    if (next === null) return;
-    event.preventDefault();
-    setKeys({ level: effort.levels[next]!.value });
-    reveal(levelsRef.current, next);
-  };
-
-  const trigger = (
-    <button
-      ref={triggerRef}
-      type="button"
-      className={styles.trigger}
-      disabled={disabled}
-      aria-haspopup="listbox"
-      aria-expanded={open}
-      data-state={selected?.state ?? undefined}
-      data-crowded={props.crowded === true ? '' : undefined}
-      title={
-        empty
-          ? undefined
-          : levelShown === null
-            ? (props.value ?? undefined)
-            : fill(CHAT.thinkingLevel.chip, { model: props.value ?? '', level: levelShown })
+  const onMultiBaseClick =
+    (base: ModelBaseOption) =>
+    (event: MouseEvent<HTMLDivElement>): void => {
+      const fromMouseDown = multiMouseDownBase.current === base.base;
+      clearMultiMouseDown();
+      if (listDisabled) return;
+      // Fast 1-click pick of preselect only for real primary mouse clicks on this row; touch taps,
+      // keyboard activation, and VoiceOver/AT synthetic clicks open the quantization submenu instead.
+      if (fromMouseDown) {
+        event.preventDefault();
+        commit(preselectOf(base));
       }
-      aria-label={
-        empty
-          ? CHAT.noModel
-          : withLevel(
-              selected === undefined || valueBase === undefined
-                ? `${CHAT.model}: ${props.value}`
-                : fill(CHAT.pillName, {
-                    model: `${valueBase.base} ${selected.label}`,
-                    state: CHAT.pillStates[selected.state],
-                  }),
-              levelShown,
-            )
-      }
-      onKeyDown={(event) => {
-        if (event.key === 'ArrowDown' && !open) {
-          event.preventDefault();
-          openList();
-        }
-      }}
-    >
-      {empty ? (
-        <span className={styles.none}>{CHAT.noModel}</span>
-      ) : (
-        <span key={props.value} className={styles.name}>
-          <ModelBadge
-            name={valueBase?.base ?? props.value ?? ''}
-            colorKey={props.value ?? undefined}
-            size="sm"
-            showLogo
-            maxChars={22}
-          />
-          {levelShown !== null ? (
-            <span
-              data-chip-label=""
-              data-chip-level=""
-              data-fit-whole={props.crowded === true ? '' : undefined}
-              className={styles.variant}
-            >
-              <Badge tone="neutral" size="sm" outline>
-                {levelShown}
-                {props.levelWarning === true ? <span className={styles.levelWarn} aria-hidden="true" /> : null}
-              </Badge>
+    };
+
+  const goTo =
+    (next: Page) =>
+    (event: Event): void => {
+      event.preventDefault();
+      moveTo(next);
+    };
+
+  const renderQuantList = (base: ModelBaseOption): ReactElement => (
+    <Menu.RadioGroup value={props.value ?? ''} onValueChange={chooseVariantById}>
+      {base.variants.map((variant) => (
+        <Menu.RadioItem
+          key={variant.id}
+          value={variant.id}
+          disabled={listDisabled}
+          textValue={variant.label}
+          className={cn(styles.item, styles.quantItem)}
+        >
+          <span className={styles.itemText}>
+            <span className={styles.itemName}>
+              <span className={styles.itemNameText}>{variant.label}</span>
             </span>
-          ) : null}
-        </span>
-      )}
-      <span className={styles.chevron} aria-hidden="true">
-        {props.working === true ? (
-          <MorphLoader size={14} status="loading" />
-        ) : (
-          <ChevronDown size={12} strokeWidth={1.75} />
-        )}
-      </span>
-    </button>
+            <VariantFacts state={variant.state} facts={variant.facts} warning={variant.warning} />
+          </span>
+          <Menu.ItemIndicator className={styles.check}>
+            <Check aria-hidden="true" />
+          </Menu.ItemIndicator>
+        </Menu.RadioItem>
+      ))}
+    </Menu.RadioGroup>
   );
 
-  const showRightActive = rightLive.focus || rightLive.pointer;
-  const showLevelsActive = levelsLive.focus || levelsLive.pointer;
-  const levelsLiveOn = {
-    onPointerEnter: () => setLevelsLive((live) => ({ ...live, pointer: true })),
-    onPointerLeave: () => setLevelsLive((live) => ({ ...live, pointer: false })),
+  const renderOutsideBase = (base: ModelBaseOption): ReactElement => {
+    const single = base.variants.length === 1 ? base.variants[0] : undefined;
+    const isSelected = base === valueBase;
+    const content = (
+      <>
+        <ModelLogo model={base.base} className={styles.itemMark} />
+        <span className={styles.itemText}>
+          <span className={styles.itemName}>
+            <span className={styles.itemNameText}>{base.base}</span>
+            <StateDot state={base.state} />
+          </span>
+          <BaseBlurb note={base.note} facts={base.facts} warning={base.warning} />
+        </span>
+      </>
+    );
+
+    if (single !== undefined) {
+      return (
+        <Menu.RadioItem
+          key={base.base}
+          value={single.id}
+          disabled={listDisabled}
+          textValue={base.base}
+          className={styles.item}
+        >
+          {content}
+          <Menu.ItemIndicator className={styles.check}>
+            <Check aria-hidden="true" />
+          </Menu.ItemIndicator>
+        </Menu.RadioItem>
+      );
+    }
+
+    if (narrow) {
+      return (
+        <Menu.Item
+          key={base.base}
+          disabled={listDisabled}
+          className={styles.item}
+          data-row={`quant:${base.base}`}
+          data-checked={isSelected ? '' : undefined}
+          textValue={base.base}
+          onSelect={goTo({ kind: 'quant', base: base.base, from: 'main' })}
+        >
+          {content}
+          {isSelected ? (
+            <span className={styles.check}>
+              <Check aria-hidden="true" />
+            </span>
+          ) : null}
+          <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+        </Menu.Item>
+      );
+    }
+
+    return (
+      <GuardedSub key={base.base} rootOpen={rootOpen}>
+        <Menu.SubTrigger
+          disabled={listDisabled}
+          className={styles.item}
+          textValue={base.base}
+          data-checked={isSelected ? '' : undefined}
+          onPointerDown={onMultiBasePointerDown(base)}
+          onClick={onMultiBaseClick(base)}
+        >
+          {content}
+          {isSelected ? (
+            <span className={styles.check}>
+              <Check aria-hidden="true" />
+            </span>
+          ) : null}
+          <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+        </Menu.SubTrigger>
+        <SubSurface
+          reduced={reduced}
+          className={styles.quantMenu}
+          label={fill(CHAT.modelQuantList, { base: base.base })}
+        >
+          {renderQuantList(base)}
+        </SubSurface>
+      </GuardedSub>
+    );
   };
 
-  const levelsHeading =
-    effort === undefined ? null : (
-      <p className={styles.heading}>
-        {CHAT.thinkingLevel.column}
-        {effort.note !== undefined ? (
-          <>
-            <Tooltip content={effort.note}>
-              <span className={styles.info}>
-                <Info size={12} strokeWidth={1.75} aria-hidden="true" />
-              </span>
-            </Tooltip>
-            <span id={`${id}-note`} hidden>
-              {effort.note}
-            </span>
-          </>
+  const renderMoreBase = (base: ModelBaseOption): ReactElement => {
+    const single = base.variants.length === 1 ? base.variants[0] : undefined;
+    const isSelected = base === valueBase;
+    const content = (
+      <>
+        <ModelLogo model={base.base} className={styles.compactMark} />
+        <span className={styles.compactName}>
+          <span className={styles.compactNameText}>{base.base}</span>
+          <StateDot state={base.state} />
+        </span>
+        {base.warning !== undefined ? (
+          <span className={cn(styles.tag, styles.warning)}>
+            <TriangleAlert size={11} strokeWidth={1.75} aria-hidden="true" />
+            {base.warning}
+          </span>
         ) : null}
-      </p>
+      </>
     );
 
-  const levelsList =
-    levelsVariant === undefined || effort === undefined || openOption === undefined ? null : (
-      <div
-        key={inPlace ? `in:${openOption.base}` : 'third'}
-        ref={attachLevels}
-        id={`${id}-levels`}
-        className={cn(styles.list, styles.inner, styles.swap)}
-        role="listbox"
-        tabIndex={0}
-        aria-label={fill(CHAT.thinkingLevel.list, {
-          model: one ? openOption.base : `${openOption.base} ${levelsVariant.label}`,
-        })}
-        aria-describedby={effort.note !== undefined ? `${id}-note` : undefined}
-        aria-activedescendant={effort.levels[levelAt] !== undefined ? `${id}-l${String(levelAt)}` : undefined}
-        onKeyDown={onLevelsKey}
-        onFocus={() => setLevelsLive((live) => ({ ...live, focus: true }))}
-        onBlur={() => setLevelsLive((live) => ({ ...live, focus: false }))}
-      >
-        {effort.levels.map((level, index) => (
-          <div
-            key={level.value}
-            id={`${id}-l${String(index)}`}
-            className={cn(styles.row, styles.levelRow)}
-            role="option"
-            aria-selected={level.value === effort.value}
-            data-active={showLevelsActive && index === levelAt ? '' : undefined}
-            onPointerMove={(event) => {
-              if (pointerMoved(event)) setKeys({ level: level.value });
-            }}
-            onClick={() => commit(levelsVariant, level.value)}
-          >
-            <span className={styles.levelName}>{level.label}</span>
-            {level.value === effort.value ? (
-              <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
-            ) : null}
-          </div>
-        ))}
-      </div>
-    );
-
-  return (
-    <Popover
-      open={open && !disabled}
-      onOpenChange={(next) => {
-        if (next) openList();
-        else setOpen(false);
-      }}
-    >
-      {props.disabled === true && props.disabledReason !== undefined ? (
-        <Tooltip content={props.disabledReason}>
-          <span className={styles.tipTarget}>{trigger}</span>
-        </Tooltip>
-      ) : (
-        <PopoverTrigger asChild>{trigger}</PopoverTrigger>
-      )}
-      <PopoverContent
-        side="top"
-        align="start"
-        collisionPadding={GUTTER}
-        className={styles.panel}
-        data-third={third ? '' : undefined}
-        aria-label={CHAT.model}
-        onOpenAutoFocus={(event) => {
-          event.preventDefault();
-          leftRef.current?.focus();
-        }}
-      >
-        <div
-          className={styles.columns}
-          data-third={third ? '' : undefined}
-          style={{ '--picker-rows': rows } as CSSProperties}
+    if (single !== undefined) {
+      return (
+        <Menu.RadioItem
+          key={base.base}
+          value={single.id}
+          disabled={listDisabled}
+          textValue={base.base}
+          className={cn(styles.item, styles.compact)}
         >
-          <div className={styles.column}>
-            <p className={styles.heading} id={`${id}-bases`}>
-              {CHAT.model}
-            </p>
-            <div
-              ref={attachLeft}
-              className={styles.list}
-              role="listbox"
-              tabIndex={0}
-              aria-labelledby={`${id}-bases`}
-              aria-controls={inPlace ? `${id}-levels` : `${id}-quants`}
-              aria-activedescendant={bases[at.base] !== undefined ? `${id}-b${String(at.base)}` : undefined}
-              onKeyDown={onLeftKey}
-            >
-              {bases.map((option, index) => {
-                const only = option.variants.length === 1 ? option.variants[0] : undefined;
-                const level = keptLabel(option.variants.find((variant) => variant.id === option.preselect));
-                return (
-                  <div
-                    key={option.base}
-                    id={`${id}-b${String(index)}`}
-                    className={cn(styles.row, styles.baseRow)}
-                    role="option"
-                    aria-selected={option === valueBase}
-                    aria-disabled={listOff && only !== undefined && nextOf(only) === undefined ? true : undefined}
-                    data-active={index === at.base ? '' : undefined}
-                    data-open={option === openOption ? '' : undefined}
-                    onPointerMove={(event) => {
-                      if (pointerMoved(event)) setKeys({ base: option.base });
-                    }}
-                    onClick={() => enterBase(option)}
-                  >
-                    <span className={styles.rowText}>
-                      <span className={styles.rowName}>
-                        <MiddleText text={option.base} />
-                        {level !== null ? <span className={styles.rowLevel}>{level}</span> : null}
-                      </span>
-                      <Facts
-                        state={option.state}
-                        stateVariant={option.stateVariant}
-                        facts={option.facts}
-                        warning={option.warning}
-                      />
-                    </span>
-                    {only === undefined ? (
-                      <ChevronRight className={styles.chev} size={12} strokeWidth={1.75} aria-hidden="true" />
-                    ) : nextOf(only) !== undefined ? (
-                      <span className={styles.endNext}>
-                        <span className={styles.end}>{only.label}</span>
-                        <ChevronRight size={12} strokeWidth={1.75} aria-hidden="true" />
-                      </span>
-                    ) : (
-                      <span className={styles.end}>{only.label}</span>
-                    )}
-                    {option === valueBase ? (
-                      <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-          <div
-            className={cn(styles.column, styles.quants)}
-            data-back={back ? '' : undefined}
-            onPointerEnter={
-              inPlace ? levelsLiveOn.onPointerEnter : () => setRightLive((live) => ({ ...live, pointer: true }))
-            }
-            onPointerLeave={
-              inPlace ? levelsLiveOn.onPointerLeave : () => setRightLive((live) => ({ ...live, pointer: false }))
-            }
-          >
-            {back && levelsVariant !== undefined ? (
-              <button
-                type="button"
-                tabIndex={-1}
-                className={styles.back}
-                aria-label={fill(CHAT.thinkingLevel.back, { quant: levelsVariant.label })}
-                onClick={levelsBack}
-              >
-                <ChevronLeft size={12} strokeWidth={1.75} aria-hidden="true" />
-                <MiddleText text={levelsVariant.label} />
-              </button>
-            ) : null}
-            {inPlace ? levelsHeading : <p className={styles.heading}>{CHAT.modelQuant}</p>}
-            <div className={styles.body}>
-              {inPlace ? (
-                levelsList
-              ) : (
-                <div
-                  key={openOption?.base ?? ''}
-                  ref={attachRight}
-                  id={`${id}-quants`}
-                  className={cn(styles.list, styles.inner, styles.swap)}
-                  role="listbox"
-                  tabIndex={0}
-                  aria-label={fill(CHAT.modelQuantList, { base: openOption?.base ?? '' })}
-                  aria-controls={third ? `${id}-levels` : undefined}
-                  aria-activedescendant={
-                    variants[at.variant] !== undefined ? `${id}-v${String(at.variant)}` : undefined
-                  }
-                  onKeyDown={onRightKey}
-                  onFocus={() => setRightLive((live) => ({ ...live, focus: true }))}
-                  onBlur={() => setRightLive((live) => ({ ...live, focus: false }))}
-                >
-                  {variants.map((variant, index) => {
-                    const next = nextOf(variant) !== undefined;
-                    return (
-                      <div
-                        key={variant.id}
-                        id={`${id}-v${String(index)}`}
-                        className={cn(styles.row, next && styles.variantNext)}
-                        role="option"
-                        aria-selected={variant.id === props.value}
-                        aria-disabled={listOff && !next ? true : undefined}
-                        data-active={showRightActive && index === at.variant ? '' : undefined}
-                        data-open={third && variant === levelsVariant ? '' : undefined}
-                        onPointerMove={(event) => {
-                          if (pointerMoved(event)) setKeys({ variant: variant.id, level: '' });
-                        }}
-                        onClick={() => (next ? openLevels(variant) : pick(variant))}
-                      >
-                        <span className={styles.rowText}>
-                          <span className={styles.rowName}>
-                            <MiddleText text={variant.label} />
-                          </span>
-                          <Facts state={variant.state} facts={variant.facts} warning={variant.warning} />
-                        </span>
-                        {next ? (
-                          <ChevronRight className={styles.chev} size={12} strokeWidth={1.75} aria-hidden="true" />
-                        ) : null}
-                        {variant.id === props.value ? (
-                          <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
-          {third ? (
-            <div className={cn(styles.column, styles.quants)} {...levelsLiveOn}>
-              {levelsHeading}
-              <div className={styles.body}>{levelsList}</div>
-            </div>
+          {content}
+          <Menu.ItemIndicator className={styles.check}>
+            <Check aria-hidden="true" />
+          </Menu.ItemIndicator>
+        </Menu.RadioItem>
+      );
+    }
+
+    if (narrow) {
+      return (
+        <Menu.Item
+          key={base.base}
+          disabled={listDisabled}
+          className={cn(styles.item, styles.compact)}
+          data-row={`quant:${base.base}`}
+          data-checked={isSelected ? '' : undefined}
+          textValue={base.base}
+          onSelect={goTo({ kind: 'quant', base: base.base, from: 'more' })}
+        >
+          {content}
+          {isSelected ? (
+            <span className={styles.check}>
+              <Check aria-hidden="true" />
+            </span>
           ) : null}
-        </div>
-        {footer !== null ? (
-          <p className={styles.footer} data-warning={swap !== null && !listOff ? '' : undefined}>
-            {swap !== null && !listOff ? <TriangleAlert size={12} strokeWidth={1.75} aria-hidden="true" /> : null}
-            <span>{footer}</span>
+          <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+        </Menu.Item>
+      );
+    }
+
+    return (
+      <GuardedSub key={base.base} rootOpen={rootOpen}>
+        <Menu.SubTrigger
+          disabled={listDisabled}
+          className={cn(styles.item, styles.compact)}
+          textValue={base.base}
+          data-checked={isSelected ? '' : undefined}
+          onPointerDown={onMultiBasePointerDown(base)}
+          onClick={onMultiBaseClick(base)}
+        >
+          {content}
+          {isSelected ? (
+            <span className={styles.check}>
+              <Check aria-hidden="true" />
+            </span>
+          ) : null}
+          <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+        </Menu.SubTrigger>
+        <SubSurface
+          reduced={reduced}
+          className={styles.quantMenu}
+          label={fill(CHAT.modelQuantList, { base: base.base })}
+        >
+          {renderQuantList(base)}
+        </SubSurface>
+      </GuardedSub>
+    );
+  };
+
+  const effortGroup =
+    effort !== undefined && effortVariant !== undefined ? (
+      <>
+        <Menu.RadioGroup value={effort.value} onValueChange={(lvl) => commit(effortVariant, lvl)}>
+          {effort.levels.map((item) => (
+            <Menu.RadioItem
+              key={item.value}
+              value={item.value}
+              textValue={item.label}
+              className={cn(styles.item, styles.effortItem)}
+            >
+              <span className={styles.itemText}>
+                <span className={styles.itemName}>
+                  {item.label}
+                  {item.value === effort.defaultValue ? (
+                    <span className={styles.default}>{CHAT.thinkingLevel.defaultTag}</span>
+                  ) : null}
+                </span>
+                {item.note !== undefined ? <span className={styles.itemBlurb}>{item.note}</span> : null}
+              </span>
+              <Menu.ItemIndicator className={styles.check}>
+                <Check aria-hidden="true" />
+              </Menu.ItemIndicator>
+            </Menu.RadioItem>
+          ))}
+        </Menu.RadioGroup>
+        {effort.note !== undefined ? <p className={styles.subNote}>{effort.note}</p> : null}
+      </>
+    ) : null;
+
+  const moreGroup = (
+    <Menu.RadioGroup value={props.value ?? ''} onValueChange={chooseVariantById}>
+      {moreGroups.map((group) => (
+        <Fragment key={group.provider}>
+          <Menu.Label className={styles.groupLabel}>{group.provider}</Menu.Label>
+          {group.bases.map(renderMoreBase)}
+        </Fragment>
+      ))}
+    </Menu.RadioGroup>
+  );
+
+  const effortRow =
+    effort !== undefined ? (
+      <>
+        <Gauge className={styles.rowIcon} aria-hidden="true" />
+        <span className={styles.rowLabel}>{CHAT.thinkingLevel.effort}</span>
+        {effortShown !== null ? (
+          <span className={styles.rowValue}>
+            {effortShown}
+            {props.levelWarning === true ? <span className={styles.levelWarn} aria-hidden="true" /> : null}
+          </span>
+        ) : null}
+        <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+      </>
+    ) : null;
+
+  const moreRow = (
+    <>
+      <Layers className={styles.rowIcon} aria-hidden="true" />
+      <span className={styles.rowLabel}>{CHAT.modelMore}</span>
+      {inMore && valueBase !== undefined ? <span className={styles.rowValue}>{valueBase.base}</span> : null}
+      <ChevronRight className={styles.rowChevron} aria-hidden="true" />
+    </>
+  );
+
+  const back = (title: string, target: Page): ReactElement => (
+    <>
+      <Menu.Item
+        className={cn(styles.row, styles.back)}
+        data-back=""
+        textValue="Back"
+        aria-label={`Back, ${title}`}
+        onSelect={goTo(target)}
+      >
+        <ChevronLeft className={styles.rowIcon} aria-hidden="true" />
+        <span className={styles.rowLabel}>{title}</span>
+      </Menu.Item>
+      <Menu.Separator className={styles.separator} />
+    </>
+  );
+
+  const mainPage = (
+    <>
+      <Menu.RadioGroup value={props.value ?? ''} onValueChange={chooseVariantById}>
+        {outsideBases.map(renderOutsideBase)}
+      </Menu.RadioGroup>
+
+      {effortGroup !== null || hasMore ? <Menu.Separator className={styles.separator} /> : null}
+
+      {effortGroup !== null && effortRow !== null ? (
+        narrow ? (
+          <Menu.Item
+            className={styles.row}
+            data-row="effort"
+            textValue={CHAT.thinkingLevel.effort}
+            onSelect={goTo({ kind: 'effort' })}
+          >
+            {effortRow}
+          </Menu.Item>
+        ) : (
+          <GuardedSub rootOpen={rootOpen}>
+            <Menu.SubTrigger className={styles.row} textValue={CHAT.thinkingLevel.effort}>
+              {effortRow}
+            </Menu.SubTrigger>
+            <SubSurface
+              reduced={reduced}
+              label={fill(CHAT.thinkingLevel.list, { model: effortBase?.base ?? '' })}
+              className={styles.effortMenu}
+            >
+              {effortGroup}
+            </SubSurface>
+          </GuardedSub>
+        )
+      ) : null}
+
+      {hasMore ? (
+        narrow ? (
+          <Menu.Item
+            disabled={listDisabled}
+            className={styles.row}
+            data-row="more"
+            textValue={CHAT.modelMore}
+            onSelect={goTo({ kind: 'more' })}
+          >
+            {moreRow}
+          </Menu.Item>
+        ) : (
+          <GuardedSub rootOpen={rootOpen}>
+            <Menu.SubTrigger disabled={listDisabled} className={styles.row} textValue={CHAT.modelMore}>
+              {moreRow}
+            </Menu.SubTrigger>
+            <SubSurface reduced={reduced} label={CHAT.modelMoreList} className={styles.moreMenu}>
+              {moreGroup}
+            </SubSurface>
+          </GuardedSub>
+        )
+      ) : null}
+    </>
+  );
+
+  const body = (() => {
+    if (shown.kind === 'effort' && effortGroup !== null) {
+      return (
+        <>
+          {back(CHAT.thinkingLevel.effort, MAIN_PAGE)}
+          {effortGroup}
+        </>
+      );
+    }
+    if (shown.kind === 'more') {
+      return (
+        <>
+          {back(CHAT.modelMore, MAIN_PAGE)}
+          {moreGroup}
+        </>
+      );
+    }
+    if (shown.kind === 'quant') {
+      const targetBase = bases.find((base) => base.base === shown.base);
+      if (targetBase !== undefined) {
+        return (
+          <>
+            {back(targetBase.base, shown.from === 'more' ? { kind: 'more' } : MAIN_PAGE)}
+            {renderQuantList(targetBase)}
+          </>
+        );
+      }
+    }
+    return mainPage;
+  })();
+
+  // Arrow keys move between pages on narrow viewports, the way they open and close submenus on desktop.
+  const onMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (!narrow) return;
+    if (shown.kind !== 'main' && event.key === 'ArrowLeft') {
+      event.preventDefault();
+      moveTo(shown.kind === 'quant' && shown.from === 'more' && !listDisabled ? { kind: 'more' } : MAIN_PAGE);
+      return;
+    }
+    if (event.key !== 'ArrowRight') return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target === null || target.hasAttribute('data-disabled')) return;
+    const row = target.dataset.row;
+    if (row === undefined) return;
+    if (shown.kind === 'main' && row === 'effort') {
+      event.preventDefault();
+      moveTo({ kind: 'effort' });
+    } else if (!listDisabled && shown.kind === 'main' && row === 'more') {
+      event.preventDefault();
+      moveTo({ kind: 'more' });
+    } else if (!listDisabled && (shown.kind === 'main' || shown.kind === 'more') && row.startsWith('quant:')) {
+      event.preventDefault();
+      moveTo({ kind: 'quant', base: row.slice('quant:'.length), from: shown.kind });
+    }
+  };
+
+  const onFootKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== 'Escape' && event.key !== 'Tab') {
+      event.stopPropagation();
+    }
+  };
+
+  const footerSection =
+    shown.kind === 'main' && (footerText !== undefined || props.memory !== undefined) ? (
+      <div ref={footRef} className={styles.foot} onKeyDown={onFootKeyDown}>
+        {footerText !== undefined ? (
+          <p className={styles.footer} data-warning={isSwapWarning ? '' : undefined}>
+            {isSwapWarning ? <TriangleAlert size={13} strokeWidth={1.75} aria-hidden="true" /> : null}
+            <span>{footerText}</span>
           </p>
         ) : null}
         {props.memory !== undefined ? (
@@ -824,7 +1320,137 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
             {props.memory.action}
           </div>
         ) : null}
-      </PopoverContent>
-    </Popover>
+      </div>
+    ) : null;
+
+  const displayName = valueBase?.base ?? props.value ?? '';
+  const triggerTitle = empty
+    ? undefined
+    : levelShown === null
+      ? (props.value ?? undefined)
+      : fill(CHAT.thinkingLevel.chip, { model: props.value ?? '', level: levelShown });
+  const triggerAriaLabel = empty
+    ? CHAT.noModel
+    : withLevel(
+        selected === undefined || valueBase === undefined
+          ? `${CHAT.model}: ${props.value}`
+          : fill(CHAT.pillName, {
+              model: `${valueBase.base} ${selected.label}`,
+              state: CHAT.pillStates[selected.state],
+            }),
+        levelShown,
+      );
+
+  const clearPointerToggle = (): void => {
+    pointerCleanup.current?.();
+    pointerCleanup.current = null;
+    pointerToggled.current = false;
+  };
+
+  useEffect(() => () => clearPointerToggle(), []);
+
+  // Radix DropdownMenuTrigger only toggles on pointerdown / keydown (no onClick). Track pointerdown so
+  // programmatic .click() and assistive tech toggle the menu without double-toggling real pointer clicks.
+  const onTriggerPointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (disabled || event.button !== 0 || event.ctrlKey) return;
+    clearPointerToggle();
+    pointerToggled.current = true;
+    let timer = 0;
+    const removeListeners = (): void => {
+      window.removeEventListener('pointerup', scheduleReset, true);
+      window.removeEventListener('pointercancel', scheduleReset, true);
+    };
+    const scheduleReset = (): void => {
+      removeListeners();
+      timer = window.setTimeout(() => {
+        pointerToggled.current = false;
+        pointerCleanup.current = null;
+      }, 0);
+    };
+    window.addEventListener('pointerup', scheduleReset, true);
+    window.addEventListener('pointercancel', scheduleReset, true);
+    pointerCleanup.current = () => {
+      removeListeners();
+      window.clearTimeout(timer);
+    };
+  };
+
+  const onTriggerClick = (event: MouseEvent<HTMLButtonElement>): void => {
+    if (pointerToggled.current) {
+      clearPointerToggle();
+      return;
+    }
+    if (disabled || event.ctrlKey || event.detail !== 0) return;
+    changeOpen(!open);
+  };
+
+  const triggerNode = (
+    <Menu.Trigger
+      ref={triggerRef}
+      className={styles.trigger}
+      disabled={disabled}
+      data-state={selected?.state ?? undefined}
+      data-crowded={props.crowded === true ? '' : undefined}
+      title={triggerTitle}
+      aria-label={triggerAriaLabel}
+      onPointerDown={onTriggerPointerDown}
+      onClick={onTriggerClick}
+    >
+      {empty ? (
+        <span className={styles.none}>{CHAT.noModel}</span>
+      ) : (
+        <TriggerLabel
+          modelId={props.value ?? ''}
+          displayName={displayName}
+          level={levelShown}
+          levelWarning={props.levelWarning === true}
+          crowded={props.crowded === true}
+          reduced={reduced}
+        />
+      )}
+      <span className={styles.chevronSlot} aria-hidden="true">
+        {props.working === true ? (
+          <MorphLoader size={14} status="loading" />
+        ) : (
+          <ChevronDown className={styles.chevron} aria-hidden="true" />
+        )}
+      </span>
+    </Menu.Trigger>
+  );
+
+  return (
+    <Menu.Root open={rootOpen} onOpenChange={changeOpen}>
+      {props.disabled === true && props.disabledReason !== undefined ? (
+        <Tooltip content={props.disabledReason}>
+          <span className={styles.tipTarget}>{triggerNode}</span>
+        </Tooltip>
+      ) : (
+        triggerNode
+      )}
+
+      <MenuSurface
+        reduced={reduced}
+        page={shownKey}
+        listId={listId}
+        side={props.side ?? 'top'}
+        align={props.align ?? 'start'}
+        footer={footerSection}
+        footRef={footRef}
+        onCloseAutoFocus={onCloseAutoFocus}
+        onKeyDown={onMenuKeyDown}
+      >
+        <motion.div
+          key={shownKey}
+          className={styles.page}
+          initial={reduced || !paged ? false : { opacity: 0, x: slideDir * 12 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={reduced ? INSTANT : { duration: duration.fast, ease: standard }}
+        >
+          {body}
+        </motion.div>
+      </MenuSurface>
+    </Menu.Root>
   );
 }
+
+export default ModelPicker;

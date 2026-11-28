@@ -68,8 +68,13 @@ function effortOf(
   const thinking = model.thinking;
   if (thinking === undefined || thinking === null || thinking.levels.length === 0) return null;
   return {
-    levels: thinking.levels.map((value) => ({ value, label: CHAT.thinkingLevel.levels[value] })),
+    levels: thinking.levels.map((value) => ({
+      value,
+      label: CHAT.thinkingLevel.levels[value],
+      note: CHAT.thinkingLevel.levelNotes[value],
+    })),
     value: home ? stepLevel(level, thinking) : thinking.default,
+    defaultValue: thinking.default,
     note: busy
       ? CHAT.thinkingLevel.next
       : thinking.levels.includes('none')
@@ -80,8 +85,9 @@ function effortOf(
 
 /**
  * The picker rows: one per base, each with its quantizations. Both lists put the model in memory first, then the model
- * in load, then the rest (bases by name without case, quantizations by size). `value` is the conversation's model;
- * `picked` is the last model picked per base (keys in lower case); `thinking` gives each model its levels.
+ * in load, then the rest (recommended bases in curated catalog order, then bases by name without case; quantizations by
+ * size). `value` is the conversation's model; `picked` is the last model picked per base (keys in lower case);
+ * `thinking` gives each model its levels.
  */
 export function modelBases(
   host: ChatHostState,
@@ -101,7 +107,7 @@ export function modelBases(
     if (group === undefined) groups.set(model.base, [model]);
     else group.push(model);
   }
-  const bases: Array<{ option: ModelBaseOption; rank: number }> = [];
+  const bases: Array<{ option: ModelBaseOption; rank: number; recommendedOrder: number }> = [];
   for (const [base, members] of groups) {
     const sized = [...members].sort(bySize);
     const ordered = [...sized].sort((a, b) => STATE_RANK[stateOf(a.id)] - STATE_RANK[stateOf(b.id)]);
@@ -140,13 +146,38 @@ export function modelBases(
       variants,
       preselect,
     };
+    let recommendedOrder = Number.POSITIVE_INFINITY;
+    if (members.some((model) => model.recommended === true)) {
+      option.recommended = true;
+      const description =
+        members.find(
+          (model) => model.recommended === true && model.description !== undefined && model.description.trim() !== '',
+        )?.description ??
+        members.find((model) => model.description !== undefined && model.description.trim() !== '')?.description;
+      if (description !== undefined) option.note = description;
+      for (const model of members) {
+        if (
+          model.recommended === true &&
+          model.recommendedOrder !== undefined &&
+          model.recommendedOrder < recommendedOrder
+        ) {
+          recommendedOrder = model.recommendedOrder;
+        }
+      }
+    }
     if (stateVariant !== undefined && variants.length > 1) option.stateVariant = stateVariant.label;
     if (members.every(small)) option.warning = CHAT.modelSmall;
-    bases.push({ option, rank: loaded !== undefined ? 0 : loading !== undefined ? 1 : 2 });
+    bases.push({ option, rank: loaded !== undefined ? 0 : loading !== undefined ? 1 : 2, recommendedOrder });
   }
   const name = (option: ModelBaseOption): string => option.base.toLowerCase();
   return bases
-    .sort((a, b) => a.rank - b.rank || (name(a.option) < name(b.option) ? -1 : name(a.option) > name(b.option) ? 1 : 0))
+    .sort((a, b) => {
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      if (a.recommendedOrder !== b.recommendedOrder) {
+        return a.recommendedOrder < b.recommendedOrder ? -1 : 1;
+      }
+      return name(a.option) < name(b.option) ? -1 : name(a.option) > name(b.option) ? 1 : 0;
+    })
     .map((entry) => entry.option);
 }
 

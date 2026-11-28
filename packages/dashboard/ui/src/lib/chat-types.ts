@@ -1012,6 +1012,9 @@ export interface ChatHostState {
     images: boolean;
     family: string | null;
     thinking?: ModelThinking | null;
+    recommended?: boolean;
+    recommendedOrder?: number;
+    description?: string;
   }>;
   /** The resident chat model when one is in `models`, else the first of `models`. */
   defaultModelId: string | null;
